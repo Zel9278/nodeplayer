@@ -1,6 +1,7 @@
 //! File playback: a decoder thread (symphonia, or FFmpeg for what it can't open, + rubato) feeding a ring buffer that the
 //! `Player` source node drains on the audio thread.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -17,7 +18,7 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTag, StandardVisualKey};
-use symphonia::core::units::Time;
+use symphonia::core::units::{Time, TimeBase};
 
 use crate::engine::{Processor, StereoBuf};
 
@@ -48,6 +49,9 @@ struct Shared {
     base_secs: AtomicU64,
     /// Playback rate as f32 bits.
     rate: AtomicU32,
+    /// Recently decoded packets: start and length in the file (seconds) and size in bytes,
+    /// for the bitrate at the playing position.
+    packets: Mutex<VecDeque<(f64, f64, u32)>>,
 }
 
 #[derive(Clone, Default)]
@@ -58,6 +62,8 @@ pub struct Status {
     pub channels: usize,
     pub error: Option<String>,
     pub tags: Tags,
+    /// "symphonia" or "FFmpeg".
+    pub decoder: &'static str,
 }
 
 /// The tags of the loaded file that the UI and the media session show.
@@ -170,6 +176,11 @@ impl Player {
             + self.shared.frames_played.load(Ordering::Acquire) as f64 / self.device_rate as f64
     }
 
+    /// The file played to the end and hasn't been started again.
+    pub fn finished(&self) -> bool {
+        self.shared.finished.load(Ordering::Acquire)
+    }
+
     /// True once after the current file finished playing to the end.
     pub fn take_ended(&self) -> bool {
         self.shared.ended.swap(false, Ordering::AcqRel)
@@ -177,6 +188,19 @@ impl Player {
 
     pub fn status(&self) -> Status {
         self.status.lock().unwrap().clone()
+    }
+
+    /// The bitrate of the second just played, in kbps, from the sizes of its packets; `None`
+    /// when the decoder doesn't tell them (FFmpeg) or too little has played.
+    pub fn live_bitrate(&self) -> Option<f64> {
+        let pos = self.position();
+        let packets = self.shared.packets.lock().unwrap();
+        let (mut bytes, mut secs) = (0u64, 0f64);
+        for &(start, dur, size) in packets.iter().filter(|(start, ..)| *start >= pos - 1.0 && *start < pos) {
+            bytes += u64::from(size);
+            secs += dur.min(pos - start);
+        }
+        (secs > 0.25).then(|| bytes as f64 * 8.0 / secs / 1000.0)
     }
 }
 
@@ -239,6 +263,21 @@ impl Decoder {
             Self::Av(d) => d.seek(secs),
         }
     }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Sym(_) => "symphonia",
+            Self::Av(_) => "FFmpeg",
+        }
+    }
+
+    /// The last packet decoded: start, length (seconds) and size.
+    fn take_packet(&mut self) -> Option<(f64, f64, u32)> {
+        match self {
+            Self::Sym(d) => d.last_packet.take(),
+            Self::Av(_) => None,
+        }
+    }
 }
 
 struct SymDecoder {
@@ -247,6 +286,8 @@ struct SymDecoder {
     track_id: u32,
     sample_rate: u32,
     channels: usize,
+    time_base: Option<TimeBase>,
+    last_packet: Option<(f64, f64, u32)>,
 }
 
 impl SymDecoder {
@@ -265,6 +306,7 @@ impl SymDecoder {
         )?;
         let track = format.default_track(TrackType::Audio).ok_or_else(|| anyhow!("no audio track"))?;
         let track_id = track.id;
+        let time_base = track.time_base;
         let params = track
             .codec_params
             .as_ref()
@@ -274,7 +316,7 @@ impl SymDecoder {
         let channels = params.channels.as_ref().map(|c| c.count()).unwrap_or(2);
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(params, &AudioDecoderOptions::default())?;
-        Ok(Self { format, decoder, track_id, sample_rate, channels })
+        Ok(Self { format, decoder, track_id, sample_rate, channels, time_base, last_packet: None })
     }
 
     fn tags(&mut self) -> Tags {
@@ -318,6 +360,11 @@ impl SymDecoder {
             let Some(packet) = self.format.next_packet()? else { return Ok(false) };
             if packet.track_id != self.track_id {
                 continue;
+            }
+            if let Some(tb) = self.time_base {
+                let start = tb.calc_time_saturating(packet.pts).as_secs_f64();
+                let dur = tb.calc_duration(packet.dur).map_or(0.0, |t| t.as_secs_f64());
+                self.last_packet = Some((start, dur, packet.data.len() as u32));
             }
             match self.decoder.decode(&packet) {
                 Ok(buf) => {
@@ -408,6 +455,7 @@ impl Worker {
                             channels: d.channels(),
                             error: None,
                             tags: d.tags(),
+                            decoder: d.name(),
                         };
                         self.resampler = (d.sample_rate() != self.device_rate)
                             .then(|| {
@@ -486,6 +534,7 @@ impl Worker {
             self.shared.flush.store(false, Ordering::Release);
         }
         self.shared.frames_played.store(0, Ordering::Release);
+        self.shared.packets.lock().unwrap().clear();
     }
 
     /// Moves audio one step down the pipeline. Returns false when nothing could be done.
@@ -515,6 +564,14 @@ impl Worker {
                 false
             }
         };
+        if let Some(p) = d.take_packet() {
+            let mut packets = self.shared.packets.lock().unwrap();
+            // A few seconds behind is plenty: the ring holds well under one.
+            while packets.front().is_some_and(|f| f.0 < p.0 - 5.0) {
+                packets.pop_front();
+            }
+            packets.push_back(p);
+        }
         self.resample(!more);
         if !more {
             self.decoder_done = true;

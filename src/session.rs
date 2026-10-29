@@ -133,6 +133,15 @@ pub struct Session {
     /// How the panels are docked; dropped (back to the default) if it can't be read.
     #[serde(deserialize_with = "dock_layout")]
     pub dock: Option<egui_dock::DockState<crate::app::Tab>>,
+    /// The panels there were when the layout was saved; newer ones are added to it.
+    #[serde(deserialize_with = "known_tabs")]
+    pub tabs_seen: Vec<crate::app::Tab>,
+}
+
+/// The tabs this version knows, skipping any it doesn't.
+fn known_tabs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<crate::app::Tab>, D::Error> {
+    let v = <Vec<serde_json::Value> as Deserialize>::deserialize(d)?;
+    Ok(v.into_iter().filter_map(|t| serde_json::from_value(t).ok()).collect())
 }
 
 /// `None` instead of failing the whole session, e.g. for a tab a later version dropped.

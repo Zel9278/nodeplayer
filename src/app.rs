@@ -50,10 +50,12 @@ pub(crate) enum Tab {
     Extensions,
     Misskey,
     Discord,
+    Info,
 }
 
 impl Tab {
-    const ALL: [Self; 7] = [Self::Graph, Self::Library, Self::Presets, Self::Plugins, Self::Extensions, Self::Misskey, Self::Discord];
+    pub(crate) const ALL: [Self; 8] =
+        [Self::Graph, Self::Library, Self::Presets, Self::Plugins, Self::Extensions, Self::Misskey, Self::Discord, Self::Info];
 
     fn title(self) -> &'static str {
         match self {
@@ -64,7 +66,24 @@ impl Tab {
             Self::Extensions => "⚙ Extensions",
             Self::Misskey => "📢 Misskey",
             Self::Discord => "🎮 Discord",
+            Self::Info => "ℹ Now playing",
         }
+    }
+}
+
+/// Puts a panel this version added into a layout saved before it: the "Now playing" panel
+/// under the library, others with the library's tabs.
+fn add_new_tab(dock: &mut egui_dock::DockState<Tab>, tab: Tab) {
+    let library = dock.find_main_surface_tab(&Tab::Library).map(|(node, _)| node);
+    match (tab, library) {
+        (Tab::Info, Some(node)) => {
+            dock.main_surface_mut().split_below(node, 0.62, vec![tab]);
+        }
+        (_, Some(node)) => {
+            dock.set_focused_node_and_surface(egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node });
+            dock.push_to_focused_leaf(tab);
+        }
+        _ => dock.push_to_first_leaf(tab),
     }
 }
 
@@ -76,6 +95,7 @@ fn default_dock(extensions: bool) -> egui_dock::DockState<Tab> {
         side.push(Tab::Extensions);
     }
     let [_, left] = dock.main_surface_mut().split_left(egui_dock::NodeIndex::root(), 0.35, side);
+    dock.main_surface_mut().split_below(left, 0.62, vec![Tab::Info]);
     // The library in front.
     dock.set_focused_node_and_surface(egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node: left });
     dock
@@ -112,6 +132,20 @@ impl egui_dock::TabViewer for Tabs<'_> {
             Tab::Extensions => app.extensions_panel(ui),
             Tab::Misskey => app.misskey.ui(ui, &app.player.status()),
             Tab::Discord => app.discord.ui(ui, &app.player.status()),
+            Tab::Info => {
+                let status = app.player.status();
+                let plays = status.path.as_deref().map(|p| app.library.play_stats(p)).unwrap_or_default();
+                let now = crate::info::Now {
+                    status: &status,
+                    playing: app.player.is_playing(),
+                    finished: app.player.finished(),
+                    position: app.player.position(),
+                    rate: app.player.rate(),
+                    output: app.engine.as_ref().map(|e| (e.device_name.as_str(), e.sample_rate, e.channels as u16)),
+                    plays,
+                };
+                app.info.ui(ui, now);
+            }
         }
     }
 
@@ -190,6 +224,7 @@ pub struct App {
     mpris: Option<Mpris>,
     misskey: Misskey,
     discord: crate::discord::Discord,
+    info: crate::info::Info,
     play_counter: library::PlayCounter,
     /// First-run questions: downloading FFmpeg, installing the AppImage.
     setup: crate::setup::Setup,
@@ -275,6 +310,7 @@ impl App {
             mpris: Mpris::new(ctx.clone()),
             misskey: Misskey::new(ctx.clone()),
             discord: crate::discord::Discord::new(ctx.clone()),
+            info: crate::info::Info::new(),
             play_counter: library::PlayCounter::default(),
             setup: crate::setup::Setup::new(),
             ffmpeg: (crate::av::available(), Instant::now()),
@@ -339,6 +375,16 @@ impl App {
             Some(mut d) if d.find_tab(&Tab::Graph).is_some() => {
                 if app.extensions.panels().is_empty() {
                     d.retain_tabs(|t| *t != Tab::Extensions);
+                }
+                // Panels added since the layout was saved (a panel closed then stays closed).
+                for tab in [Tab::Discord, Tab::Info] {
+                    if !saved.tabs_seen.contains(&tab) && d.find_tab(&tab).is_none() {
+                        add_new_tab(&mut d, tab);
+                    }
+                }
+                // Adding a tab brings it to the front; keep the library there.
+                if let Some(path) = d.find_tab(&Tab::Library) {
+                    let _ = d.set_active_tab(path);
                 }
                 d
             }
@@ -729,6 +775,7 @@ impl App {
             shuffle: self.library.shuffle,
             rate: Some(self.rate),
             dock: Some(self.dock.clone()),
+            tabs_seen: Tab::ALL.to_vec(),
         };
         session::save_session(&s);
         self.last_save = Instant::now();
@@ -2029,6 +2076,7 @@ impl eframe::App for App {
         {
             self.library.add_play(path);
         }
+        self.info.sample(status.path.as_deref(), self.player.is_playing(), || self.player.live_bitrate());
         let nodes = graph::rate_shift(&mut self.snarl);
         self.player.set_rate(self.rate * nodes);
         self.discord.update(&status, self.player.is_playing(), self.player.position(), f64::from(self.rate * nodes));
@@ -2068,6 +2116,15 @@ impl eframe::App for App {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if let Some(p) = dropped.into_iter().next() {
             self.open_dropped(p);
+        }
+        // Space plays and pauses, unless something is being typed. Taken before any widget
+        // sees it, so it doesn't also press the focused button.
+        if !ctx.text_edit_focused() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+            if self.player.is_playing() {
+                self.player.set_playing(false);
+            } else {
+                self.play();
+            }
         }
 
         egui::Panel::top("transport").show(ui, |ui| {

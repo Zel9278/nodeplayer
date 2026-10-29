@@ -8,6 +8,7 @@ mod discord;
 mod engine;
 mod eq_editor;
 mod fonts;
+mod info;
 mod graph;
 mod jsfx;
 mod library;

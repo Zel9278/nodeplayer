@@ -540,6 +540,9 @@ pub fn track_info(path: &Path) -> Result<TrackInfo> {
         }
         tech("encoding", if lossless { "lossless" } else { "lossy" }.into());
     }
+    if let Some(name) = probe.format["format_long_name"].as_str().filter(|n| !n.is_empty()) {
+        info.tech.push(("container".into(), name.to_string()));
+    }
     Ok(info)
 }
 
