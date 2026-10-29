@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=nodeplayer
+Comment=Node-graph audio player with DSP nodes and VST3, CLAP and JSFX plugins
+Exec=nodeplayer %f
+Icon=nodeplayer
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+MimeType=audio/flac;audio/mpeg;audio/ogg;audio/opus;audio/x-wav;audio/wav;audio/mp4;audio/aac;audio/x-aiff;video/mp4;video/x-matroska;video/webm;video/quicktime;inode/directory;
+StartupWMClass=nodeplayer

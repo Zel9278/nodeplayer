@@ -1,0 +1,11 @@
+[package]
+name = "np-example"
+version = "0.1.0"
+edition = "2024"
+description = "Example nodeplayer plugin: two DSP nodes and a toolbox extension"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nodeplayer-plugin = { path = "../../sdk" }

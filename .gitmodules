@@ -1,0 +1,3 @@
+[submodule "third_party/ysfx"]
+	path = third_party/ysfx
+	url = https://github.com/JoepVanlier/ysfx.git

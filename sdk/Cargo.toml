@@ -1,0 +1,7 @@
+[package]
+name = "nodeplayer-plugin"
+version = "0.1.0"
+edition = "2024"
+description = "Plugin SDK for nodeplayer: DSP nodes and app extensions as shared libraries"
+
+[dependencies]
