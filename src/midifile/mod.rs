@@ -2251,12 +2251,14 @@ mod tests {
     /// should sound, in time order and spaced as in the file.
     #[test]
     fn player_sends_timed_messages() {
-        let piano = track(&[(0, &[0x90, 60, 100]), (240, &[0x80, 60, 0]), (0, &[0x90, 62, 90]), (240, &[0x80, 62, 0])]);
+        // Half a second in: a note-on due over 100 ms ago is left out, and a busy machine may
+        // start the player's thread that late.
+        let piano = track(&[(480, &[0x90, 60, 100]), (240, &[0x80, 60, 0]), (0, &[0x90, 62, 90]), (240, &[0x80, 62, 0])]);
         let mut player = MidiPlayer::new(MidiSettings::default());
         let (out, mut rx) = MidiOut::new(1 << 12);
         player.set_output(Some(out));
         player.install(parse_bytes(file(480, &[piano])).unwrap(), true);
-        // The four notes span 0.5 s; give a busy machine's late thread a while longer.
+        // The notes end 1 s in; give a busy machine's late thread a while longer.
         let mut sent: Vec<Timed> = Vec::new();
         let until = Instant::now() + Duration::from_secs(5);
         while sent.iter().filter(|s| s.0.is_some()).count() < 4 && Instant::now() < until {
@@ -2274,8 +2276,9 @@ mod tests {
 
     #[test]
     fn player_plays_seeks_and_releases() {
+        // Half a second in, as in `player_sends_timed_messages`.
         let piano = track(&[
-            (0, &[0x90, 60, 100]),
+            (480, &[0x90, 60, 100]),
             (48, &[0x80, 60, 0]),
             (0, &[0x90, 62, 100]),
             (4800, &[0x80, 62, 0]),
@@ -2304,9 +2307,9 @@ mod tests {
         assert!(player.key_down(62));
         player.seek(0.0);
         assert!(settles(&|| down(&player, 62) == 0), "seeking before the note lets it go");
-        player.seek(4.0);
+        player.seek(4.5);
         assert!(settles(&|| down(&player, 62) == 1), "seeking into the note holds it");
-        assert!((player.control().now() - 4.0).abs() < 1e-9);
+        assert!((player.control().now() - 4.5).abs() < 1e-9);
         player.stop();
         assert!(settles(&|| !player.is_playing() && down(&player, 62) == 0), "stopping lets everything go");
         assert_eq!(player.control().now(), 0.0);
