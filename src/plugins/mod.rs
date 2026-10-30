@@ -13,9 +13,9 @@ pub mod win32win;
 #[cfg(target_os = "windows")]
 pub use win32win as window;
 #[cfg(target_os = "macos")]
-pub mod nowin;
+pub mod macwin;
 #[cfg(target_os = "macos")]
-pub use nowin as window;
+pub use macwin as window;
 
 use std::path::{Path, PathBuf};
 
@@ -46,7 +46,6 @@ pub struct PxRect {
 }
 
 /// What happened to an editor's window since the last `HostWindow::poll`.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub enum WinEvent {
     /// The user closed a top-level editor window.
     Close,

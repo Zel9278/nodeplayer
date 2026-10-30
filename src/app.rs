@@ -2535,7 +2535,12 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                     // Reserve the editor's actual pixel size on screen; the X11 child window is
                     // moved over this rect after the graph is drawn. The editor is asked to
                     // follow the zoom, which it does if it can scale or resize.
-                    let ppp = self.ppp;
+                    // macOS editors count in points and handle Retina themselves.
+                    let ppp = if cfg!(target_os = "macos") {
+                        self.ppp / ui.ctx().native_pixels_per_point().unwrap_or(1.0)
+                    } else {
+                        self.ppp
+                    };
                     let xf = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or_default();
                     ed.set_zoom(ppp * xf.scaling);
                     let (w, h) = ed.size();
