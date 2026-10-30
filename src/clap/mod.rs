@@ -67,9 +67,10 @@ unsafe impl Sync for Module {}
 
 impl Module {
     pub fn load(path: &Path) -> Result<Self> {
-        // A macOS plugin is a bundle; init still gets the bundle's path.
-        let bin = if cfg!(target_os = "macos") { dylib::mac_bundle_binary(path)? } else { path.to_path_buf() };
+        let bin = bundle_binary(path)?;
         let lib = dylib::open(&bin)?;
+        // init gets the bundle on macOS, the binary elsewhere.
+        let init_path = if cfg!(target_os = "macos") { path } else { bin.as_path() };
         unsafe {
             let entry: *const clap_plugin_entry =
                 *lib.get::<*const clap_plugin_entry>(b"clap_entry").context("clap_entry not exported")?;
@@ -80,7 +81,7 @@ impl Module {
             if !clap_sys::version::clap_version_is_compatible(e.clap_version) {
                 bail!("incompatible CLAP version {}.{}", e.clap_version.major, e.clap_version.minor);
             }
-            let cpath = CString::new(path.as_os_str().as_encoded_bytes())?;
+            let cpath = CString::new(init_path.as_os_str().as_encoded_bytes())?;
             if !e.init.is_some_and(|f| f(cpath.as_ptr())) {
                 bail!("clap_entry.init failed");
             }
@@ -159,12 +160,43 @@ pub fn default_search_paths() -> Vec<PathBuf> {
     v
 }
 
-/// Finds `.clap` files (bundles on macOS) below `root` without loading them.
+/// The binary of the CLAP at `path`: `path` itself when it's a file, otherwise the one inside
+/// the bundle folder. That's `Contents/MacOS/` on macOS; elsewhere vendors use the VST3 layout
+/// (`X.clap/Contents/x86_64-win/X.clap`, `…/x86_64-linux/X.so`, …), or just put the file
+/// somewhere inside.
+pub fn bundle_binary(path: &Path) -> Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return dylib::mac_bundle_binary(path);
+    }
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    let os = if cfg!(windows) { "win" } else { "linux" };
+    let arch_dir = path.join("Contents").join(format!("{}-{os}", std::env::consts::ARCH));
+    find_binary(&arch_dir, 0)
+        .or_else(|| find_binary(path, 0))
+        .ok_or_else(|| anyhow!("no .clap or .{} in {}", dylib::EXT, path.display()))
+}
+
+/// The first `.clap` file below `dir`, else the first shared library, looking a few levels deep.
+fn find_binary(dir: &Path, depth: u32) -> Option<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    let has = |p: &PathBuf, ext: &str| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case(ext));
+    entries
+        .iter()
+        .find(|p| has(p, "clap"))
+        .or_else(|| entries.iter().find(|p| has(p, dylib::EXT)))
+        .cloned()
+        .or_else(|| if depth < 3 { entries.iter().filter(|p| p.is_dir()).find_map(|p| find_binary(p, depth + 1)) } else { None })
+}
+
+/// Finds `.clap` files and bundle folders below `root` without loading them.
 pub fn find_files(root: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(root) else { return };
     for e in rd.flatten() {
         let p = e.path();
-        if (p.is_file() || cfg!(target_os = "macos")) && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("clap")) {
+        if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("clap")) {
             out.push(p);
         } else if p.is_dir() {
             find_files(&p, out);
@@ -1156,5 +1188,47 @@ impl Drop for ClapProcessor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn finds_the_binary_in_a_bundle_folder() {
+        let root = std::env::temp_dir().join(format!("np-clap-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let os = if cfg!(windows) { "win" } else { "linux" };
+        let arch = format!("{}-{os}", std::env::consts::ARCH);
+
+        // The VST3-like layout, with a binary for another platform beside it.
+        let a = root.join("A.clap");
+        std::fs::create_dir_all(a.join("Contents").join(&arch)).unwrap();
+        std::fs::create_dir_all(a.join("Contents/other-arch")).unwrap();
+        std::fs::write(a.join("Contents/other-arch/A.clap"), b"").unwrap();
+        std::fs::write(a.join("Contents").join(&arch).join("A.clap"), b"").unwrap();
+        std::fs::write(a.join("readme.txt"), b"").unwrap();
+        assert_eq!(bundle_binary(&a).unwrap(), a.join("Contents").join(&arch).join("A.clap"));
+
+        // A shared library somewhere inside.
+        let b = root.join("B.clap");
+        std::fs::create_dir_all(b.join("bin")).unwrap();
+        let lib = b.join("bin").join(format!("B.{}", dylib::EXT));
+        std::fs::write(&lib, b"").unwrap();
+        assert_eq!(bundle_binary(&b).unwrap(), lib);
+
+        // A plain file, and both bundles counted once each.
+        let c = root.join("C.clap");
+        std::fs::write(&c, b"").unwrap();
+        assert_eq!(bundle_binary(&c).unwrap(), c);
+        let mut found = Vec::new();
+        find_files(&root, &mut found);
+        found.sort();
+        assert_eq!(found, vec![a, b, c]);
+
+        assert!(bundle_binary(&root.join("missing.clap")).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

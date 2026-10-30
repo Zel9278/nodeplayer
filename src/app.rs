@@ -1863,12 +1863,19 @@ impl App {
             if ui.add_enabled(!scanning, egui::Button::new("Scan plugins")).on_hover_text("VST3, CLAP, JSFX and native plugins").clicked() {
                 self.start_scan();
             }
-            if ui.add_enabled(!scanning, egui::Button::new("Add file…")).on_hover_text("a .clap, .so or JSFX file outside the usual folders").clicked() {
+            let hint = format!("a .clap, .{} or JSFX file outside the usual folders", crate::plugins::dylib::EXT);
+            if ui.add_enabled(!scanning, egui::Button::new("Add file…")).on_hover_text(hint).clicked() {
                 let mut dlg = rfd::FileDialog::new();
                 if let Some(dir) = crate::jsfx::default_search_paths().into_iter().find(|d| d.is_dir()) {
                     dlg = dlg.set_directory(dir);
                 }
                 if let Some(path) = dlg.pick_file() {
+                    self.add_plugin_file(&path);
+                }
+            }
+            // Bundles are folders, which a file dialog won't pick.
+            if ui.add_enabled(!scanning, egui::Button::new("Add bundle…")).on_hover_text("a .vst3 or .clap folder").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.add_plugin_file(&path);
                 }
             }
