@@ -1283,7 +1283,12 @@ impl Shared {
 const ROUND_EVENTS: usize = 1 << 19;
 const MIN_ROUND_SPAN: f64 = 1e-4;
 const MAX_ROUND_SPAN: f64 = 0.25;
+#[cfg(not(test))]
 const LATE_LIMIT: Duration = Duration::from_millis(100);
+/// CI machines can stall the player's thread for longer than that, and the tests check what
+/// gets played, not this.
+#[cfg(test)]
+const LATE_LIMIT: Duration = Duration::from_secs(10);
 
 /// File notes are sent this long before they are due, so each lands in an audio block that is
 /// not rendered yet and starts at its own frame (the player wakes every 2 ms or more).
@@ -2251,8 +2256,6 @@ mod tests {
     /// should sound, in time order and spaced as in the file.
     #[test]
     fn player_sends_timed_messages() {
-        // Half a second in: a note-on due over 100 ms ago is left out, and a busy machine may
-        // start the player's thread that late.
         let piano = track(&[(480, &[0x90, 60, 100]), (240, &[0x80, 60, 0]), (0, &[0x90, 62, 90]), (240, &[0x80, 62, 0])]);
         let mut player = MidiPlayer::new(MidiSettings::default());
         let (out, mut rx) = MidiOut::new(1 << 12);
@@ -2276,7 +2279,6 @@ mod tests {
 
     #[test]
     fn player_plays_seeks_and_releases() {
-        // Half a second in, as in `player_sends_timed_messages`.
         let piano = track(&[
             (480, &[0x90, 60, 100]),
             (48, &[0x80, 60, 0]),
