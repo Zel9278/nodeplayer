@@ -201,7 +201,7 @@ impl Meter {
     }
 
     fn feed(&self, ch: usize, peak: f32) {
-        let _ = self.0[ch].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        let _ = self.0[ch].try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
             (peak > f32::from_bits(old)).then_some(peak.to_bits())
         });
     }
@@ -301,7 +301,7 @@ impl LimiterMeter {
     }
 
     fn feed(&self, gain: f32) {
-        let _ = self.gain.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        let _ = self.gain.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
             (gain < f32::from_bits(old)).then_some(gain.to_bits())
         });
     }

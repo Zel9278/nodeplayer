@@ -533,8 +533,9 @@ mod tests {
         assert!(desktop_entry(Path::new("/home/a b/x.AppImage")).contains("Exec=\"/home/a b/x.AppImage\" %f\n"));
     }
 
+    // GNU tar's --wildcards: the tar.xz builds are for Linux only.
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn unpacks_the_two_programs() {
         use std::os::unix::fs::PermissionsExt;
         let base = std::env::temp_dir().join(format!("nodeplayer-unpack-{}", std::process::id()));

@@ -46,6 +46,7 @@ pub struct PxRect {
 }
 
 /// What happened to an editor's window since the last `HostWindow::poll`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub enum WinEvent {
     /// The user closed a top-level editor window.
     Close,
