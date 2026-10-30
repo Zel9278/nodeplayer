@@ -1,5 +1,6 @@
 //! VST3 editors: an IPlugView in a [`HostWindow`], plus the IPlugFrame / IRunLoop the plugin
-//! needs on Linux.
+//! needs on Linux. On Windows the plugin's windows get their messages from the UI thread's
+//! event loop like ours, so the run loop goes unused there.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -12,8 +13,16 @@ use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
-use crate::plugins::x11win::{HostWindow, WinEvent};
-use crate::plugins::{Placement, PxRect};
+use crate::plugins::window::HostWindow;
+use crate::plugins::{Placement, PxRect, WinEvent};
+
+/// The kind of window a VST3 editor is attached to on this platform.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const PLATFORM_TYPE: FIDString = kPlatformTypeX11EmbedWindowID;
+#[cfg(target_os = "windows")]
+const PLATFORM_TYPE: FIDString = kPlatformTypeHWND;
+#[cfg(target_os = "macos")]
+const PLATFORM_TYPE: FIDString = kPlatformTypeNSView;
 
 struct Timer {
     handler: ComPtr<ITimerHandler>,
@@ -92,7 +101,9 @@ impl PlugFrame {
     /// Runs ready fd handlers and due timers. Callbacks may (un)register handlers re-entrantly,
     /// so the lists are snapshotted before calling out.
     fn pump(&self) {
+        #[cfg(unix)]
         let fds: Vec<_> = self.fds.borrow().iter().map(|(h, fd)| (h.clone(), *fd)).collect();
+        #[cfg(unix)]
         if !fds.is_empty() {
             let mut pfds: Vec<libc::pollfd> =
                 fds.iter().map(|&(_, fd)| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
@@ -141,8 +152,8 @@ impl Editor {
         unsafe {
             let view = ComPtr::from_raw(controller.createView(ViewType::kEditor))
                 .ok_or_else(|| anyhow!("plugin has no editor"))?;
-            if view.isPlatformTypeSupported(kPlatformTypeX11EmbedWindowID) != kResultTrue {
-                bail!("editor doesn't support X11 embedding");
+            if view.isPlatformTypeSupported(PLATFORM_TYPE) != kResultTrue {
+                bail!("editor doesn't support {}", std::ffi::CStr::from_ptr(PLATFORM_TYPE).to_string_lossy());
             }
 
             let mut rect: ViewRect = std::mem::zeroed();
@@ -160,7 +171,7 @@ impl Editor {
                 timers: RefCell::new(Vec::new()),
             });
             view.setFrame(frame.as_com_ref::<IPlugFrame>().unwrap().as_ptr());
-            if view.attached(window.id as usize as *mut c_void, kPlatformTypeX11EmbedWindowID) != kResultOk {
+            if view.attached(window.handle() as *mut c_void, PLATFORM_TYPE) != kResultOk {
                 view.setFrame(std::ptr::null_mut());
                 bail!("IPlugView::attached failed");
             }
@@ -179,6 +190,7 @@ impl Editor {
         }
     }
 
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     pub fn window_id(&self) -> u32 {
         self.window.id
     }

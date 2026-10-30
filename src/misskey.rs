@@ -8,7 +8,7 @@
 //! Accounts log in with MiAuth (or a pasted access token). The settings, tokens included, are
 //! kept in `~/.config/nodeplayer/misskey.json`, readable only by the user.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -163,17 +163,12 @@ impl Settings {
 
     /// Writes through a temporary file, readable only by the user since it holds tokens.
     pub fn save(&self) -> Result<()> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let path = settings_path().context("no config directory")?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = path.with_extension("json.tmp");
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        // The mode only applies to a new file.
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(&serde_json::to_vec_pretty(self)?)?;
-        drop(f);
+        crate::dirs::write_private(&tmp, &serde_json::to_vec_pretty(self)?)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
@@ -355,10 +350,8 @@ fn miauth_wait(base: &str, session: &str, cancel: &AtomicBool) -> Result<Account
 }
 
 fn open_browser(url: &str) {
-    match std::process::Command::new("xdg-open").arg(url).stdin(std::process::Stdio::null()).spawn() {
-        // Reap it so it doesn't linger as a zombie.
-        Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
-        Err(e) => log::warn!("can't run xdg-open: {e}"),
+    if let Err(e) = crate::dirs::open(url) {
+        log::warn!("can't open {url}: {e}");
     }
 }
 

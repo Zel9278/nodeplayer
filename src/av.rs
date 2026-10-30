@@ -15,23 +15,39 @@ use crate::player::Tags;
 
 /// Where nodeplayer keeps its own copy of the programs.
 pub fn local_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-    Some(base.join("nodeplayer/ffmpeg"))
+    Some(crate::dirs::data()?.join("ffmpeg"))
 }
 
 /// `ffmpeg` or `ffprobe`: nodeplayer's own copy, else the one on the PATH.
 pub fn tool(name: &str) -> Option<PathBuf> {
-    if let Some(p) = local_dir().map(|d| d.join(name)).filter(|p| is_executable(p)) {
+    let name = exe_name(name);
+    if let Some(p) = local_dir().map(|d| d.join(&name)).filter(|p| is_executable(p)) {
         return Some(p);
     }
-    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| is_executable(p))
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    // Apps started from the Finder don't get Homebrew's folders on their PATH.
+    if cfg!(target_os = "macos") {
+        dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    }
+    dirs.into_iter().map(|d| d.join(&name)).find(|p| is_executable(p))
+}
+
+/// The program's file name on this platform (`ffmpeg`, `ffmpeg.exe`).
+pub fn exe_name(name: &str) -> String {
+    if cfg!(windows) { format!("{name}.exe") } else { name.to_owned() }
 }
 
 fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    // Windows has no executable bit; the name already carries .exe.
+    #[cfg(windows)]
+    {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file())
+    }
 }
 
 /// Both programs are there.

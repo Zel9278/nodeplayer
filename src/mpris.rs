@@ -1,5 +1,6 @@
-//! Media session integration (MPRIS on D-Bus): shows the current track in the desktop's media
-//! controls and forwards their play/pause/next/seek requests.
+//! Media session integration (MPRIS on D-Bus on Linux, the System Media Transport Controls on
+//! Windows, Now Playing on macOS): shows the current track in the desktop's media controls and
+//! forwards their play/pause/next/seek requests.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -22,8 +23,13 @@ pub struct Mpris {
 }
 
 impl Mpris {
-    pub fn new(ctx: egui::Context) -> Option<Self> {
-        let config = PlatformConfig { dbus_name: "nodeplayer", display_name: "nodeplayer", hwnd: None };
+    /// `hwnd` is the main window, which Windows ties the media session to; unused elsewhere.
+    pub fn new(ctx: egui::Context, hwnd: Option<crate::plugins::WindowId>) -> Option<Self> {
+        if cfg!(windows) && hwnd.is_none() {
+            return None;
+        }
+        let hwnd = hwnd.map(|h| h as *mut std::ffi::c_void);
+        let config = PlatformConfig { dbus_name: "nodeplayer", display_name: "nodeplayer", hwnd };
         let mut controls = MediaControls::new(config).map_err(|e| log::warn!("media session: {e:?}")).ok()?;
         let (tx, rx) = crossbeam_channel::unbounded();
         controls
@@ -128,10 +134,7 @@ impl Drop for Mpris {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("nodeplayer"))
+    crate::dirs::cache()
 }
 
 pub(crate) fn folder_image(dir: &Path) -> Option<PathBuf> {

@@ -179,25 +179,25 @@ impl Vst3Processor {
             let vel = |v: f32| (v * 127.0).round().clamp(0.0, 127.0) as u8;
             let data = unsafe {
                 match e.r#type as u32 {
-                    t if t == kNoteOnEvent => {
+                    t if t == kNoteOnEvent as u32 => {
                         let x = e.__field0.noteOn;
                         [0x90 | (x.channel as u8 & 15), x.pitch as u8 & 127, vel(x.velocity).max(1)]
                     }
-                    t if t == kNoteOffEvent => {
+                    t if t == kNoteOffEvent as u32 => {
                         let x = e.__field0.noteOff;
                         [0x80 | (x.channel as u8 & 15), x.pitch as u8 & 127, vel(x.velocity)]
                     }
-                    t if t == kPolyPressureEvent => {
+                    t if t == kPolyPressureEvent as u32 => {
                         let x = e.__field0.polyPressure;
                         [0xa0 | (x.channel as u8 & 15), x.pitch as u8 & 127, vel(x.pressure)]
                     }
-                    t if t == kLegacyMIDICCOutEvent => {
+                    t if t == kLegacyMIDICCOutEvent as u32 => {
                         let x = e.__field0.midiCCOut;
                         let ch = x.channel as u8 & 15;
                         match x.controlNumber as u32 {
                             c if c < 128 => [0xb0 | ch, c as u8, x.value as u8 & 127],
-                            c if c == ControllerNumbers_::kAfterTouch => [0xd0 | ch, x.value as u8 & 127, 0],
-                            c if c == ControllerNumbers_::kPitchBend => [0xe0 | ch, x.value as u8 & 127, x.value2 as u8 & 127],
+                            c if c == ControllerNumbers_::kAfterTouch as u32 => [0xd0 | ch, x.value as u8 & 127, 0],
+                            c if c == ControllerNumbers_::kPitchBend as u32 => [0xe0 | ch, x.value as u8 & 127, x.value2 as u8 & 127],
                             130 => [0xc0 | ch, x.value as u8 & 127, 0],
                             _ => return,
                         }

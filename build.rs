@@ -16,7 +16,27 @@ fn main() {
         .build();
     println!("cargo:rustc-link-search=native={}/build", dst.display());
     println!("cargo:rustc-link-lib=static=ysfx");
-    for lib in ["stdc++", "fontconfig", "freetype", "dl", "pthread", "m"] {
+    // What ysfx's graphics (LICE, and SWELL outside Windows) need from the system.
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let libs: &[&str] = match (os.as_str(), env.as_str()) {
+        ("windows", "msvc") => &["gdi32", "user32", "shell32", "comdlg32"],
+        ("windows", _) => &["gdi32", "user32", "shell32", "comdlg32"],
+        ("macos", _) => &["c++"],
+        _ => &["stdc++", "fontconfig", "freetype", "dl", "pthread", "m"],
+    };
+    for lib in libs {
         println!("cargo:rustc-link-lib=dylib={lib}");
+    }
+    // MinGW's C++ runtime goes in statically, so the .exe needs no DLLs beside it.
+    if os == "windows" && env == "gnu" {
+        println!("cargo:rustc-link-lib=static=stdc++");
+        println!("cargo:rustc-link-lib=static=winpthread");
+        println!("cargo:rustc-link-arg=-static-libgcc");
+    }
+    if os == "macos" {
+        for fw in ["Cocoa", "Carbon", "Foundation", "Metal"] {
+            println!("cargo:rustc-link-lib=framework={fw}");
+        }
     }
 }

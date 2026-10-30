@@ -1,24 +1,24 @@
 //! VST3 hosting: module loading, scanning and instance lifecycle.
 //!
-//! Windows plugins are expected to be wrapped by yabridge, which makes them look like
-//! ordinary Linux VST3 bundles, so nothing here is Wine-specific.
+//! On Linux, Windows plugins are expected to be wrapped by yabridge, which makes them look like
+//! ordinary Linux VST3 bundles, so nothing here is Wine-specific. On Windows and macOS the
+//! platform's own bundles load directly.
 
 pub mod editor;
 pub mod host;
 mod processor;
 
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
-use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{ComPtr, ComWrapper, Interface};
 
+use crate::plugins::dylib::{self, Library};
 use crate::plugins::{self, Format, ParamDesc, Placement, PluginInfo};
 use host::{
     ComponentHandler, HostApp, MemoryStream, ParamChange, ParamSender, cchar_to_string,
@@ -56,38 +56,63 @@ pub struct Module {
 unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
-/// Resolves a bundle directory to the shared object inside it.
+/// Resolves a bundle directory to the shared library inside it: `Contents/x86_64-linux/X.so`,
+/// `Contents/x86_64-win/X.vst3`, `Contents/MacOS/X`. Older Windows plugins are a single DLL
+/// named `X.vst3`, which is returned as it is.
 pub fn bundle_binary(path: &Path) -> Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return dylib::mac_bundle_binary(path);
+    }
     if path.is_file() {
         return Ok(path.to_path_buf());
     }
-    let dir = path.join("Contents").join(format!("{}-linux", std::env::consts::ARCH));
+    let (arch, ext) = if cfg!(windows) {
+        (format!("{}-win", std::env::consts::ARCH), "vst3")
+    } else {
+        (format!("{}-linux", std::env::consts::ARCH), "so")
+    };
+    let dir = path.join("Contents").join(arch);
     let stem = path.file_stem().unwrap_or_default();
-    let preferred = dir.join(stem).with_extension("so");
+    let preferred = dir.join(stem).with_extension(ext);
     if preferred.is_file() {
         return Ok(preferred);
     }
     std::fs::read_dir(&dir)
         .with_context(|| format!("no {} in bundle", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.extension().is_some_and(|e| e == "so"))
-        .ok_or_else(|| anyhow!("no .so in {}", dir.display()))
+        .find(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)))
+        .ok_or_else(|| anyhow!("no .{ext} in {}", dir.display()))
 }
 
 impl Module {
     pub fn load(bundle: &Path) -> Result<Self> {
         let bin = bundle_binary(bundle)?;
+        let lib = dylib::open(&bin)?;
         unsafe {
-            let lib = Library::open(Some(&bin), RTLD_NOW | RTLD_LOCAL)
-                .with_context(|| format!("dlopen {}", bin.display()))?;
-            let handle = lib.into_raw();
-            let lib = Library::from_raw(handle);
-
-            if let Ok(entry) = lib.get::<unsafe extern "system" fn(*mut c_void) -> bool>(b"ModuleEntry")
-            {
-                if !entry(handle) {
+            // Each platform has its own entry point, called once before anything else.
+            #[cfg(all(unix, not(target_os = "macos")))]
+            let lib = {
+                let lib: libloading::os::unix::Library = lib.into();
+                let handle = lib.into_raw();
+                let lib = Library::from(libloading::os::unix::Library::from_raw(handle));
+                if let Ok(entry) = lib.get::<unsafe extern "system" fn(*mut std::ffi::c_void) -> bool>(b"ModuleEntry")
+                    && !entry(handle)
+                {
                     bail!("ModuleEntry failed");
                 }
+                lib
+            };
+            #[cfg(windows)]
+            if let Ok(entry) = lib.get::<unsafe extern "system" fn() -> bool>(b"InitDll")
+                && !entry()
+            {
+                bail!("InitDll failed");
+            }
+            #[cfg(target_os = "macos")]
+            if let Ok(entry) = lib.get::<unsafe extern "C" fn(*mut std::ffi::c_void) -> bool>(b"bundleEntry")
+                && !entry(dylib::cf_bundle(bundle)?)
+            {
+                bail!("bundleEntry failed");
             }
             let get_factory = lib
                 .get::<unsafe extern "system" fn() -> *mut IPluginFactory>(b"GetPluginFactory")
@@ -175,15 +200,12 @@ impl ModuleCache {
 // ---------------------------------------------------------------------------
 // Scanning
 
-/// `$VST3_PATH` (colon separated) first, then the standard Linux locations.
+/// `$VST3_PATH` (separated like PATH) first, then the platform's standard locations.
 pub fn default_search_paths() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::env::var_os("VST3_PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    if let Some(home) = std::env::var_os("HOME") {
-        v.push(PathBuf::from(home).join(".vst3"));
-    }
-    v.extend(["/usr/lib/vst3", "/usr/lib64/vst3", "/usr/local/lib/vst3"].map(PathBuf::from));
+    v.extend(plugins::standard_dirs("VST3", ".vst3", &["/usr/lib/vst3", "/usr/lib64/vst3", "/usr/local/lib/vst3"]));
     v
 }
 
@@ -492,6 +514,7 @@ impl Vst3Plugin {
         }
     }
 
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
     pub fn controller(&self) -> Option<&ComPtr<IEditController>> {
         self.controller.as_ref()
     }

@@ -155,10 +155,7 @@ fn sidecar(path: &Path) -> Option<(String, PathBuf)> {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("nodeplayer/lyrics"))
+    Some(crate::dirs::cache()?.join("lyrics"))
 }
 
 /// FNV-1a, stable across builds (the cache file name).

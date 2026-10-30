@@ -552,10 +552,12 @@ impl Library {
 
 /// The file's stamp and when it was added.
 fn stamp(path: &Path) -> (Stamp, i64) {
-    use std::os::unix::fs::MetadataExt;
     let Ok(m) = std::fs::metadata(path) else { return ((0, 0), 0) };
-    let created = m.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64);
-    ((m.size(), m.mtime()), created.unwrap_or(m.mtime()))
+    let secs = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64)
+    };
+    let mtime = secs(m.modified()).unwrap_or(0);
+    ((m.len(), mtime), secs(m.created()).unwrap_or(mtime))
 }
 
 /// A release date as (year, month, day) for sorting; parts that are missing are 0. Takes
@@ -638,11 +640,8 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>) {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
     // -2: since release dates are read; the older file is removed so they get read.
-    let dir = base.join("nodeplayer");
+    let dir = crate::dirs::cache()?;
     let _ = std::fs::remove_file(dir.join("library-tags.json"));
     Some(dir.join("library-tags-2.json"))
 }
@@ -778,10 +777,14 @@ fn local(secs: i64) -> Option<libc::tm> {
     if secs <= 0 {
         return None;
     }
-    // SAFETY: localtime_r only writes the struct it's given.
+    // SAFETY: localtime_r and localtime_s only write the struct they're given.
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
-        (!libc::localtime_r(&(secs as libc::time_t), &mut tm).is_null()).then_some(tm)
+        #[cfg(unix)]
+        let ok = !libc::localtime_r(&(secs as libc::time_t), &mut tm).is_null();
+        #[cfg(windows)]
+        let ok = libc::localtime_s(&mut tm, &(secs as libc::time_t)) == 0;
+        ok.then_some(tm)
     }
 }
 
@@ -798,10 +801,7 @@ pub fn fmt_datetime(secs: i64) -> String {
 }
 
 fn state_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("nodeplayer").join("last_folder"))
+    Some(crate::dirs::config()?.join("last_folder"))
 }
 
 pub fn load_last_folder() -> Option<PathBuf> {

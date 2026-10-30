@@ -15,31 +15,7 @@ use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-/// Where an editor is shown.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Placement {
-    /// Its own top-level window.
-    Window,
-    /// A child of the given X11 window (the app's main window).
-    Embedded(u32),
-}
-
-/// Pixel rectangle in the parent window's coordinates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PxRect {
-    pub x: i32,
-    pub y: i32,
-    pub w: u32,
-    pub h: u32,
-}
-
-/// What happened to the window since the last [`HostWindow::poll`].
-pub enum WinEvent {
-    /// The user closed a top-level editor window.
-    Close,
-    /// The window manager resized a top-level window.
-    Resized(u32, u32),
-}
+use super::{Placement, PxRect, WinEvent, WindowId};
 
 pub struct HostWindow {
     pub conn: RustConnection,
@@ -99,7 +75,7 @@ impl HostWindow {
             }
             Placement::Embedded(parent) => {
                 let container = conn.generate_id()?;
-                conn.create_window(depth, container, parent, 0, 0, w, h, 0, WindowClass::INPUT_OUTPUT, visual, &aux)?;
+                conn.create_window(depth, container, parent as u32, 0, 0, w, h, 0, WindowClass::INPUT_OUTPUT, visual, &aux)?;
                 let id = conn.generate_id()?;
                 conn.create_window(depth, id, container, 0, 0, w, h, 0, WindowClass::INPUT_OUTPUT, visual, &aux)?;
                 (id, Some(container))
@@ -121,6 +97,11 @@ impl HostWindow {
             announce,
             announced: Cell::new(None),
         })
+    }
+
+    /// The window handed to the plugin.
+    pub fn handle(&self) -> WindowId {
+        self.id as WindowId
     }
 
     /// Size in physical pixels.

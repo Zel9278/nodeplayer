@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
 use nodeplayer_plugin::abi::*;
 
 use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf};
+use crate::plugins::dylib::{self, Library};
 use crate::plugins::{self, BodyIo, Format, ParamDesc, PluginInfo};
 
 const QUEUE_LEN: usize = 1024;
@@ -23,14 +23,13 @@ fn cstr(p: *const c_char) -> String {
     if p.is_null() { String::new() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned() }
 }
 
-/// `$NODEPLAYER_PLUGIN_PATH` (colon separated), then `~/.local/share/nodeplayer/plugins`.
+/// `$NODEPLAYER_PLUGIN_PATH` (separated like PATH), then `plugins` in nodeplayer's data folder
+/// (`~/.local/share/nodeplayer/plugins` on Linux).
 pub fn default_search_paths() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::env::var_os("NODEPLAYER_PLUGIN_PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    if let Some(home) = std::env::var_os("HOME") {
-        v.push(PathBuf::from(home).join(".local/share/nodeplayer/plugins"));
-    }
+    v.extend(crate::dirs::data().map(|d| d.join("plugins")));
     v
 }
 
@@ -40,7 +39,7 @@ pub fn find_files(root: &Path, out: &mut Vec<PathBuf>) {
         let p = e.path();
         if p.is_dir() {
             find_files(&p, out);
-        } else if p.extension().is_some_and(|x| x == "so") {
+        } else if p.extension().is_some_and(|x| x == dylib::EXT) {
             out.push(p);
         }
     }
@@ -62,9 +61,8 @@ unsafe impl Sync for Lib {}
 
 impl Lib {
     pub fn load(path: &Path) -> Result<Self> {
+        let lib = dylib::open(path)?;
         unsafe {
-            let lib = Library::open(Some(path), RTLD_NOW | RTLD_LOCAL)
-                .with_context(|| format!("dlopen {}", path.display()))?;
             let entry = *lib.get::<NpEntry>(ENTRY_SYMBOL.as_bytes()).context("not a nodeplayer plugin")?;
             let desc = entry();
             if desc.is_null() {

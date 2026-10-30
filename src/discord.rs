@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -115,16 +116,12 @@ impl Settings {
 
     /// Readable only by the user, since it holds the R2 key.
     fn save(&self) -> Result<()> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let path = settings_path().context("no config directory")?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = path.with_extension("json.tmp");
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(&serde_json::to_vec_pretty(self)?)?;
-        drop(f);
+        crate::dirs::write_private(&tmp, &serde_json::to_vec_pretty(self)?)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
@@ -142,7 +139,17 @@ const OP_HANDSHAKE: u32 = 0;
 const OP_FRAME: u32 = 1;
 const OP_CLOSE: u32 = 2;
 
-/// Where Discord (native, Flatpak, Snap, Vesktop) listens.
+/// Where Discord listens on Windows: a named pipe.
+#[cfg(windows)]
+fn socket_paths() -> Vec<PathBuf> {
+    if let Some(p) = std::env::var_os("NODEPLAYER_DISCORD_IPC") {
+        return vec![p.into()];
+    }
+    (0..10).map(|i| PathBuf::from(format!(r"\\.\pipe\discord-ipc-{i}"))).collect()
+}
+
+/// Where Discord (native, Flatpak, Snap, Vesktop; `$TMPDIR` on macOS) listens.
+#[cfg(unix)]
 fn socket_paths() -> Vec<PathBuf> {
     if let Some(p) = std::env::var_os("NODEPLAYER_DISCORD_IPC") {
         return vec![p.into()];
@@ -162,15 +169,29 @@ fn socket_paths() -> Vec<PathBuf> {
 }
 
 struct Conn {
+    #[cfg(unix)]
     stream: UnixStream,
+    /// The named pipe. It has no timeouts, but Discord answers every request, and closing
+    /// Discord breaks the pipe.
+    #[cfg(windows)]
+    stream: std::fs::File,
 }
 
 impl Conn {
     /// Connects and says hello; the logged-in user's name.
     fn open(client_id: &str) -> Result<(Self, String)> {
-        let stream = socket_paths().into_iter().find_map(|p| UnixStream::connect(p).ok()).context("Discord isn't running")?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        #[cfg(unix)]
+        let stream = {
+            let stream = socket_paths().into_iter().find_map(|p| UnixStream::connect(p).ok()).context("Discord isn't running")?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            stream
+        };
+        #[cfg(windows)]
+        let stream = socket_paths()
+            .into_iter()
+            .find_map(|p| std::fs::OpenOptions::new().read(true).write(true).open(p).ok())
+            .context("Discord isn't running")?;
         let mut c = Self { stream };
         c.send(OP_HANDSHAKE, &json!({ "v": 1, "client_id": client_id }))?;
         let (op, reply) = c.recv()?;
@@ -652,7 +673,7 @@ impl Discord {
             ui.small("Make an application at discord.com/developers/applications; its name is what \"Listening to\" shows. Copy its Application ID here.");
             ui.horizontal(|ui| {
                 if ui.link("Open the Developer Portal").clicked() {
-                    let _ = std::process::Command::new("xdg-open").arg("https://discord.com/developers/applications").spawn();
+                    let _ = crate::dirs::open("https://discord.com/developers/applications");
                 }
             });
 

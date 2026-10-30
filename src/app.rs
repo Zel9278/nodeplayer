@@ -213,7 +213,7 @@ pub struct App {
     rate: f32,
     added: usize,
     /// The main window's X11 id when running under X11; editors are embedded into it.
-    host_xid: Option<u32>,
+    host_xid: Option<crate::plugins::WindowId>,
     debug_done: bool,
     library: Library,
     dock: egui_dock::DockState<Tab>,
@@ -307,7 +307,8 @@ impl App {
             dock: default_dock(false),
             placements: HashMap::new(),
             reveal_current: false,
-            mpris: Mpris::new(ctx.clone()),
+            // On Windows it needs the window, so it's made with the first frame.
+            mpris: if cfg!(windows) { None } else { Mpris::new(ctx.clone(), None) },
             misskey: Misskey::new(ctx.clone()),
             discord: crate::discord::Discord::new(ctx.clone()),
             info: crate::info::Info::new(),
@@ -2099,11 +2100,15 @@ impl eframe::App for App {
             return;
         }
         let first_frame = self.host_xid.is_none() && !self.debug_done;
-        self.host_xid = x11_window_id(frame);
+        self.host_xid = native_window_id(frame);
         if first_frame {
             self.debug_done = true;
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             if self.host_xid.is_some() {
                 crate::x11_errors::install(xlib_display(frame));
+            }
+            if cfg!(windows) && self.mpris.is_none() {
+                self.mpris = Mpris::new(ui.ctx().clone(), self.host_xid);
             }
             self.debug_autoload();
         }
@@ -2259,7 +2264,7 @@ struct Viewer<'a> {
     plugins: &'a [PluginInfo],
     has_player: bool,
     errors: Vec<String>,
-    embed_parent: Option<u32>,
+    embed_parent: Option<crate::plugins::WindowId>,
     sample_rate: f32,
     ppp: f32,
     /// Screen placement of embedded editors, filled while drawing node bodies.
@@ -2789,6 +2794,7 @@ fn list_row(ui: &mut egui::Ui, height: f32, selected: bool, text: egui::RichText
     resp
 }
 
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn xlib_display(frame: &eframe::Frame) -> *mut std::ffi::c_void {
     use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
     match frame.display_handle().map(|h| h.as_raw()) {
@@ -2797,11 +2803,15 @@ fn xlib_display(frame: &eframe::Frame) -> *mut std::ffi::c_void {
     }
 }
 
-fn x11_window_id(frame: &eframe::Frame) -> Option<u32> {
+/// The main window as plugin editors can be embedded into it: an X11 window (not a Wayland
+/// surface), a Win32 HWND, an NSView.
+fn native_window_id(frame: &eframe::Frame) -> Option<crate::plugins::WindowId> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     match frame.window_handle().ok()?.as_raw() {
-        RawWindowHandle::Xlib(h) => Some(h.window as u32),
-        RawWindowHandle::Xcb(h) => Some(h.window.get()),
+        RawWindowHandle::Xlib(h) => Some(h.window as _),
+        RawWindowHandle::Xcb(h) => Some(h.window.get() as _),
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get() as _),
+        RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr() as _),
         _ => None,
     }
 }

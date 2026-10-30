@@ -1,10 +1,12 @@
-//! MIDI between the graph and the outside world: ALSA sequencer input and output nodes, and a
-//! monitor listing what passes through a MIDI wire.
+//! MIDI between the graph and the outside world: ALSA sequencer input and output nodes (the
+//! system's MIDI devices through [`crate::midir_io`] on Windows and macOS), and a monitor
+//! listing what passes through a MIDI wire.
 //!
 //! Each sequencer node owns a thread with its own sequencer client. Events cross between that
 //! thread and the audio thread through lock-free queues ([`MidiBridge`]).
 
 use std::collections::VecDeque;
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -12,12 +14,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use alsa::seq::{Addr, ClientIter, EventType, PortCap, PortIter, PortSubscribe, PortType, Seq};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::audio2midi::note_name;
 use crate::engine::MidiEvent;
 use crate::engine::nodes::{MidiBridge, MidiQueue, midi_queue};
+
+/// Where a port is: ALSA client and port numbers on Linux. Elsewhere ports go by name, and
+/// this is only the port's place in the list.
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Addr {
+    pub client: i32,
+    pub port: i32,
+}
 
 /// A sequencer port of another client.
 #[derive(Clone, Debug)]
@@ -28,6 +40,7 @@ pub struct Port {
     pub name: String,
 }
 
+#[cfg(target_os = "linux")]
 /// Ports of other clients having all of `caps` (READ|SUBS_READ for sources, WRITE|SUBS_WRITE
 /// for destinations).
 pub fn list_ports(seq: &Seq, own_client: i32, caps: PortCap) -> Vec<Port> {
@@ -67,6 +80,7 @@ impl Dir {
     }
 
     /// Capabilities of the ports we can connect to.
+    #[cfg(target_os = "linux")]
     fn peer_caps(self) -> PortCap {
         match self {
             Self::In => PortCap::READ | PortCap::SUBS_READ,
@@ -116,7 +130,7 @@ impl SeqNode {
         let thread = {
             let shared = shared.clone();
             std::thread::Builder::new()
-                .name(format!("alsa {}", dir.port_name()))
+                .name(format!("midi {}", dir.port_name()))
                 .spawn(move || match dir {
                     Dir::In => worker(dir, shared, rx, Some(to_graph), None),
                     Dir::Out => worker(dir, shared, rx, None, Some(from_graph)),
@@ -214,12 +228,14 @@ impl Drop for SeqNode {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct Client {
     seq: Seq,
     me: Addr,
     connected: Option<Addr>,
 }
 
+#[cfg(target_os = "linux")]
 impl Client {
     fn open(dir: Dir) -> alsa::Result<Self> {
         let (sdir, caps) = match dir {
@@ -258,6 +274,7 @@ impl Client {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn worker(
     dir: Dir,
     shared: Arc<Shared>,
@@ -349,6 +366,7 @@ fn worker(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn send(client: &Client, codec: &mut alsa::seq::MidiEvent, out: &mut Vec<MidiEvent>) {
     for e in out.drain(..) {
         codec.reset_encode();
@@ -361,6 +379,97 @@ fn send(client: &Client, codec: &mut alsa::seq::MidiEvent, out: &mut Vec<MidiEve
                 return;
             }
         }
+    }
+}
+
+/// [`worker`] for midir: an input connection delivers on midir's own thread, so this one only
+/// handles commands, and for an output passes the graph's events on.
+#[cfg(not(target_os = "linux"))]
+fn worker(
+    dir: Dir,
+    shared: Arc<Shared>,
+    rx: Receiver<Cmd>,
+    to_graph: Option<MidiQueue<rtrb::Producer<MidiEvent>>>,
+    from_graph: Option<MidiQueue<rtrb::Consumer<MidiEvent>>>,
+) {
+    use crate::midir_io;
+    let mut input = None;
+    let mut output: Option<midir::MidiOutputConnection> = None;
+    let mut out = Vec::new();
+
+    let connect = |port: Option<Port>, input: &mut Option<_>, output: &mut Option<_>| {
+        (*input, *output) = (None, None);
+        let res = match (&port, dir) {
+            (None, _) => Ok(()),
+            (Some(p), Dir::In) => {
+                let (tx, shared) = (to_graph.clone(), shared.clone());
+                midir_io::connect_in(p, move |bytes| {
+                    if let Some(e) = MidiEvent::new(0, bytes)
+                        && let Some(Ok(mut tx)) = tx.as_ref().map(|t| t.lock())
+                    {
+                        let _ = tx.push(e);
+                        shared.count.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+                .map(|c| *input = Some(c))
+            }
+            (Some(p), Dir::Out) => midir_io::connect_out(p).map(|c| *output = Some(c)),
+        };
+        *shared.error.lock().unwrap() = res.as_ref().err().map(|e| format!("connect failed: {e}"));
+        *shared.connected.lock().unwrap() = port.filter(|_| res.is_ok());
+    };
+    let send = |output: &mut Option<midir::MidiOutputConnection>, out: &mut Vec<MidiEvent>| {
+        for e in out.drain(..) {
+            if let Some(c) = output
+                && let Err(err) = c.send(e.bytes())
+            {
+                log::warn!("MIDI send failed: {err}");
+            }
+        }
+    };
+
+    while !shared.stop.load(Ordering::Acquire) {
+        for cmd in rx.try_iter() {
+            match cmd {
+                Cmd::Refresh => *shared.ports.lock().unwrap() = midir_io::list(dir),
+                Cmd::Connect(p) => connect(p, &mut input, &mut output),
+                Cmd::ConnectLabel(label) => {
+                    let ports = midir_io::list(dir);
+                    match ports.iter().find(|p| p.label == label) {
+                        Some(p) => connect(Some(p.clone()), &mut input, &mut output),
+                        None => *shared.error.lock().unwrap() = Some(format!("MIDI port \"{label}\" not found")),
+                    }
+                    *shared.ports.lock().unwrap() = ports;
+                }
+                Cmd::Panic => {
+                    for ch in 0..16u8 {
+                        for (cc, v) in [(123, 0), (121, 0)] {
+                            out.push(MidiEvent { time: 0, data: [0xb0 | ch, cc, v] });
+                        }
+                    }
+                    send(&mut output, &mut out);
+                }
+            }
+        }
+        match dir {
+            Dir::In => std::thread::sleep(Duration::from_millis(20)),
+            Dir::Out => {
+                if let Some(Ok(mut rx)) = from_graph.as_ref().map(|r| r.lock()) {
+                    while let Ok(e) = rx.pop() {
+                        out.push(e);
+                    }
+                }
+                shared.count.fetch_add(out.len() as u64, Ordering::Relaxed);
+                send(&mut output, &mut out);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    if dir == Dir::Out {
+        for ch in 0..16u8 {
+            out.push(MidiEvent { time: 0, data: [0xb0 | ch, 123, 0] });
+        }
+        send(&mut output, &mut out);
     }
 }
 

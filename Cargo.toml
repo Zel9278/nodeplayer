@@ -8,7 +8,6 @@ members = [".", "sdk", "examples/plugin-example"]
 
 [dependencies]
 csynth = { git = "https://git.c30.life/ced/csynth-v2" }
-alsa = "0.11"
 anyhow = "1.0.104"
 base64 = "0.22"
 clap-sys = "0.5"
@@ -35,13 +34,44 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "3"
 ring = "0.17"
-souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
 symphonia = { version = "0.6", features = ["all"] }
 vst3 = "0.3"
-winit = { version = "0.30", default-features = false, features = ["x11"] }
-x11rb = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 ab_glyph = "0.2"
+# FFmpeg's Windows builds come as zip files.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# Linux: ALSA for audio and MIDI, X11 for plugin editor windows, MPRIS over D-Bus.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.11"
+souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
+winit = { version = "0.30", default-features = false, features = ["x11"] }
+x11rb = "0.14"
+
+# Windows: WASAPI through cpal, WinMM for MIDI, HWND for plugin editors, SMTC for the
+# media session.
+[target.'cfg(target_os = "windows")'.dependencies]
+midir = "0.11"
+souvlaki = "0.8"
+winit = "0.30"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_Multimedia",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# macOS: CoreAudio through cpal, CoreMIDI, Now Playing for the media session.
+[target.'cfg(target_os = "macos")'.dependencies]
+midir = "0.11"
+souvlaki = "0.8"
+winit = "0.30"
 
 [build-dependencies]
 cmake = "0.1"

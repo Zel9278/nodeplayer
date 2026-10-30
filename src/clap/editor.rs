@@ -1,4 +1,4 @@
-//! CLAP editors: the plugin's X11 GUI parented to a [`HostWindow`].
+//! CLAP editors: the plugin's GUI (X11, Win32 or Cocoa) parented to a [`HostWindow`].
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -8,8 +8,24 @@ use clap_sys::ext::gui::*;
 use clap_sys::plugin::clap_plugin;
 
 use super::HostShared;
-use crate::plugins::x11win::{HostWindow, WinEvent};
-use crate::plugins::{Placement, PluginInfo, PxRect};
+use crate::plugins::window::HostWindow;
+use crate::plugins::{Placement, PluginInfo, PxRect, WinEvent};
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const API: &std::ffi::CStr = CLAP_WINDOW_API_X11;
+#[cfg(target_os = "windows")]
+const API: &std::ffi::CStr = CLAP_WINDOW_API_WIN32;
+#[cfg(target_os = "macos")]
+const API: &std::ffi::CStr = CLAP_WINDOW_API_COCOA;
+
+fn window_handle(window: &HostWindow) -> clap_window_handle {
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    return clap_window_handle { x11: window.handle() as _ };
+    #[cfg(target_os = "windows")]
+    return clap_window_handle { win32: window.handle() as _ };
+    #[cfg(target_os = "macos")]
+    return clap_window_handle { cocoa: window.handle() as _ };
+}
 
 pub struct ClapEditor {
     plugin: *const clap_plugin,
@@ -34,11 +50,11 @@ impl ClapEditor {
     ) -> Result<Self> {
         unsafe {
             let g = &*gui;
-            let x11 = CLAP_WINDOW_API_X11.as_ptr();
-            if !g.is_api_supported.is_some_and(|f| f(plugin, x11, false)) {
-                bail!("{} has no embeddable X11 GUI", info.name);
+            let api = API.as_ptr();
+            if !g.is_api_supported.is_some_and(|f| f(plugin, api, false)) {
+                bail!("{} has no embeddable {} GUI", info.name, API.to_string_lossy());
             }
-            if !g.create.is_some_and(|f| f(plugin, x11, false)) {
+            if !g.create.is_some_and(|f| f(plugin, api, false)) {
                 bail!("{}: GUI create failed", info.name);
             }
             let (mut w, mut h) = (0u32, 0u32);
@@ -56,7 +72,7 @@ impl ClapEditor {
                 }
             };
             window.set_fixed_size(w, h, !resizable);
-            let parent = clap_window { api: x11, specific: clap_window_handle { x11: window.id as _ } };
+            let parent = clap_window { api, specific: window_handle(&window) };
             if !g.set_parent.is_some_and(|f| f(plugin, &parent)) {
                 if let Some(d) = g.destroy {
                     d(plugin);

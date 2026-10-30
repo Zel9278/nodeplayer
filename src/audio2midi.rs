@@ -7,9 +7,11 @@
 //! - McLeod pitch detection adds the detected note.
 //!
 //! Velocity and channel come from the level. Notes are released after the note length unless
-//! retriggered. Events go out through an ALSA sequencer port.
+//! retriggered. Events go out through an ALSA sequencer port (a MIDI device through midir on
+//! Windows and macOS).
 
 use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -17,7 +19,10 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use alsa::seq::{Addr, EvCtrl, EvNote, Event, EventType, PortCap, PortSubscribe, PortType, Seq};
+#[cfg(not(target_os = "linux"))]
+use crate::midi::Addr;
 use crossbeam_channel::{Receiver, Sender};
 use pitch_detection::detector::PitchDetector;
 use pitch_detection::detector::mcleod::McLeodDetector;
@@ -688,6 +693,7 @@ pub fn settings_ui(ui: &mut egui::Ui, c: &mut Config, gain: f32, level_db: f32, 
 
 pub use crate::midi::Port as Dest;
 
+#[cfg(target_os = "linux")]
 struct SeqOut {
     seq: Seq,
     port: i32,
@@ -695,7 +701,16 @@ struct SeqOut {
     connected: Option<Addr>,
 }
 
+#[cfg(target_os = "linux")]
 impl SeqOut {
+    /// What the error from [`open`](Self::open) is about.
+    const WHAT: &str = "ALSA sequencer";
+
+    /// Our port, for connecting from other tools.
+    fn own(&self) -> Option<Addr> {
+        Some(Addr { client: self.client, port: self.port })
+    }
+
     fn open() -> alsa::Result<Self> {
         let seq = Seq::open(None, Some(alsa::Direction::Playback), false)?;
         seq.set_client_name(&CString::new("nodeplayer").unwrap())?;
@@ -744,6 +759,49 @@ impl SeqOut {
             self.seq.subscribe_port(&sub)?;
             self.connected = Some(d);
         }
+        Ok(())
+    }
+}
+
+/// [`SeqOut`] through midir: a connection to one of the system's MIDI devices.
+#[cfg(not(target_os = "linux"))]
+struct SeqOut {
+    conn: std::cell::RefCell<Option<midir::MidiOutputConnection>>,
+    /// The ports last listed, which [`connect`](Self::connect)'s addresses refer to.
+    listed: std::cell::RefCell<Vec<Dest>>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl SeqOut {
+    const WHAT: &str = "MIDI";
+
+    fn own(&self) -> Option<Addr> {
+        None
+    }
+
+    fn open() -> Result<Self, String> {
+        Ok(Self { conn: Default::default(), listed: Default::default() })
+    }
+
+    fn send(&self, m: Msg) -> Result<(), String> {
+        match &mut *self.conn.borrow_mut() {
+            Some(c) => c.send(m.to_event().bytes()).map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+
+    fn destinations(&self) -> Vec<Dest> {
+        let list = crate::midir_io::list(crate::midi::Dir::Out);
+        *self.listed.borrow_mut() = list.clone();
+        list
+    }
+
+    fn connect(&mut self, dest: Option<Addr>) -> Result<(), String> {
+        *self.conn.borrow_mut() = None;
+        let Some(addr) = dest else { return Ok(()) };
+        let listed = self.listed.borrow();
+        let port = listed.iter().find(|d| d.addr == addr).ok_or("the port is gone")?;
+        *self.conn.borrow_mut() = Some(crate::midir_io::connect_out(port)?);
         Ok(())
     }
 }
@@ -898,11 +956,11 @@ fn worker(
 ) {
     let mut out = match SeqOut::open() {
         Ok(s) => {
-            *shared.own.lock().unwrap() = Some(Addr { client: s.client, port: s.port });
+            *shared.own.lock().unwrap() = s.own();
             Some(s)
         }
         Err(e) => {
-            *shared.error.lock().unwrap() = Some(format!("ALSA sequencer: {e}"));
+            *shared.error.lock().unwrap() = Some(format!("{}: {e}", SeqOut::WHAT));
             None
         }
     };

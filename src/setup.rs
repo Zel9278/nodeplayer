@@ -1,6 +1,8 @@
 //! First-run setup, asked once in the window:
 //! - FFmpeg, when neither nodeplayer's own copy nor one on the PATH is there: a static build
-//!   (BtbN's FFmpeg-Builds on GitHub) can be downloaded into `~/.local/share/nodeplayer/ffmpeg/`.
+//!   (BtbN's FFmpeg-Builds on GitHub) can be downloaded into `~/.local/share/nodeplayer/ffmpeg/`
+//!   (`%LOCALAPPDATA%\nodeplayer\ffmpeg` on Windows). There are no macOS builds there, so on
+//!   macOS this points at Homebrew instead.
 //! - When running from an AppImage: copying it to `~/.local/bin/nodeplayer.AppImage` with a
 //!   menu entry and an icon.
 //!
@@ -57,13 +59,7 @@ fn bin_home() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/bin"))
 }
 
-/// `path` with the home folder written as `~`.
-fn tilde(path: &Path) -> String {
-    match std::env::var_os("HOME").map(PathBuf::from).and_then(|h| path.strip_prefix(h).ok().map(Path::to_path_buf)) {
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
-    }
-}
+use crate::dirs::tilde;
 
 fn installed_appimage() -> Option<PathBuf> {
     Some(bin_home()?.join("nodeplayer.AppImage"))
@@ -177,11 +173,17 @@ impl Setup {
                     "FFmpeg isn't installed. nodeplayer uses it to play video and the audio formats it can't read by itself (Opus in WebM, AC-3, WMA and others), and to read tags for the library and Misskey.",
                 );
                 ui.add_space(4.0);
-                ui.label("It can download a static build (about 150 MB, from BtbN's FFmpeg-Builds on GitHub) into ~/.local/share/nodeplayer/ffmpeg. FFmpeg from your distribution works too; nodeplayer finds it once it's installed.");
+                let can_download = build_name().is_ok();
+                if can_download {
+                    let dir = crate::av::local_dir().map_or_else(String::new, |d| tilde(&d));
+                    ui.label(format!("It can download a static build (about 150 MB, from BtbN's FFmpeg-Builds on GitHub) into {dir}. {}", if cfg!(windows) { "An FFmpeg installed some other way (winget, Scoop) works too; nodeplayer finds it on the PATH." } else { "FFmpeg from your distribution works too; nodeplayer finds it once it's installed." }));
+                } else {
+                    ui.label("Install it with Homebrew (brew install ffmpeg); nodeplayer finds it there.");
+                }
                 ui.add_space(8.0);
                 let mut close = false;
                 ui.horizontal(|ui| {
-                    if ui.button("Download").clicked() {
+                    if can_download && ui.button("Download").clicked() {
                         self.start_download();
                     }
                     if ui.button("Not now").clicked() {
@@ -281,14 +283,25 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(20))).http_status_as_error(true).build().into()
 }
 
+/// The platform name of BtbN's builds for this machine and their archive type.
+fn build_name() -> Result<(&'static str, &'static str)> {
+    Ok(match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => ("linux64", ".tar.xz"),
+        ("linux", "aarch64") => ("linuxarm64", ".tar.xz"),
+        ("windows", "x86_64") => ("win64", ".zip"),
+        ("windows", "aarch64") => ("winarm64", ".zip"),
+        (os, a) => bail!("no FFmpeg build for {os} on {a}"),
+    })
+}
+
 /// The newest release build for this machine from the release list: "ffmpeg-n9.0-latest-
 /// linux64-gpl-9.0.tar.xz" and the like, else the master build.
-fn pick_asset(release: &serde_json::Value, arch: &str) -> Option<(String, u64)> {
+fn pick_asset(release: &serde_json::Value, arch: &str, ext: &str) -> Option<(String, u64)> {
     let assets = release["assets"].as_array()?;
     let version = |name: &str| -> Option<(u32, u32)> {
         let rest = name.strip_prefix("ffmpeg-n")?;
         let (v, tail) = rest.split_once("-latest-")?;
-        if !tail.starts_with(&format!("{arch}-gpl-")) || !tail.ends_with(".tar.xz") || tail.contains("shared") {
+        if !tail.starts_with(&format!("{arch}-gpl-")) || !tail.ends_with(ext) || tail.contains("shared") {
             return None;
         }
         let (a, b) = v.split_once('.')?;
@@ -298,16 +311,12 @@ fn pick_asset(release: &serde_json::Value, arch: &str) -> Option<(String, u64)> 
     let best = assets.iter().filter_map(|a| Some((version(a["name"].as_str()?)?, a))).max_by_key(|(v, _)| *v);
     match best {
         Some((_, a)) => url(a),
-        None => assets.iter().find(|a| a["name"].as_str() == Some(&format!("ffmpeg-master-latest-{arch}-gpl.tar.xz"))).and_then(url),
+        None => assets.iter().find(|a| a["name"].as_str() == Some(&format!("ffmpeg-master-latest-{arch}-gpl{ext}"))).and_then(url),
     }
 }
 
 fn download_ffmpeg(state: &Mutex<Download>) -> Result<()> {
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "linux64",
-        "aarch64" => "linuxarm64",
-        a => bail!("no FFmpeg build for {a}"),
-    };
+    let (arch, ext) = build_name()?;
     let dir = crate::av::local_dir().context("no home folder")?;
     let parent = dir.parent().context("no data folder")?.to_path_buf();
     std::fs::create_dir_all(&parent)?;
@@ -325,10 +334,10 @@ fn download_ffmpeg(state: &Mutex<Download>) -> Result<()> {
         .read_to_string()
         .map_err(anyhow::Error::from)
         .and_then(|t| Ok(serde_json::from_str(&t)?))?;
-    let (url, size) = pick_asset(&release, arch).ok_or_else(|| anyhow!("no {arch} build in the latest release"))?;
+    let (url, size) = pick_asset(&release, arch, ext).ok_or_else(|| anyhow!("no {arch} build in the latest release"))?;
     log::info!("downloading {url}");
 
-    let archive = parent.join("ffmpeg-download.tar.xz");
+    let archive = parent.join(format!("ffmpeg-download{ext}"));
     let mut resp = agent.get(&url).header("User-Agent", USER_AGENT).call()?;
     let total = resp.body().content_length().unwrap_or(size);
     let mut body = resp.body_mut().with_config().limit(u64::MAX).reader();
@@ -373,24 +382,48 @@ fn unpack_into(archive: &Path, tmp: &Path) -> Result<()> {
     let bin = tmp.join("bin");
     std::fs::create_dir_all(&all)?;
     std::fs::create_dir_all(&bin)?;
-    let out = std::process::Command::new("tar")
-        .arg("-xJf")
-        .arg(archive)
-        .arg("-C")
-        .arg(&all)
-        .args(["--wildcards", "*bin/ffmpeg", "*bin/ffprobe"])
-        .output()
-        .context("can't run tar")?;
-    if !out.status.success() {
-        bail!("tar: {}", String::from_utf8_lossy(&out.stderr).trim());
+    if archive.extension().is_some_and(|e| e == "zip") {
+        unzip_programs(archive, &all)?;
+    } else {
+        let out = std::process::Command::new("tar")
+            .arg("-xJf")
+            .arg(archive)
+            .arg("-C")
+            .arg(&all)
+            .args(["--wildcards", "*bin/ffmpeg", "*bin/ffprobe"])
+            .output()
+            .context("can't run tar")?;
+        if !out.status.success() {
+            bail!("tar: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
     }
-    for name in ["ffmpeg", "ffprobe"] {
+    for name in ["ffmpeg", "ffprobe"].map(crate::av::exe_name) {
+        let name = name.as_str();
         let found = find_file(&all, name).ok_or_else(|| anyhow!("no {name} in the archive"))?;
         std::fs::rename(&found, bin.join(name))?;
         let ok = std::process::Command::new(bin.join(name)).arg("-version").output().is_ok_and(|o| o.status.success());
         if !ok {
             bail!("the downloaded {name} doesn't run");
         }
+    }
+    Ok(())
+}
+
+/// Takes `bin/ffmpeg.exe` and `bin/ffprobe.exe` out of a Windows build's zip into `dir`, keeping
+/// their folders like tar does.
+fn unzip_programs(archive: &Path, dir: &Path) -> Result<()> {
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(archive)?).context("not a zip file")?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let Some(rel) = entry.enclosed_name() else { continue };
+        let wanted = ["ffmpeg.exe", "ffprobe.exe"].iter().any(|n| rel.file_name().is_some_and(|f| f == *n))
+            && rel.parent().and_then(Path::file_name).is_some_and(|d| d == "bin");
+        if !wanted || !entry.is_file() {
+            continue;
+        }
+        let out = dir.join(rel);
+        std::fs::create_dir_all(out.parent().unwrap_or(dir))?;
+        std::io::copy(&mut entry, &mut std::fs::File::create(&out)?)?;
     }
     Ok(())
 }
@@ -412,7 +445,6 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 /// Copies the running AppImage to `~/.local/bin` and writes its menu entry and icon.
 fn install_appimage() -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let image = running_appimage().context("not running from an AppImage")?;
     let target = installed_appimage().context("no home folder")?;
     let data = data_home().context("no home folder")?;
@@ -420,7 +452,11 @@ fn install_appimage() -> Result<PathBuf> {
     // Through a temporary name, in case the installed copy is running.
     let tmp = target.with_extension("AppImage.new");
     std::fs::copy(&image, &tmp).with_context(|| format!("copying {}", image.display()))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
     std::fs::rename(&tmp, &target)?;
 
     let icon_dir = data.join("icons/hicolor/256x256/apps");
@@ -484,10 +520,11 @@ mod tests {
             { "name": "ffmpeg-n9.0-latest-linux64-lgpl-9.0.tar.xz", "browser_download_url": "d", "size": 5 },
             { "name": "ffmpeg-n10.0-latest-win64-gpl-10.0.zip", "browser_download_url": "e", "size": 6 },
         ]});
-        assert_eq!(pick_asset(&release, "linux64"), Some(("b".into(), 3)));
-        assert_eq!(pick_asset(&release, "linuxarm64"), None);
+        assert_eq!(pick_asset(&release, "linux64", ".tar.xz"), Some(("b".into(), 3)));
+        assert_eq!(pick_asset(&release, "linuxarm64", ".tar.xz"), None);
+        assert_eq!(pick_asset(&release, "win64", ".zip"), Some(("e".into(), 6)));
         let master_only = serde_json::json!({ "assets": [{ "name": "ffmpeg-master-latest-linuxarm64-gpl.tar.xz", "browser_download_url": "m", "size": 1 }] });
-        assert_eq!(pick_asset(&master_only, "linuxarm64"), Some(("m".into(), 1)));
+        assert_eq!(pick_asset(&master_only, "linuxarm64", ".tar.xz"), Some(("m".into(), 1)));
     }
 
     #[test]
@@ -497,6 +534,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unpacks_the_two_programs() {
         use std::os::unix::fs::PermissionsExt;
         let base = std::env::temp_dir().join(format!("nodeplayer-unpack-{}", std::process::id()));
@@ -522,6 +560,33 @@ mod tests {
         unpack(&archive, &dir).unwrap();
         assert!(!dir.with_extension("unpacking").exists());
         std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn unzips_the_two_programs() {
+        use std::io::Write;
+        let base = std::env::temp_dir().join(format!("nodeplayer-unzip-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let archive = base.join("a.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for name in ["ffmpeg.exe", "ffprobe.exe", "ffplay.exe"] {
+            zip.start_file(format!("ffmpeg-n9.0-latest-win64-gpl-9.0/bin/{name}"), opts).unwrap();
+            zip.write_all(name.as_bytes()).unwrap();
+        }
+        zip.start_file("ffmpeg-n9.0-latest-win64-gpl-9.0/doc/ffmpeg.exe", opts).unwrap();
+        zip.write_all(b"not this one").unwrap();
+        zip.finish().unwrap();
+
+        let out = base.join("all");
+        unzip_programs(&archive, &out).unwrap();
+        let bin = out.join("ffmpeg-n9.0-latest-win64-gpl-9.0/bin");
+        assert_eq!(std::fs::read(bin.join("ffmpeg.exe")).unwrap(), b"ffmpeg.exe");
+        assert_eq!(std::fs::read(bin.join("ffprobe.exe")).unwrap(), b"ffprobe.exe");
+        assert!(!bin.join("ffplay.exe").exists());
+        assert!(!out.join("ffmpeg-n9.0-latest-win64-gpl-9.0/doc").exists());
+        assert_eq!(find_file(&out, "ffmpeg.exe"), Some(bin.join("ffmpeg.exe")));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

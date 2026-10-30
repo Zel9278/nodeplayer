@@ -4,6 +4,7 @@ mod av;
 mod card;
 mod clap;
 mod csynth_node;
+mod dirs;
 mod discord;
 mod engine;
 mod eq_editor;
@@ -16,6 +17,8 @@ mod lyrics;
 mod midi;
 mod midi_file_node;
 mod midifile;
+#[cfg(not(target_os = "linux"))]
+mod midir_io;
 mod misskey;
 mod mpris;
 mod native;
@@ -28,6 +31,7 @@ mod titleformat;
 mod video;
 mod visual;
 mod vst3;
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod x11_errors;
 mod yabridge;
 
@@ -90,6 +94,12 @@ fn main() -> Result<()> {
 
 /// Plugin editors are X11 windows and can only be embedded into an X11 parent, so the app
 /// runs through XWayland unless `NODEPLAYER_WAYLAND` is set (editors then get own windows).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn x11_event_loop_hook() -> Option<eframe::EventLoopBuilderHook> {
+    None
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn x11_event_loop_hook() -> Option<eframe::EventLoopBuilderHook> {
     use winit::platform::x11::EventLoopBuilderExtX11;
     if std::env::var_os("NODEPLAYER_WAYLAND").is_some() || std::env::var_os("DISPLAY").is_none() {
@@ -233,7 +243,13 @@ fn test_plugin(format: &str, path: &Path, filter: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn test_editor(_bundle: &Path, _name: &str, _out: &Path) -> Result<()> {
+    Err(anyhow!("--test-editor captures X11 windows; it only works on Linux"))
+}
+
 /// Opens a plugin editor for a few seconds and dumps the window contents as a PPM image.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn test_editor(bundle: &Path, name: &str, out: &Path) -> Result<()> {
     use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 

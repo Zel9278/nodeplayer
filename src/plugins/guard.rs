@@ -1,7 +1,8 @@
 //! Crash attribution. Plugins run inside nodeplayer, so a crashing plugin takes the app down.
 //! Each thread notes which plugin it is calling into; if the process dies from a fatal signal
-//! meanwhile, a signal handler writes that plugin to a file. On the next start it is put on
-//! the disabled list ([`disabled`]) and not loaded until the user enables it again.
+//! meanwhile, a signal handler (an unhandled exception filter on Windows) writes that plugin
+//! to a file. On the next start it is put on the disabled list ([`disabled`]) and not loaded
+//! until the user enables it again.
 
 use std::cell::Cell;
 use std::ffi::{CString, c_char};
@@ -56,14 +57,13 @@ pub fn enter_borrowed(tag: &Tag) -> Entered {
 }
 
 static CRASH_FILE: OnceLock<CString> = OnceLock::new();
+#[cfg(unix)]
 const SIGNALS: [i32; 5] = [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGABRT];
+#[cfg(unix)]
 static mut PREVIOUS: [Option<libc::sigaction>; 5] = [None; 5];
 
 pub(crate) fn state_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("nodeplayer"))
+    crate::dirs::state()
 }
 
 fn crash_path() -> Option<PathBuf> {
@@ -80,6 +80,11 @@ pub fn install() {
     if CRASH_FILE.set(c).is_err() {
         return;
     }
+    #[cfg(windows)]
+    unsafe {
+        windows::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(on_exception));
+    }
+    #[cfg(unix)]
     unsafe {
         for (i, &sig) in SIGNALS.iter().enumerate() {
             let mut act: libc::sigaction = std::mem::zeroed();
@@ -94,6 +99,21 @@ pub fn install() {
     }
 }
 
+/// Notes the plugin the crashing thread was in, then lets Windows end the process as usual.
+#[cfg(windows)]
+unsafe extern "system" fn on_exception(_info: *const windows::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    let cur = CURRENT.with(|c| c.get());
+    if !cur.is_null()
+        && let Some(file) = CRASH_FILE.get()
+    {
+        // The process is going down anyway; writing through std is fine here.
+        let path = std::path::Path::new(std::str::from_utf8(file.to_bytes()).unwrap_or_default());
+        let _ = std::fs::write(path, unsafe { std::ffi::CStr::from_ptr(cur) }.to_bytes());
+    }
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
+#[cfg(unix)]
 extern "C" fn on_signal(sig: i32, _info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
     // Only async-signal-safe calls in here.
     let cur = CURRENT.with(|c| c.get());

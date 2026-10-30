@@ -2,8 +2,20 @@
 //! offers the UI ([`Instance`]) and native editor windows ([`Editor`]). Each format lives in
 //! its own module and only has to produce these plus an audio-thread [`Processor`].
 
+pub mod dylib;
 pub mod guard;
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub mod x11win;
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub use x11win as window;
+#[cfg(target_os = "windows")]
+pub mod win32win;
+#[cfg(target_os = "windows")]
+pub use win32win as window;
+#[cfg(target_os = "macos")]
+pub mod nowin;
+#[cfg(target_os = "macos")]
+pub use nowin as window;
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +23,35 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::Processor;
-pub use x11win::{Placement, PxRect};
+
+/// A native window: an X11 window ID, a Win32 HWND, an NSView pointer.
+pub type WindowId = usize;
+
+/// Where an editor is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// Its own top-level window.
+    Window,
+    /// A child of the given window (the app's main window).
+    Embedded(WindowId),
+}
+
+/// Pixel rectangle in the parent window's coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PxRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// What happened to an editor's window since the last `HostWindow::poll`.
+pub enum WinEvent {
+    /// The user closed a top-level editor window.
+    Close,
+    /// The user or window manager resized a top-level window.
+    Resized(u32, u32),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum Format {
@@ -162,7 +202,7 @@ pub trait Editor {
     fn size(&self) -> (u32, u32);
     /// Asks the editor to draw at `factor` (graph zoom × display scale), if it can.
     fn set_zoom(&mut self, _factor: f32) {}
-    /// See [`x11win::HostWindow::place`].
+    /// See [`window::HostWindow::place`].
     fn place(&mut self, clip: Option<PxRect>, origin: (i32, i32));
     /// Pumps the editor; returns `false` once the user closed its window.
     fn idle(&mut self) -> bool;
@@ -230,13 +270,42 @@ impl Host {
 // ---------------------------------------------------------------------------
 // Scanning
 
+/// The standard plugin folders of a format: `~/.vst3` and `/usr/lib/vst3`-like `unix` ones
+/// on Linux, `Common Files\VST3` on Windows, `Library/Audio/Plug-Ins/VST3` on macOS. `name`
+/// is the format's folder name on Windows and macOS, `home` the one in the home folder on
+/// Linux.
+pub fn standard_dirs(name: &str, home: &str, unix: &[&str]) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = name;
+        v.extend(crate::dirs::home().map(|h| h.join(home)));
+        v.extend(unix.iter().map(PathBuf::from));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (home, unix);
+        v.extend(crate::dirs::home().map(|h| h.join("Library/Audio/Plug-Ins").join(name)));
+        v.push(Path::new("/Library/Audio/Plug-Ins").join(name));
+    }
+    #[cfg(windows)]
+    {
+        let _ = (home, unix);
+        // Per-user installs, then the shared folder ("C:\Program Files\Common Files").
+        v.extend(std::env::var_os("LOCALAPPDATA").map(|d| Path::new(&d).join("Programs\\Common").join(name)));
+        let common = std::env::var_os("CommonProgramFiles").map_or_else(|| PathBuf::from("C:\\Program Files\\Common Files"), PathBuf::from);
+        v.push(common.join(name));
+    }
+    v
+}
+
 /// The format of a plugin file picked by hand, from its name (and contents for JSFX).
 pub fn detect_format(path: &Path) -> Option<Format> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
     match ext.as_deref() {
         Some("vst3") => Some(Format::Vst3),
         Some("clap") => Some(Format::Clap),
-        Some("so") => Some(Format::Native),
+        Some(e) if e == dylib::EXT => Some(Format::Native),
         _ => crate::jsfx::is_jsfx_file(path).then_some(Format::Jsfx),
     }
 }
@@ -327,10 +396,7 @@ pub fn scan_main(format: &str, path: &Path) -> Result<()> {
 // Scan cache: `path \t format \t id \t name \t vendor \t category` per line.
 
 fn cache_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("nodeplayer"))
+    crate::dirs::cache()
 }
 
 pub fn load_cache() -> Vec<PluginInfo> {
@@ -387,7 +453,7 @@ mod tests {
     fn formats_from_file_names() {
         assert_eq!(detect_format(Path::new("/a/b.clap")), Some(Format::Clap));
         assert_eq!(detect_format(Path::new("/a/b.vst3")), Some(Format::Vst3));
-        assert_eq!(detect_format(Path::new("/a/libx.so")), Some(Format::Native));
+        assert_eq!(detect_format(Path::new(&format!("/a/libx.{}", dylib::EXT))), Some(Format::Native));
         assert_eq!(detect_format(Path::new("/a/missing.png")), None);
     }
 }

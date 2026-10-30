@@ -1,7 +1,8 @@
 //! CLAP hosting: module loading, scanning, instances with their host-side extensions, and
 //! the audio-thread processor. Editors are in [`editor`].
 //!
-//! Like VST3 plugins, Windows CLAP plugins come through yabridge as ordinary Linux ones.
+//! Like VST3 plugins, Windows CLAP plugins come through yabridge as ordinary Linux ones on
+//! Linux; on Windows and macOS the platform's own plugins load directly.
 
 mod editor;
 
@@ -35,9 +36,9 @@ use clap_sys::plugin::clap_plugin;
 use clap_sys::process::*;
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::CLAP_VERSION;
-use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
 
 use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf};
+use crate::plugins::dylib::{self, Library};
 use crate::plugins::{self, Format, ParamDesc, Placement, PluginInfo};
 
 const QUEUE_LEN: usize = 1024;
@@ -66,9 +67,10 @@ unsafe impl Sync for Module {}
 
 impl Module {
     pub fn load(path: &Path) -> Result<Self> {
+        // A macOS plugin is a bundle; init still gets the bundle's path.
+        let bin = if cfg!(target_os = "macos") { dylib::mac_bundle_binary(path)? } else { path.to_path_buf() };
+        let lib = dylib::open(&bin)?;
         unsafe {
-            let lib = Library::open(Some(path), RTLD_NOW | RTLD_LOCAL)
-                .with_context(|| format!("dlopen {}", path.display()))?;
             let entry: *const clap_plugin_entry =
                 *lib.get::<*const clap_plugin_entry>(b"clap_entry").context("clap_entry not exported")?;
             if entry.is_null() {
@@ -149,23 +151,20 @@ impl ModuleCache {
     }
 }
 
-/// `$CLAP_PATH` (colon separated) first, then the standard Linux locations.
+/// `$CLAP_PATH` (separated like PATH) first, then the platform's standard locations.
 pub fn default_search_paths() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> =
         std::env::var_os("CLAP_PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
-    if let Some(home) = std::env::var_os("HOME") {
-        v.push(PathBuf::from(home).join(".clap"));
-    }
-    v.extend(["/usr/lib/clap", "/usr/lib64/clap", "/usr/local/lib/clap"].map(PathBuf::from));
+    v.extend(plugins::standard_dirs("CLAP", ".clap", &["/usr/lib/clap", "/usr/lib64/clap", "/usr/local/lib/clap"]));
     v
 }
 
-/// Finds `.clap` files below `root` without loading them.
+/// Finds `.clap` files (bundles on macOS) below `root` without loading them.
 pub fn find_files(root: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(root) else { return };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("clap")) {
+        if (p.is_file() || cfg!(target_os = "macos")) && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("clap")) {
             out.push(p);
         } else if p.is_dir() {
             find_files(&p, out);
@@ -224,7 +223,7 @@ unsafe extern "C" fn get_extension(_host: *const clap_host, id: *const c_char) -
         &HOST_GUI as *const _ as *const c_void
     } else if id == CLAP_EXT_TIMER_SUPPORT {
         &HOST_TIMER as *const _ as *const c_void
-    } else if id == CLAP_EXT_POSIX_FD_SUPPORT {
+    } else if cfg!(unix) && id == CLAP_EXT_POSIX_FD_SUPPORT {
         &HOST_FD as *const _ as *const c_void
     } else if id == CLAP_EXT_LATENCY {
         &HOST_LATENCY as *const _ as *const c_void
@@ -542,6 +541,7 @@ struct Ext {
     gui: *const clap_plugin_gui,
     latency: *const clap_plugin_latency,
     timer: *const clap_plugin_timer_support,
+    #[cfg_attr(not(unix), allow(dead_code))]
     fd: *const clap_plugin_posix_fd_support,
     ports: *const clap_plugin_audio_ports,
     notes: *const clap_plugin_note_ports,
@@ -756,6 +756,7 @@ impl ClapPlugin {
                 unsafe { on_timer(self.plugin, id) };
             }
         }
+        #[cfg(unix)]
         if let Some(on_fd) = unsafe { self.ext.fd.as_ref() }.and_then(|f| f.on_fd) {
             let fds = s.fds.lock().unwrap().clone();
             if !fds.is_empty() {
