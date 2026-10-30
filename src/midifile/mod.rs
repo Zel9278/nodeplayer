@@ -2231,7 +2231,11 @@ mod tests {
         let piano = track(&[(0, &[0x90, 60, 100]), (48_000, &[0x80, 60, 0])]);
         let mut player = MidiPlayer::new(MidiSettings::default());
         player.install(parse_bytes(file(480, &[piano])).unwrap(), true);
-        std::thread::sleep(Duration::from_millis(150));
+        // However late a busy machine starts the player's thread.
+        let until = Instant::now() + Duration::from_secs(5);
+        while player.control().now() <= 0.15 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         player.pause();
         let paused = player.control().now();
         assert!(paused > 0.1, "{paused}");
