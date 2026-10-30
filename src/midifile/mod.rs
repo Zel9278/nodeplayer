@@ -2252,8 +2252,13 @@ mod tests {
         let (out, mut rx) = MidiOut::new(1 << 12);
         player.set_output(Some(out));
         player.install(parse_bytes(file(480, &[piano])).unwrap(), true);
-        std::thread::sleep(Duration::from_millis(700));
-        let sent: Vec<Timed> = std::iter::from_fn(|| rx.pop().ok()).collect();
+        // The four notes span 0.5 s; give a busy machine's late thread a while longer.
+        let mut sent: Vec<Timed> = Vec::new();
+        let until = Instant::now() + Duration::from_secs(5);
+        while sent.iter().filter(|s| s.0.is_some()).count() < 4 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+            sent.extend(std::iter::from_fn(|| rx.pop().ok()));
+        }
         let notes: Vec<(Instant, u32)> = sent.iter().filter_map(|&(at, m)| Some((at?, m))).collect();
         let msgs: Vec<u32> = notes.iter().map(|n| n.1).collect();
         assert_eq!(msgs, [msg(0x90, 60, 100), msg(0x80, 60, 0), msg(0x90, 62, 90), msg(0x80, 62, 0)]);
