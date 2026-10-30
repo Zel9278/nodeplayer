@@ -1,0 +1,88 @@
+# Release builds for Linux, Windows and macOS (Apple silicon and Intel), kept as artifacts.
+# Windows is cross-built with MinGW on Linux, the same way as locally; its C++ runtime is
+# linked in statically (see build.rs), so the .exe runs on its own.
+
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            exe: nodeplayer
+            test: true
+          - name: Windows x86_64
+            os: ubuntu-24.04
+            target: x86_64-pc-windows-gnu
+            exe: nodeplayer.exe
+            test: false
+          - name: macOS arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            exe: nodeplayer
+            test: true
+          - name: macOS x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            exe: nodeplayer
+            test: false
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Linux packages
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake libasound2-dev libfontconfig1-dev libfreetype-dev \
+            libx11-dev libxkbcommon-dev libdbus-1-dev
+
+      - name: MinGW
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+          # The posix flavour: ysfx uses std::thread and std::mutex.
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nodeplayer-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.exe }}
+          if-no-files-found: error
+
+      - name: Test
+        if: matrix.test
+        run: cargo test --release --locked --target ${{ matrix.target }}
