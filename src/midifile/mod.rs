@@ -2273,8 +2273,17 @@ mod tests {
         ]);
         let mut player = MidiPlayer::new(MidiSettings::default());
         player.install(parse_bytes(file(480, &[piano])).unwrap(), true);
-        std::thread::sleep(Duration::from_millis(150));
         let down = |p: &MidiPlayer, k: usize| p.shared.down[k].load(Ordering::Relaxed);
+        // The player's thread runs late on a busy machine, so wait for what it should do rather
+        // than a fixed time.
+        let settles = |what: &dyn Fn() -> bool| {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !what() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            what()
+        };
+        assert!(settles(&|| down(&player, 62) == 1), "the second note plays");
         assert_eq!((down(&player, 60), down(&player, 62)), (0, 1));
         assert_eq!(player.shared.presses[60].load(Ordering::Relaxed), 1);
 
@@ -2285,15 +2294,12 @@ mod tests {
         assert_eq!(down(&player, 62), 1, "pausing keeps the keys as they were");
         assert!(player.key_down(62));
         player.seek(0.0);
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(down(&player, 62), 0, "seeking before the note lets it go");
+        assert!(settles(&|| down(&player, 62) == 0), "seeking before the note lets it go");
         player.seek(4.0);
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(settles(&|| down(&player, 62) == 1), "seeking into the note holds it");
         assert!((player.control().now() - 4.0).abs() < 1e-9);
-        assert_eq!(down(&player, 62), 1, "seeking into the note holds it");
         player.stop();
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!player.is_playing());
+        assert!(settles(&|| !player.is_playing() && down(&player, 62) == 0), "stopping lets everything go");
         assert_eq!(player.control().now(), 0.0);
         player.update();
         assert!(!player.key_down(62));

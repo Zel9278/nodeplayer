@@ -1191,11 +1191,10 @@ impl Drop for ClapProcessor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn finds_the_binary_in_a_bundle_folder() {
         let root = std::env::temp_dir().join(format!("np-clap-test-{}", std::process::id()));
