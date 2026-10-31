@@ -1,6 +1,7 @@
 //! CSynth node: [csynth](https://git.c30.life/ced/csynth-v2) (the MIDI apps' piano) as a MIDI
 //! instrument in the graph. It plays the MPP piano samples (found locally or downloaded and
-//! cached, as the apps do) or a SoundFont.
+//! cached, as the apps do), or a list of SoundFonts and SFZ instruments: each program is played
+//! by the first in the list that has it.
 //!
 //! Sounds load on a background thread; the finished `PianoProcessor` is handed to the audio
 //! thread through a slot it polls with `try_lock`, and the one it replaces comes back through
@@ -23,8 +24,12 @@ const SERVER: &str = "wss://mpp.c30.life";
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CSynthSettings {
-    /// A SoundFont to play; `None` for the MPP piano samples.
-    pub font: Option<PathBuf>,
+    /// SoundFonts (.sf2) and SFZ instruments (.sfz) to play, the first listed first; none for
+    /// the MPP piano samples.
+    pub fonts: Vec<PathBuf>,
+    /// The single SoundFont of older versions; read into `fonts`.
+    #[serde(skip_serializing)]
+    font: Option<PathBuf>,
     pub volume_db: f32,
     pub voices: usize,
     /// The shortest release, as the apps' "performance mode".
@@ -35,18 +40,33 @@ pub struct CSynthSettings {
 
 impl Default for CSynthSettings {
     fn default() -> Self {
-        Self { font: None, volume_db: 0.0, voices: csynth::DEFAULT_VOICES, performance: false, limiter: true }
+        Self { fonts: Vec::new(), font: None, volume_db: 0.0, voices: csynth::DEFAULT_VOICES, performance: false, limiter: true }
     }
 }
 
 impl CSynthSettings {
     pub const VOLUME: usize = 0;
     pub const LIMITER: usize = 1;
+
+    /// Settings of older versions in the current form.
+    fn upgraded(mut self) -> Self {
+        if let Some(font) = self.font.take()
+            && self.fonts.is_empty()
+        {
+            self.fonts.push(font);
+        }
+        self
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
 enum Load {
     Loading(String),
-    Ready(String),
+    /// Playing `name`; `errors` are the fonts that couldn't be loaded and are left out.
+    Ready { name: String, errors: Vec<String> },
     Failed(String),
 }
 
@@ -94,7 +114,7 @@ pub struct CSynthNode {
 
 impl CSynthNode {
     pub fn new(settings: CSynthSettings, sample_rate: f32) -> Self {
-        let mut me = Self { settings, shared: Arc::default(), rate: sample_rate as u32 };
+        let mut me = Self { settings: settings.upgraded(), shared: Arc::default(), rate: sample_rate as u32 };
         me.load();
         me
     }
@@ -119,9 +139,13 @@ impl CSynthNode {
     fn load(&mut self) {
         let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let shared = self.shared.clone();
-        let (font, rate) = (self.settings.font.clone(), self.rate);
+        let (fonts, rate) = (self.settings.fonts.clone(), self.rate);
         let (voices, performance) = (self.settings.voices, self.settings.performance);
-        let name = font.as_deref().map_or("MPP piano".into(), |f| f.file_name().unwrap_or_default().to_string_lossy().into_owned());
+        let name = match fonts.as_slice() {
+            [] => "MPP piano".into(),
+            [one] => file_name(one),
+            many => format!("{} sounds", many.len()),
+        };
         *shared.load.lock().unwrap() = Some(Load::Loading(format!("Loading {name}…")));
         let spawned = std::thread::Builder::new().name("csynth load".into()).spawn(move || {
             let status = |s: String| {
@@ -129,9 +153,29 @@ impl CSynthNode {
                     *shared.load.lock().unwrap() = Some(Load::Loading(s));
                 }
             };
-            let piano = match &font {
-                Some(path) => csynth::Font::load(path).map(|f| PianoProcessor::with_fonts(vec![f], rate)),
-                None => mpp_samples(rate, &status).map(|s| PianoProcessor::new(s, rate)),
+            let mut errors = Vec::new();
+            let piano = if fonts.is_empty() {
+                mpp_samples(rate, &status).map(|s| PianoProcessor::new(s, rate))
+            } else {
+                // One that can't be loaded is left out, and the rest still play.
+                let mut loaded = Vec::new();
+                for (i, path) in fonts.iter().enumerate() {
+                    if fonts.len() > 1 {
+                        status(format!("Loading {} ({}/{})…", file_name(path), i + 1, fonts.len()));
+                    }
+                    match csynth::Font::load(path) {
+                        Ok(f) => loaded.push(f),
+                        Err(e) => {
+                            log::warn!("csynth: {}: {e}", path.display());
+                            errors.push(format!("{}: {e}", file_name(path)));
+                        }
+                    }
+                }
+                if loaded.is_empty() {
+                    Err(errors.join("\n"))
+                } else {
+                    Ok(PianoProcessor::with_fonts(loaded, rate))
+                }
             };
             if shared.generation.load(Ordering::Acquire) != generation {
                 return;
@@ -142,11 +186,12 @@ impl CSynthNode {
                     p.set_performance_mode(performance);
                     // Whatever wasn't picked up yet is simply replaced.
                     *shared.next.lock().unwrap() = Some(Box::new(p));
-                    *shared.load.lock().unwrap() = Some(Load::Ready(name));
+                    *shared.load.lock().unwrap() = Some(Load::Ready { name, errors });
                 }
                 Err(e) => {
                     log::warn!("csynth: {name}: {e}");
-                    *shared.load.lock().unwrap() = Some(Load::Failed(format!("{name}: {e}")));
+                    let e = if fonts.len() == 1 || fonts.is_empty() { format!("{name}: {e}") } else { e };
+                    *shared.load.lock().unwrap() = Some(Load::Failed(e));
                 }
             }
         });
@@ -165,30 +210,7 @@ impl CSynthNode {
         self.idle();
         let mut sends = Vec::new();
         let mut reload = false;
-        ui.horizontal(|ui| {
-            ui.label("sound");
-            let text = match &self.settings.font {
-                Some(f) => f.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                None => "MPP piano".into(),
-            };
-            egui::ComboBox::from_id_salt(ui.id().with("csynth-sound")).width(170.0).selected_text(text).show_ui(ui, |ui| {
-                if ui.selectable_label(self.settings.font.is_none(), "MPP piano").clicked() && self.settings.font.is_some() {
-                    self.settings.font = None;
-                    reload = true;
-                }
-                if ui.button("SoundFont (.sf2)…").clicked() {
-                    let mut dlg = rfd::FileDialog::new().add_filter("SoundFont", &["sf2", "SF2"]);
-                    if let Some(dir) = self.settings.font.as_deref().and_then(Path::parent) {
-                        dlg = dlg.set_directory(dir);
-                    }
-                    if let Some(p) = dlg.pick_file() {
-                        self.settings.font = Some(p);
-                        reload = true;
-                    }
-                    ui.close();
-                }
-            });
-        });
+        reload |= self.sounds_ui(ui);
         if ui.add(egui::Slider::new(&mut self.settings.volume_db, -40.0..=12.0).suffix(" dB").text("volume")).changed() {
             sends.push((CSynthSettings::VOLUME, self.settings.volume_db));
         }
@@ -210,8 +232,11 @@ impl CSynthNode {
                 });
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             }
-            Some(Load::Ready(name)) => {
+            Some(Load::Ready { name, errors }) => {
                 ui.small(format!("{name} · {} voices sounding", self.shared.active.load(Ordering::Relaxed)));
+                for e in errors {
+                    ui.colored_label(egui::Color32::from_rgb(230, 120, 90), format!("left out: {e}"));
+                }
             }
             Some(Load::Failed(e)) => {
                 ui.colored_label(egui::Color32::from_rgb(230, 120, 90), e);
@@ -222,6 +247,72 @@ impl CSynthNode {
             self.load();
         }
         sends
+    }
+
+    /// The sounds: the MPP piano, or the SoundFonts and SFZ instruments in order, to add,
+    /// reorder and remove. True when they changed.
+    fn sounds_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let fonts = &mut self.settings.fonts;
+        let mut changed = false;
+        let mut action = None;
+        if fonts.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("sound");
+                ui.label("MPP piano");
+            });
+        }
+        let last = fonts.len().saturating_sub(1);
+        for (i, path) in fonts.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.weak(format!("{}.", i + 1));
+                ui.label(file_name(path)).on_hover_text(path.display().to_string());
+                if ui.add_enabled(i > 0, egui::Button::new("⏶").small()).on_hover_text("play before the one above").clicked() {
+                    action = Some((i, -1));
+                }
+                if ui.add_enabled(i < last, egui::Button::new("⏷").small()).on_hover_text("play after the one below").clicked() {
+                    action = Some((i, 1));
+                }
+                if ui.small_button("✖").on_hover_text("remove").clicked() {
+                    action = Some((i, 0));
+                }
+            });
+        }
+        match action {
+            Some((i, 0)) => {
+                fonts.remove(i);
+                changed = true;
+            }
+            Some((i, d)) => {
+                fonts.swap(i, i.saturating_add_signed(d));
+                changed = true;
+            }
+            None => {}
+        }
+        ui.horizontal(|ui| {
+            let add = ui
+                .button("Add SoundFont or SFZ…")
+                .on_hover_text("several can be used: each program is played by the first listed that has it");
+            if add.clicked() {
+                let mut dlg = rfd::FileDialog::new()
+                    .add_filter("SoundFont or SFZ", &["sf2", "SF2", "sfz", "SFZ"])
+                    .add_filter("SoundFont", &["sf2", "SF2"])
+                    .add_filter("SFZ", &["sfz", "SFZ"]);
+                if let Some(dir) = fonts.last().and_then(|f| f.parent()) {
+                    dlg = dlg.set_directory(dir);
+                }
+                for p in dlg.pick_files().unwrap_or_default() {
+                    if !fonts.contains(&p) {
+                        fonts.push(p);
+                        changed = true;
+                    }
+                }
+            }
+            if !fonts.is_empty() && ui.button("MPP piano").on_hover_text("remove them all and play the MPP piano").clicked() {
+                fonts.clear();
+                changed = true;
+            }
+        });
+        changed
     }
 }
 
@@ -484,6 +575,18 @@ impl CSynthProc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_single_font_of_older_versions_becomes_the_list() {
+        let old: CSynthSettings = serde_json::from_str(r#"{"font": "/sf/piano.sf2", "volume_db": -3.0}"#).unwrap();
+        let s = old.upgraded();
+        assert_eq!(s.fonts, [PathBuf::from("/sf/piano.sf2")]);
+        assert_eq!(s.volume_db, -3.0);
+        // Saved again, only the list is written.
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json.get("font").is_none());
+        assert_eq!(json["fonts"], serde_json::json!(["/sf/piano.sf2"]));
+    }
 
     fn tone_set(len: usize) -> SampleSet {
         let mut set: SampleSet = vec![None; 128];

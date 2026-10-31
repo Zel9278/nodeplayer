@@ -40,9 +40,17 @@ An instrument that ignores pitch bend, or its range setting, gets only the whole
 
 ## CSynth
 
-CSynth is a piano instrument: MIDI in, audio out. It plays the MPP piano samples or a
-SoundFont (`.sf2`) picked in the node.
+CSynth is an instrument (the MPP apps' piano): MIDI in, audio out. It plays the MPP piano
+samples, or SoundFonts (`.sf2`) and SFZ instruments (`.sfz`, with WAV, FLAC or Ogg Vorbis
+samples) added in the node.
 
+- **Several sounds**: "Add SoundFont or SFZ…" adds one or more files to the list. Each
+  program is played by the first file in the list that has it (else by the first with the
+  General MIDI program it falls back to), so put a piano SFZ above a full General MIDI
+  SoundFont to play the piano part with it and the rest with the SoundFont. An SFZ instrument
+  counts as the piano (program 1); alone, it plays every channel.
+- ⏶ / ⏷ move a file up or down the list, ✖ removes it, and "MPP piano" clears the list. A file
+  that can't be loaded is left out (the node says why) and the rest still play.
 - The MPP samples are downloaded once from mpp.c30.life and cached, unless they are found
   locally (`MPP_WEB_SAMPLES`, next to the program, or the MPP apps' cache).
 - A new sound loads in the background, and the old one keeps playing until it is ready.
