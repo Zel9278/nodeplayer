@@ -28,7 +28,7 @@ use packed::{Event, Packed, Playhead};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -958,6 +958,8 @@ struct Shared {
     /// Packed bytes unpacked playing, and by seeks (each from a snapshot before its place).
     bytes_played: AtomicU64,
     bytes_scanned: AtomicU64,
+    /// Set when the file plays to its end; taken by [`MidiPlayer::take_ended`].
+    ended: AtomicBool,
 }
 
 impl Shared {
@@ -1264,6 +1266,7 @@ impl Shared {
                 c.playing = false;
                 c.position = file.info.duration;
                 self.release_notes(&mut c);
+                self.ended.store(true, Ordering::Relaxed);
                 continue;
             };
             // At least 2 ms between rounds: dense files would otherwise spin
@@ -1332,6 +1335,8 @@ enum LoadState {
         name: String,
         rx: mpsc::Receiver<Result<MidiFile, String>>,
         play: bool,
+        /// Where to start once loaded.
+        seek: Option<f64>,
         progress: Arc<LoadCounter>,
         total: u64,
         started: Instant,
@@ -1413,6 +1418,7 @@ impl MidiPlayer {
             notes_skipped: AtomicU64::new(0),
             bytes_played: AtomicU64::new(0),
             bytes_scanned: AtomicU64::new(0),
+            ended: AtomicBool::new(false),
         });
         let worker = shared.clone();
         let thread = std::thread::Builder::new()
@@ -1445,17 +1451,19 @@ impl MidiPlayer {
             })
             .expect("MIDI loader thread");
         self.count_load();
+        self.shared.ended.store(false, Ordering::Relaxed);
         self.load = LoadState::Loading {
             name,
             rx,
             play,
+            seek: None,
             progress,
             total,
             started: Instant::now(),
         };
     }
 
-    fn install(&mut self, file: MidiFile, play: bool) {
+    fn install(&mut self, file: MidiFile, play: bool, seek: Option<f64>) {
         let info = &file.info;
         log::info!(
             "MIDI loaded: {} ({} tracks, {} notes, {}) in {:.0} ms (index {:.0}, scan {:.0}, pack {:.0}); {} events packed in {:.1} MB",
@@ -1482,8 +1490,49 @@ impl MidiPlayer {
             c.position = 0.0;
         }
         self.shared.notes_played.store(0, Ordering::Relaxed);
+        self.shared.ended.store(false, Ordering::Relaxed);
+        if let Some(at) = seek {
+            self.seek(at);
+        }
         if play {
             self.play();
+        }
+    }
+
+    /// True once after the file played to its end.
+    pub fn take_ended(&self) -> bool {
+        self.shared.ended.swap(false, Ordering::Relaxed)
+    }
+
+    pub fn is_loading(&self) -> bool {
+        matches!(self.load, LoadState::Loading { .. })
+    }
+
+    /// While a file loads: whether it starts playing once loaded (else false).
+    pub fn plays_when_loaded(&self) -> bool {
+        matches!(self.load, LoadState::Loading { play: true, .. })
+    }
+
+    /// While a file loads: start it once loaded, or not. Returns false if nothing is loading.
+    pub fn play_when_loaded(&mut self, on: bool) -> bool {
+        match &mut self.load {
+            LoadState::Loading { play, .. } => {
+                *play = on;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// While a file loads: start it at `position` once loaded. Returns false if nothing is
+    /// loading.
+    pub fn seek_when_loaded(&mut self, position: f64) -> bool {
+        match &mut self.load {
+            LoadState::Loading { seek, .. } => {
+                *seek = Some(position);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1673,14 +1722,14 @@ impl MidiPlayer {
 
     /// Per frame: finish loads.
     pub fn update(&mut self) {
-        if let LoadState::Loading { rx, play, .. } = &self.load
+        if let LoadState::Loading { rx, play, seek, .. } = &self.load
             && let Ok(result) = rx.try_recv()
         {
-            let play = *play;
+            let (play, seek) = (*play, *seek);
             self.count_load();
             self.load = LoadState::Idle;
             match result {
-                Ok(file) => self.install(file, play),
+                Ok(file) => self.install(file, play, seek),
                 Err(e) => {
                     log::error!("MIDI load failed: {e}");
                     self.load = LoadState::Failed(e);
@@ -2023,7 +2072,7 @@ mod tests {
     #[test]
     fn a_seek_recounts_the_notes_played() {
         let mut player = MidiPlayer::new(MidiSettings { skip_drums: false, ..Default::default() });
-        player.install(parse_bytes(song()).unwrap(), false);
+        player.install(parse_bytes(song()).unwrap(), false, None);
         let played = |p: &MidiPlayer| p.status().notes_played;
         player.seek(1.5);
         std::thread::sleep(Duration::from_millis(100));
@@ -2034,7 +2083,7 @@ mod tests {
 
         let drums = track(&[(0, &[0x99, 36, 100]), (480, &[0x89, 36, 0]), (0, &[0x90, 60, 100]), (480, &[0x80, 60, 0])]);
         let mut player = MidiPlayer::new(MidiSettings { skip_drums: true, ..Default::default() });
-        player.install(parse_bytes(file(480, &[drums])).unwrap(), false);
+        player.install(parse_bytes(file(480, &[drums])).unwrap(), false, None);
         assert_eq!(player.status().notes_total, 1);
         player.seek(0.9);
         std::thread::sleep(Duration::from_millis(100));
@@ -2093,7 +2142,7 @@ mod tests {
         assert_eq!(held(1921), []);
         // 1.25 s at 120 BPM: tick 1200
         let mut player = MidiPlayer::new(MidiSettings::default());
-        player.install(parse_bytes(bytes).unwrap(), false);
+        player.install(parse_bytes(bytes).unwrap(), false, None);
         player.seek(1.25);
         std::thread::sleep(Duration::from_millis(100));
         assert!(player.key_down(60) && player.key_down(62) && player.key_down(64));
@@ -2191,7 +2240,7 @@ mod tests {
         let midi = Arc::new(parse_bytes(file(480, &[notes])).unwrap());
         assert_eq!((midi.info.note_on, midi.info.high_notes), (2, 1));
         let mut player = MidiPlayer::new(MidiSettings { skip_drums: false, ..Default::default() });
-        player.install(parse_bytes(file(480, &[track(&[(0, &[0x90, 200, 100]), (4800, &[0x80, 200, 0])])])).unwrap(), true);
+        player.install(parse_bytes(file(480, &[track(&[(0, &[0x90, 200, 100]), (4800, &[0x80, 200, 0])])])).unwrap(), true, None);
         std::thread::sleep(Duration::from_millis(100));
         assert!(player.key_down(200));
         assert_eq!(player.status().notes_played, 1);
@@ -2235,7 +2284,7 @@ mod tests {
     fn resuming_carries_on_from_the_pause() {
         let piano = track(&[(0, &[0x90, 60, 100]), (48_000, &[0x80, 60, 0])]);
         let mut player = MidiPlayer::new(MidiSettings::default());
-        player.install(parse_bytes(file(480, &[piano])).unwrap(), true);
+        player.install(parse_bytes(file(480, &[piano])).unwrap(), true, None);
         // However late a busy machine starts the player's thread.
         let until = Instant::now() + Duration::from_secs(5);
         while player.control().now() <= 0.15 && Instant::now() < until {
@@ -2260,7 +2309,7 @@ mod tests {
         let mut player = MidiPlayer::new(MidiSettings::default());
         let (out, mut rx) = MidiOut::new(1 << 12);
         player.set_output(Some(out));
-        player.install(parse_bytes(file(480, &[piano])).unwrap(), true);
+        player.install(parse_bytes(file(480, &[piano])).unwrap(), true, None);
         // The notes end 1 s in; give a busy machine's late thread a while longer.
         let mut sent: Vec<Timed> = Vec::new();
         let until = Instant::now() + Duration::from_secs(5);
@@ -2286,7 +2335,7 @@ mod tests {
             (4800, &[0x80, 62, 0]),
         ]);
         let mut player = MidiPlayer::new(MidiSettings::default());
-        player.install(parse_bytes(file(480, &[piano])).unwrap(), true);
+        player.install(parse_bytes(file(480, &[piano])).unwrap(), true, None);
         let down = |p: &MidiPlayer, k: usize| p.shared.down[k].load(Ordering::Relaxed);
         // The player's thread runs late on a busy machine, so wait for what it should do rather
         // than a fixed time.

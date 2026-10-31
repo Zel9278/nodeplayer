@@ -12,6 +12,7 @@ use egui::RichText;
 
 use crate::av::TrackInfo;
 use crate::library::{self, PlayStats};
+use crate::midifile::{MidiInfo, group_digits};
 use crate::player::Status;
 
 /// What the panel shows about the file, read off the UI thread.
@@ -23,7 +24,9 @@ struct Details {
 
 impl Details {
     fn read(path: &Path) -> Self {
-        let info = crate::av::track_info(path).map_err(|e| log::debug!("{}: {e:#}", path.display())).unwrap_or_default();
+        // FFmpeg takes MIDI files for audio it would render; the player tells about them.
+        let info = if crate::midi_song::is_midi_file(path) { Ok(TrackInfo::default()) } else { crate::av::track_info(path) };
+        let info = info.map_err(|e| log::debug!("{}: {e:#}", path.display())).unwrap_or_default();
         Self { info, size: std::fs::metadata(path).ok().map(|m| m.len()), added: library::added(path) }
     }
 
@@ -41,6 +44,8 @@ pub struct Now<'a> {
     pub position: f64,
     /// Playback rate in effect.
     pub rate: f32,
+    /// The MIDI file playing, once loaded.
+    pub midi: Option<MidiInfo>,
     /// Output device: name, sample rate and channels.
     pub output: Option<(&'a str, u32, u16)>,
     pub plays: PlayStats,
@@ -146,6 +151,14 @@ impl Info {
                 row(ui, "State", state);
                 let length = now.status.duration.map(fmt_time).unwrap_or_else(|| "?".into());
                 row(ui, "Position", format!("{} / {length}", fmt_time(now.position)));
+                if let Some(m) = &now.midi {
+                    row(ui, "Format", format!("Standard MIDI file, type {}", m.format));
+                    row(ui, "Tracks", m.tracks.to_string());
+                    row(ui, "Notes", group_digits(m.note_on));
+                    row(ui, "Resolution", format!("{} PPQ", m.division));
+                    row(ui, "Tempo changes", m.tempo_changes.to_string());
+                }
+                let audio = now.status.decoder != "MIDI";
                 let avg = d.and_then(|d| d.tech("bitrate"));
                 let bitrate = match (self.kbps, avg) {
                     (Some(live), Some(avg)) => format!("{live:.0} kbps (average {avg} kbps)"),
@@ -153,13 +166,17 @@ impl Info {
                     (None, Some(avg)) => format!("{avg} kbps"),
                     (None, None) => "?".into(),
                 };
-                row(ui, "Bitrate", bitrate).on_hover_text("of the second just played; the average is over the whole file");
+                if audio {
+                    row(ui, "Bitrate", bitrate).on_hover_text("of the second just played; the average is over the whole file");
+                }
                 let codec = match (d.and_then(|d| d.tech("codec")), d.and_then(|d| d.tech("codec_profile"))) {
                     (Some(c), Some(p)) => format!("{c} ({p})"),
                     (Some(c), None) => c.to_string(),
                     _ => "?".into(),
                 };
-                row(ui, "Codec", codec);
+                if audio {
+                    row(ui, "Codec", codec);
+                }
                 if let Some(e) = d.and_then(|d| d.tech("encoding")) {
                     row(ui, "Encoding", if e == "lossless" { "Lossless" } else { "Lossy" });
                 }
@@ -172,7 +189,9 @@ impl Info {
                     _ if src > 0 => fmt_rate(src),
                     _ => "?".into(),
                 };
-                row(ui, "Sample rate", rate);
+                if audio {
+                    row(ui, "Sample rate", rate);
+                }
                 let ch = now.status.channels;
                 let channels = match ch {
                     1 => "1 (mono, played on both sides)".to_string(),
@@ -180,7 +199,9 @@ impl Info {
                     0 => "?".to_string(),
                     n => format!("{n} (mixed down to stereo)"),
                 };
-                row(ui, "Channels", channels);
+                if audio {
+                    row(ui, "Channels", channels);
+                }
                 if (now.rate - 1.0).abs() > 1e-4 {
                     row(ui, "Rate", format!("{:.2}×", now.rate));
                 }

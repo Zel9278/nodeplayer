@@ -15,7 +15,7 @@ mod jsfx;
 mod library;
 mod lyrics;
 mod midi;
-mod midi_file_node;
+mod midi_song;
 mod midifile;
 #[cfg(not(target_os = "linux"))]
 mod midir_io;

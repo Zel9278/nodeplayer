@@ -1,5 +1,5 @@
-//! The track list: scans folders (with their subfolders) and single files for audio and video
-//! in the background, reads their tags for the table (cached in
+//! The track list: scans folders (with their subfolders) and single files for audio, video
+//! and MIDI files in the background, reads their tags for the table (cached in
 //! `~/.cache/nodeplayer/library-tags-2.json`), counts plays (in
 //! `~/.local/state/nodeplayer/plays.json`), and keeps the play order (sorting, next/previous,
 //! repeat, shuffle).
@@ -15,6 +15,7 @@ pub const AUDIO_EXTS: &[&str] =
 
 pub fn is_media(path: &Path) -> bool {
     crate::av::is_video_ext(path)
+        || crate::midi_song::is_midi_file(path)
         || path.extension().and_then(|e| e.to_str()).is_some_and(|e| AUDIO_EXTS.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
@@ -56,8 +57,20 @@ pub struct TrackMeta {
     pub date: Option<String>,
 }
 
+/// MIDI files up to this size are read through for their length; black MIDI can be
+/// gigabytes.
+const MIDI_LENGTH_MAX_BYTES: u64 = 16 << 20;
+
 impl TrackMeta {
     fn read(path: &Path) -> Self {
+        if crate::midi_song::is_midi_file(path) {
+            let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= MIDI_LENGTH_MAX_BYTES);
+            let duration = small
+                .then(|| crate::midifile::load(path, &Default::default()).ok())
+                .flatten()
+                .map(|f| f.info.duration);
+            return Self { duration, ..Default::default() };
+        }
         let Ok(info) = crate::av::track_info(path) else { return Self::default() };
         let get = |k: &str| info.meta.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         let num = |k: &str| get(k).and_then(|v| v.trim().parse::<u32>().ok());

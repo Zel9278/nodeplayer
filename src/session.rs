@@ -60,7 +60,9 @@ pub enum SavedKind {
     CSynth(crate::csynth_node::CSynthSettings),
     Lyrics(crate::lyrics::LyricsSettings),
     Video(crate::video::VideoSettings),
-    MidiFile(crate::midi_file_node::MidiFileSettings),
+    /// The MIDI File Player node of older versions; the Player plays MIDI files now, so only
+    /// its wires are kept (see `insert_graph`).
+    MidiFile(serde_json::Value),
     /// A hosted plugin of any format.
     Plugin {
         format: Format,
@@ -130,6 +132,8 @@ pub struct Session {
     /// Playback rate shift; absent means 1.
     #[serde(default)]
     pub rate: Option<f32>,
+    /// Leave out channel 10 (drums) when playing MIDI files.
+    pub midi_no_drums: bool,
     /// How the panels are docked; dropped (back to the default) if it can't be read.
     #[serde(deserialize_with = "dock_layout")]
     pub dock: Option<egui_dock::DockState<crate::app::Tab>>,

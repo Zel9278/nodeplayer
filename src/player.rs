@@ -1,11 +1,12 @@
 //! File playback: a decoder thread (symphonia, or FFmpeg for what it can't open, + rubato) feeding a ring buffer that the
-//! `Player` source node drains on the audio thread.
+//! `Player` source node drains on the audio thread. MIDI files are played by a
+//! [`MidiSong`] instead, out of the node's MIDI pin.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -20,7 +21,8 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTag, StandardVisualKey};
 use symphonia::core::units::{Time, TimeBase};
 
-use crate::engine::{Processor, StereoBuf};
+use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf};
+use crate::midi_song::{MidiFeed, MidiSong, is_midi_file};
 
 const RING_SECONDS: f32 = 0.5;
 const RESAMPLE_CHUNK: usize = 1024;
@@ -62,7 +64,7 @@ pub struct Status {
     pub channels: usize,
     pub error: Option<String>,
     pub tags: Tags,
-    /// "symphonia" or "FFmpeg".
+    /// "symphonia", "FFmpeg" or "MIDI".
     pub decoder: &'static str,
 }
 
@@ -89,6 +91,8 @@ impl Status {
 
 enum Cmd {
     Load(PathBuf),
+    /// Let go of the file (a MIDI file plays instead).
+    Unload,
     Seek(f64),
     Attach(rtrb::Producer<f32>),
 }
@@ -98,6 +102,9 @@ pub struct Player {
     shared: Arc<Shared>,
     status: Arc<Mutex<Status>>,
     device_rate: u32,
+    midi: Mutex<MidiSong>,
+    /// The MIDI file loaded, when it is one; the decoder then has nothing.
+    midi_path: Mutex<Option<PathBuf>>,
 }
 
 impl Player {
@@ -122,7 +129,7 @@ impl Player {
             .name("decoder".into())
             .spawn(move || worker.run())
             .expect("spawn decoder thread");
-        Self { tx, shared, status, device_rate }
+        Self { tx, shared, status, device_rate, midi: Mutex::new(MidiSong::new()), midi_path: Mutex::new(None) }
     }
 
     /// Creates the audio-thread source. Only the most recently created source receives audio.
@@ -130,7 +137,24 @@ impl Player {
         let len = (self.device_rate as f32 * RING_SECONDS) as usize * 2;
         let (prod, cons) = rtrb::RingBuffer::new(len);
         let _ = self.tx.send(Cmd::Attach(prod));
-        PlayerSource { ring: cons, shared: self.shared.clone(), varispeed: Varispeed::new() }
+        let midi = self.midi.lock().unwrap().feed(self.device_rate as f32);
+        PlayerSource { ring: cons, shared: self.shared.clone(), varispeed: Varispeed::new(), midi }
+    }
+
+    pub fn is_midi(&self) -> bool {
+        self.midi_path.lock().unwrap().is_some()
+    }
+
+    /// The MIDI player, with its load finished if it is done and its speed following the
+    /// rate shift.
+    pub fn midi(&self) -> MutexGuard<'_, MidiSong> {
+        let mut m = self.midi.lock().unwrap();
+        m.player.update();
+        let rate = self.rate();
+        if m.player.settings.speed != rate {
+            m.player.set_speed(rate);
+        }
+        m
     }
 
     /// Playback rate shift, within [`RATE_RANGE`]; 1 is normal speed.
@@ -149,11 +173,29 @@ impl Player {
         self.shared.eof.store(false, Ordering::Release);
         self.shared.ended.store(false, Ordering::Release);
         self.shared.finished.store(false, Ordering::Release);
+        if is_midi_file(path) {
+            log::info!("load {}", path.display());
+            let _ = self.tx.send(Cmd::Unload);
+            self.shared.playing.store(false, Ordering::Release);
+            *self.midi_path.lock().unwrap() = Some(path.to_path_buf());
+            self.midi().player.open(path.to_path_buf(), true);
+            return;
+        }
+        if self.midi_path.lock().unwrap().take().is_some() {
+            self.midi().player.stop();
+        }
         let _ = self.tx.send(Cmd::Load(path.to_path_buf()));
         self.shared.playing.store(true, Ordering::Release);
     }
 
     pub fn seek(&self, secs: f64) {
+        if self.is_midi() {
+            let mut m = self.midi();
+            if !m.player.seek_when_loaded(secs.max(0.0)) {
+                m.player.seek(secs.max(0.0));
+            }
+            return;
+        }
         self.shared.eof.store(false, Ordering::Release);
         self.shared.finished.store(false, Ordering::Release);
         let _ = self.tx.send(Cmd::Seek(secs.max(0.0)));
@@ -161,6 +203,13 @@ impl Player {
 
     /// Starting again after the file played to the end restarts it from the top.
     pub fn set_playing(&self, on: bool) {
+        if self.is_midi() {
+            let mut m = self.midi();
+            if !m.player.play_when_loaded(on) {
+                if on { m.player.play() } else { m.player.pause() }
+            }
+            return;
+        }
         if on && self.shared.finished.load(Ordering::Acquire) {
             self.seek(0.0);
         }
@@ -168,31 +217,61 @@ impl Player {
     }
 
     pub fn is_playing(&self) -> bool {
+        if self.is_midi() {
+            let m = self.midi();
+            return m.player.is_playing() || m.player.plays_when_loaded();
+        }
         self.shared.playing.load(Ordering::Acquire)
     }
 
     pub fn position(&self) -> f64 {
+        if self.is_midi() {
+            return self.midi().player.status().position;
+        }
         f64::from_bits(self.shared.base_secs.load(Ordering::Acquire))
             + self.shared.frames_played.load(Ordering::Acquire) as f64 / self.device_rate as f64
     }
 
     /// The file played to the end and hasn't been started again.
     pub fn finished(&self) -> bool {
+        if self.is_midi() {
+            let m = self.midi();
+            let s = m.player.status();
+            return m.player.is_loaded() && !s.playing && !m.player.is_loading() && s.position >= s.duration;
+        }
         self.shared.finished.load(Ordering::Acquire)
     }
 
     /// True once after the current file finished playing to the end.
     pub fn take_ended(&self) -> bool {
+        if self.is_midi() {
+            return self.midi().player.take_ended();
+        }
         self.shared.ended.swap(false, Ordering::AcqRel)
     }
 
     pub fn status(&self) -> Status {
+        let midi_path = self.midi_path.lock().unwrap().clone();
+        if let Some(path) = midi_path {
+            let m = self.midi();
+            return Status {
+                path: Some(path),
+                // Known once loaded.
+                duration: m.player.info().map(|i| i.duration),
+                error: m.player.load_error().map(str::to_owned),
+                decoder: "MIDI",
+                ..Default::default()
+            };
+        }
         self.status.lock().unwrap().clone()
     }
 
     /// The bitrate of the second just played, in kbps, from the sizes of its packets; `None`
     /// when the decoder doesn't tell them (FFmpeg) or too little has played.
     pub fn live_bitrate(&self) -> Option<f64> {
+        if self.is_midi() {
+            return None;
+        }
         let pos = self.position();
         let packets = self.shared.packets.lock().unwrap();
         let (mut bytes, mut secs) = (0u64, 0f64);
@@ -443,6 +522,14 @@ impl Worker {
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Attach(p) => self.ring = Some(p),
+            Cmd::Unload => {
+                self.reset_stream();
+                self.decoder = None;
+                self.decoder_done = true;
+                self.path = None;
+                *self.status.lock().unwrap() = Status::default();
+                self.shared.base_secs.store(0f64.to_bits(), Ordering::Release);
+            }
             Cmd::Load(path) => {
                 log::info!("load {}", path.display());
                 self.reset_stream();
@@ -619,11 +706,12 @@ impl Worker {
     }
 }
 
-/// Audio-thread source node: 0 inputs, 1 stereo output.
+/// Audio-thread source node: 0 inputs, 1 stereo output, and MIDI out for MIDI files.
 pub struct PlayerSource {
     ring: rtrb::Consumer<f32>,
     shared: Arc<Shared>,
     varispeed: Varispeed,
+    midi: MidiFeed,
 }
 
 /// The rate shift: a sinc resampler between the ring and the output whose ratio follows the
@@ -782,6 +870,19 @@ impl Varispeed {
 }
 
 impl Processor for PlayerSource {
+    fn process_midi(
+        &mut self,
+        n: usize,
+        inputs: &mut [StereoBuf],
+        outputs: &mut [StereoBuf],
+        _midi_in: &[MidiEvent],
+        midi_out: &mut MidiBuf,
+    ) {
+        self.process(n, inputs, outputs);
+        let rate = f32::from_bits(self.shared.rate.load(Ordering::Acquire));
+        self.midi.run(n, midi_out, rate);
+    }
+
     fn process(&mut self, n: usize, _inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
         let s = &self.shared;
         if s.flush.load(Ordering::Acquire) {
@@ -861,7 +962,7 @@ mod tests {
         }
         let shared = Arc::new(Shared { rate: AtomicU32::new(rate.to_bits()), ..Default::default() });
         shared.playing.store(true, Ordering::Release);
-        let mut src = PlayerSource { ring: cons, shared: shared.clone(), varispeed: Varispeed::new() };
+        let mut src = PlayerSource { ring: cons, shared: shared.clone(), varispeed: Varispeed::new(), midi: MidiSong::new().feed(sr) };
         let mut out = vec![StereoBuf::new()];
         let mut l = Vec::new();
         for b in 0..blocks {
@@ -926,5 +1027,49 @@ mod tests {
             let peak = l[4800..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
             assert!((peak - 0.5).abs() < 0.02, "rate {rate}: peak {peak}");
         }
+    }
+
+    /// Waits up to 5 s for `f` to hold.
+    fn wait_for(mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn plays_midi_files_as_songs() {
+        // One note, half a second long at the default 120 BPM.
+        let mut bytes = b"MThd\0\0\0\x06\0\0\0\x01\x01\xe0MTrk\0\0\0\x0d".to_vec();
+        bytes.extend([0x00, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, 0x00, 0xff, 0x2f, 0x00]);
+        let dir = std::env::temp_dir().join(format!("nodeplayer-midi-song-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.mid");
+        std::fs::write(&path, bytes).unwrap();
+
+        let player = Player::new(48_000);
+        // As when the last track is brought back: paused, where it was.
+        player.load(&path);
+        player.set_playing(false);
+        player.seek(0.25);
+        assert!(wait_for(|| player.status().duration.is_some()), "the file loads");
+        let status = player.status();
+        assert_eq!((status.decoder, status.path.as_deref()), ("MIDI", Some(path.as_path())));
+        assert!((status.duration.unwrap() - 0.5).abs() < 1e-6);
+        assert!(!player.is_playing());
+        assert!((player.position() - 0.25).abs() < 1e-6);
+
+        player.set_playing(true);
+        assert!(player.is_playing());
+        assert!(wait_for(|| player.take_ended()), "the end is told");
+        assert!(player.finished() && !player.is_playing());
+        // Played again, it starts over.
+        player.set_playing(true);
+        assert!(player.is_playing() && player.position() < 0.25);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

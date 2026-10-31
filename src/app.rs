@@ -18,9 +18,9 @@ use crate::audio2midi::Audio2Midi;
 use crate::csynth_node::CSynthNode;
 use crate::lyrics::LyricsNode;
 use crate::video::VideoNode;
-use crate::midi_file_node::MidiFileNode;
 use crate::graph::{self, GraphNode, IdAlloc, NodeKind, PluginNode};
 use crate::library::{self, AUDIO_EXTS, Library};
+use crate::midi_song::MIDI_EXTS;
 use crate::midi::{Dir, Monitor, SeqNode};
 use crate::misskey::Misskey;
 use crate::mpris::{self, Mpris};
@@ -141,6 +141,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
                     finished: app.player.finished(),
                     position: app.player.position(),
                     rate: app.player.rate(),
+                    midi: app.player.is_midi().then(|| app.player.midi().player.info().cloned()).flatten(),
                     output: app.engine.as_ref().map(|e| (e.device_name.as_str(), e.sample_rate, e.channels as u16)),
                     plays,
                 };
@@ -348,6 +349,7 @@ impl App {
         app.library.repeat = saved.repeat.unwrap_or(app.library.repeat);
         app.library.shuffle = saved.shuffle;
         app.rate = saved.rate.unwrap_or(1.0);
+        app.player.midi().player.set_skip_drums(saved.midi_no_drums);
         app.library.sort = saved.library_sort;
         app.library.columns = saved.library_columns.clone().unwrap_or_default();
         match initial_file {
@@ -582,7 +584,6 @@ impl App {
                 NodeKind::CSynth(c) => SavedKind::CSynth(c.settings.clone()),
                 NodeKind::Lyrics(l) => SavedKind::Lyrics(l.settings.clone()),
                 NodeKind::Video(v) => SavedKind::Video(v.settings.clone()),
-                NodeKind::MidiFile(m) => SavedKind::MidiFile(m.settings()),
                 NodeKind::Plugin(p) => {
                     let _g = guard::enter(&p.tag);
                     let state = p.instance.save_state().map(|b| BASE64.encode(b));
@@ -641,7 +642,7 @@ impl App {
                 let had = self.snarl.node_ids().count();
                 self.insert_graph(&g, pos.to_vec2());
                 let added = self.snarl.node_ids().count() - had;
-                let players = g.nodes.iter().filter(|n| matches!(n.kind, SavedKind::Player)).count();
+                let players = g.nodes.iter().filter(|n| matches!(n.kind, SavedKind::Player | SavedKind::MidiFile(_))).count();
                 if added + players < g.nodes.len() {
                     self.log(format!("node preset \"{name}\": {added} of {} nodes added (missing plugins are skipped)", g.nodes.len()));
                 }
@@ -653,9 +654,17 @@ impl App {
     /// Adds `g`'s nodes, moved by `offset`, and its wires; the new ids in `g`'s order.
     fn insert_graph(&mut self, g: &SavedGraph, offset: egui::Vec2) -> Vec<Option<NodeId>> {
         let mut ids = Vec::with_capacity(g.nodes.len());
-        for n in &g.nodes {
+        // MIDI File Player nodes of older versions: the Player plays MIDI files now, so their
+        // wires come from its MIDI pin.
+        let mut midi_files = Vec::new();
+        for (i, n) in g.nodes.iter().enumerate() {
             let pos = Pos2::from(n.pos) + offset;
             let id = match &n.kind {
+                SavedKind::MidiFile(_) => {
+                    midi_files.push(i);
+                    ids.push(None);
+                    continue;
+                }
                 SavedKind::Plugin { .. } => self.restore_plugin(&n.kind, pos),
                 SavedKind::Vst3 { .. } => n.kind.upgraded().and_then(|k| self.restore_plugin(&k, pos)),
                 // There's only one Player; a node preset's wires from it go to the one there is.
@@ -704,8 +713,7 @@ impl App {
                         SavedKind::CSynth(s) => NodeKind::CSynth(Box::new(CSynthNode::new(s.clone(), self.sample_rate))),
                         SavedKind::Lyrics(s) => NodeKind::Lyrics(Box::new(LyricsNode::new(s.clone()))),
                         SavedKind::Video(s) => NodeKind::Video(Box::new(VideoNode::new(s.clone()))),
-                        SavedKind::MidiFile(s) => NodeKind::MidiFile(Box::new(MidiFileNode::new(s.clone(), self.sample_rate))),
-                        SavedKind::Plugin { .. } | SavedKind::Vst3 { .. } => unreachable!(),
+                        SavedKind::MidiFile(_) | SavedKind::Plugin { .. } | SavedKind::Vst3 { .. } => unreachable!(),
                     };
                     self.add_node(kind, pos)
                 }
@@ -715,7 +723,12 @@ impl App {
             }
             ids.push(id);
         }
+        let player = self.snarl.node_ids().find(|(_, n)| matches!(n.kind, NodeKind::Player)).map(|(id, _)| id);
+        for &i in &midi_files {
+            ids[i] = player;
+        }
         for &[a, out, b, inp] in &g.wires {
+            let out = if midi_files.contains(&a) { NodeKind::Player.audio_outputs() } else { out };
             let (Some(&Some(from)), Some(&Some(to))) = (ids.get(a), ids.get(b)) else { continue };
             let (a, b) = (&self.snarl[from].kind, &self.snarl[to].kind);
             if out < a.outputs()
@@ -775,6 +788,7 @@ impl App {
             repeat: Some(self.library.repeat),
             shuffle: self.library.shuffle,
             rate: Some(self.rate),
+            midi_no_drums: self.player.midi().player.settings.skip_drums,
             dock: Some(self.dock.clone()),
             tabs_seen: Tab::ALL.to_vec(),
         };
@@ -886,16 +900,6 @@ impl App {
     }
 
     fn open_dropped(&mut self, path: PathBuf) {
-        // A MIDI file goes to the first MIDI File Player, if there is one.
-        if MidiFileNode::is_midi_file(&path)
-            && let Some(m) = self.snarl.nodes_mut().find_map(|n| match &mut n.kind {
-                NodeKind::MidiFile(m) => Some(m),
-                _ => None,
-            })
-        {
-            m.open(path);
-            return;
-        }
         if path.is_dir() {
             self.library.add(library::Source::Folder(path));
             self.show_tab(Tab::Library);
@@ -1222,7 +1226,6 @@ impl App {
                 }
                 NodeKind::Limiter { meter, gain, .. } => *gain = meter.take_gain(),
                 NodeKind::CSynth(c) => c.idle(),
-                NodeKind::MidiFile(m) => m.update(),
                 NodeKind::Output { meter, level, .. } => {
                     let peak = meter.take();
                     for c in 0..2 {
@@ -1244,8 +1247,14 @@ impl App {
         let dur = status.duration.unwrap_or(0.0);
         ui.horizontal(|ui| {
             if ui.button("📂 Open").clicked() {
-                let media: Vec<&str> = AUDIO_EXTS.iter().chain(crate::av::VIDEO_EXTS).copied().collect();
-                if let Some(p) = rfd::FileDialog::new().add_filter("Audio and video", &media).add_filter("Audio", AUDIO_EXTS).add_filter("Video", crate::av::VIDEO_EXTS).pick_file() {
+                let media: Vec<&str> = AUDIO_EXTS.iter().chain(crate::av::VIDEO_EXTS).chain(MIDI_EXTS).copied().collect();
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Audio, video and MIDI", &media)
+                    .add_filter("Audio", AUDIO_EXTS)
+                    .add_filter("Video", crate::av::VIDEO_EXTS)
+                    .add_filter("MIDI", MIDI_EXTS)
+                    .pick_file()
+                {
                     self.load_file(&p);
                 }
             }
@@ -1364,8 +1373,8 @@ impl App {
                 }
             }
             if ui.button("🎵 Add files…").on_hover_text("add single tracks").clicked() {
-                let media: Vec<&str> = AUDIO_EXTS.iter().chain(crate::av::VIDEO_EXTS).copied().collect();
-                let mut dlg = rfd::FileDialog::new().add_filter("Audio and video", &media);
+                let media: Vec<&str> = AUDIO_EXTS.iter().chain(crate::av::VIDEO_EXTS).chain(MIDI_EXTS).copied().collect();
+                let mut dlg = rfd::FileDialog::new().add_filter("Audio, video and MIDI", &media);
                 if let Some(d) = &start {
                     dlg = dlg.set_directory(d);
                 }
@@ -2391,7 +2400,7 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
     }
 
     fn has_body(&mut self, node: &GraphNode) -> bool {
-        !matches!(node.kind, NodeKind::Player)
+        !matches!(node.kind, NodeKind::Player) || self.player.is_midi()
     }
 
     fn show_body(
@@ -2405,7 +2414,7 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         let eid = snarl[node].eid;
         let mut sends: Vec<(usize, f32)> = Vec::new();
         ui.vertical(|ui| match &mut snarl[node].kind {
-            NodeKind::Player => {}
+            NodeKind::Player => self.player.midi().ui(ui),
             NodeKind::Visual(v) => v.show(ui, self.sample_rate),
             NodeKind::Audio2Midi(a) => audio2midi_body(ui, a, eid, self.sample_rate),
             NodeKind::MidiIn(m) | NodeKind::MidiOut(m) => m.ui(ui),
@@ -2413,7 +2422,6 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
             NodeKind::CSynth(c) => sends.extend(c.ui(ui)),
             NodeKind::Lyrics(l) => self.wants_scroll |= l.ui(ui, self.player, self.scroll.y),
             NodeKind::Video(v) => v.ui(ui, self.player),
-            NodeKind::MidiFile(m) => m.ui(ui),
             NodeKind::Output { volume_db, level, .. } => {
                 if ui.add(egui::Slider::new(volume_db, -60.0..=12.0).suffix(" dB").text("vol")).changed() {
                     sends.push((0, *volume_db));
@@ -2629,7 +2637,6 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
             add(ui, "MIDI Out (ALSA)", &|| NodeKind::MidiOut(Box::new(SeqNode::new(Dir::Out))));
             add(ui, "MIDI Monitor", &|| NodeKind::MidiMonitor(Box::new(Monitor::new())));
             let sr = self.sample_rate;
-            add(ui, "MIDI File Player", &|| NodeKind::MidiFile(Box::new(MidiFileNode::new(Default::default(), sr))));
             add(ui, "CSynth (piano / SoundFont)", &|| NodeKind::CSynth(Box::new(CSynthNode::new(Default::default(), sr))));
             add(ui, "Audio → MIDI", &|| NodeKind::Audio2Midi(Box::new(Audio2Midi::new(sr))));
         });

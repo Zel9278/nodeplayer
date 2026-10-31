@@ -12,7 +12,6 @@ use crate::audio2midi::Audio2Midi;
 use crate::csynth_node::CSynthNode;
 use crate::lyrics::LyricsNode;
 use crate::video::VideoNode;
-use crate::midi_file_node::MidiFileNode;
 use crate::midi::{Monitor, SeqNode};
 use crate::eq_editor::EqNode;
 use crate::player::Player;
@@ -54,6 +53,7 @@ impl PluginNode {
 }
 
 pub enum NodeKind {
+    /// Plays the current track: audio out, and MIDI out for MIDI files.
     Player,
     Output { volume_db: f32, meter: Arc<Meter>, level: [f32; 2] },
     Gain { db: f32 },
@@ -76,7 +76,6 @@ pub enum NodeKind {
     CSynth(Box<CSynthNode>),
     Lyrics(Box<LyricsNode>),
     Video(Box<VideoNode>),
-    MidiFile(Box<MidiFileNode>),
 }
 
 impl NodeKind {
@@ -124,7 +123,6 @@ impl NodeKind {
             Self::CSynth(_) => "CSynth".into(),
             Self::Lyrics(_) => "Lyrics".into(),
             Self::Video(_) => "Video".into(),
-            Self::MidiFile(_) => "MIDI File Player".into(),
         }
     }
 
@@ -137,8 +135,7 @@ impl NodeKind {
             | Self::MidiMonitor(_)
             | Self::CSynth(_)
             | Self::Lyrics(_)
-            | Self::Video(_)
-            | Self::MidiFile(_) => 0,
+            | Self::Video(_) => 0,
             Self::Mixer { .. } => MIXER_INPUTS,
             _ => 1,
         }
@@ -146,7 +143,7 @@ impl NodeKind {
 
     pub fn audio_outputs(&self) -> usize {
         match self {
-            Self::Output { .. } | Self::MidiIn(_) | Self::MidiOut(_) | Self::MidiMonitor(_) | Self::Lyrics(_) | Self::Video(_) | Self::MidiFile(_) => 0,
+            Self::Output { .. } | Self::MidiIn(_) | Self::MidiOut(_) | Self::MidiMonitor(_) | Self::Lyrics(_) | Self::Video(_) => 0,
             _ => 1,
         }
     }
@@ -161,7 +158,7 @@ impl NodeKind {
 
     pub fn midi_output(&self) -> bool {
         match self {
-            Self::MidiIn(_) | Self::MidiMonitor(_) | Self::Audio2Midi(_) | Self::MidiFile(_) => true,
+            Self::Player | Self::MidiIn(_) | Self::MidiMonitor(_) | Self::Audio2Midi(_) => true,
             Self::Plugin(p) => p.instance.midi_ports().1,
             _ => false,
         }
@@ -206,7 +203,6 @@ impl NodeKind {
             Self::CSynth(c) => Box::new(c.processor()),
             // Shows what's playing; nothing to do on the audio thread.
             Self::Lyrics(_) | Self::Video(_) => Box::new(nodes::MidiBridge::default()),
-            Self::MidiFile(m) => Box::new(m.processor()),
             Self::Plugin(_) => return None,
         })
     }
