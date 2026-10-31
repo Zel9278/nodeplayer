@@ -1,3 +1,6 @@
+// Changed for nodeplayer (2026): `ImeRequest::Allow` focuses the new input context when the
+// window already has the focus. The rest of this copy of winit 0.30.13 is as published.
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::os::raw::{c_char, c_int, c_long, c_ulong};

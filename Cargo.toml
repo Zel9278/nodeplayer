@@ -2,6 +2,8 @@
 name = "nodeplayer"
 version = "0.1.0"
 edition = "2024"
+authors = ["Zel9278"]
+license = "MIT"
 
 [workspace]
 members = [".", "sdk", "examples/plugin-example"]

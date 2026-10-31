@@ -1,3 +1,4 @@
+mod about;
 mod app;
 mod audio2midi;
 mod av;

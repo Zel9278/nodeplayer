@@ -260,6 +260,7 @@ pub struct App {
     capture_scroll: bool,
     /// App extensions from native plugins.
     extensions: Extensions,
+    about: crate::about::About,
     /// What extensions were last told: current track and whether it played.
     ext_seen: (Option<PathBuf>, bool),
     /// The library revision the extensions' snapshot was taken from.
@@ -333,6 +334,7 @@ impl App {
             graph_shown: false,
             capture_scroll: false,
             extensions: Extensions::default(),
+            about: Default::default(),
             ext_seen: (None, false),
             ext_library: u64::MAX,
             track_ended: false,
@@ -2187,9 +2189,15 @@ impl eframe::App for App {
                     ui.separator();
                     ui.small(m).on_hover_text(self.messages.join("\n"));
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("About").clicked() {
+                        self.about.open = !self.about.open;
+                    }
+                });
             });
         });
         self.param_windows(&ctx);
+        self.about.show(&ctx);
 
         let mut dock = std::mem::replace(&mut self.dock, egui_dock::DockState::new(Vec::new()));
         let closed: Vec<Tab> = Tab::ALL

@@ -201,6 +201,7 @@ NODEPLAYER_DEBUG_PLUGIN="[FORMAT:]<path>|<class name>" nodeplayer  # add the plu
 | `src/midi_song.rs` | MIDI files as songs: the Player node's MIDI section, and placing the player's timed messages on their frames |
 | `src/lyrics.rs` | Lyrics node: LRC parsing, local files and tags, NetEase / Kugou lookup and cache, the scrolling view |
 | `src/csynth_node.rs` | CSynth instrument node: loading sounds in the background, MIDI to csynth on its clock, sustain pedal |
+| `src/about.rs` | The About window: author, license, and the crate list (`assets/licenses.json`) with the test that makes it |
 | `src/player.rs` | Decoder thread (symphonia, or FFmpeg for what it can't open, then rubato) feeding a ring buffer that the source node reads, and the rate shift (a variable-ratio sinc resampler on the audio thread); MIDI files go to `midi_song.rs` instead |
 | `src/av.rs` | FFmpeg as programs: `ffprobe` for streams and tags, `ffmpeg` piping audio as f32 and video pictures as RGBA (frame times from `showinfo`), seeking by restarting, rotation |
 | `src/setup.rs` | First start: the FFmpeg download and the AppImage's menu entry |
@@ -230,3 +231,7 @@ NODEPLAYER_DEBUG_PLUGIN="[FORMAT:]<path>|<class name>" nodeplayer  # add the plu
 - Running plugins in a separate process (a crash is recorded and the plugin disabled, but the app still goes down with it)
 - Saving playlists and reading tags (titles and other metadata are not read; file names are shown)
 - Latency compensation
+
+## License
+
+nodeplayer is made by Zel9278 and released under the MIT License (`LICENSE`). "About" at the right of the status bar shows it, the crates named in `Cargo.toml` with their versions and licenses, the C/C++ code built in (ysfx and what it uses, under Apache-2.0, Zlib and public-domain-or-MIT terms) and the copy of winit changed for IME input (Apache-2.0; the change is marked in `third_party/winit/src/platform_impl/linux/x11/event_processor.rs`), and every crate in the build. That list is `assets/licenses.json`, made from `cargo metadata`; a test fails when it no longer matches `Cargo.lock`, and `NODEPLAYER_WRITE_LICENSES=1 cargo test about` writes it again. Of the crates, symphonia is MPL-2.0 and the rest are MIT, Apache-2.0 or similar permissive licenses. FFmpeg is not part of nodeplayer: it runs as its own programs, under the license of the build installed.
