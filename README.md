@@ -2,6 +2,10 @@
 
 An audio player written in Rust where the signal chain is built as a node graph. It hosts VST3, CLAP and JSFX plugins plus its own native plugins (DSP nodes and app extensions), and Windows plugins can be used through yabridge. It also plays video files, showing the picture in a Video node.
 
+## Download
+
+Builds for Linux (x86_64), Windows (x86_64) and macOS (Apple silicon and Intel) are on the [releases page](https://github.com/Zel9278/nodeplayer/releases). On Linux it needs ALSA, X11 (or XWayland) and fontconfig, as most desktops have. The macOS builds aren't signed: allow them in System Settings → Privacy & Security, or run `xattr -d com.apple.quarantine nodeplayer` once.
+
 ## Building and running
 
 ```sh
