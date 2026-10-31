@@ -18,6 +18,16 @@ const API: &std::ffi::CStr = CLAP_WINDOW_API_WIN32;
 #[cfg(target_os = "macos")]
 const API: &std::ffi::CStr = CLAP_WINDOW_API_COCOA;
 
+/// Use the same native API when offering an editor and when opening it.
+///
+/// # Safety
+/// Any non-null `gui` must point to a valid extension whose callback accepts `plugin`.
+pub(super) unsafe fn is_supported(plugin: *const clap_plugin, gui: *const clap_plugin_gui) -> bool {
+    unsafe { gui.as_ref() }
+        .and_then(|g| g.is_api_supported)
+        .is_some_and(|f| unsafe { f(plugin, API.as_ptr(), false) })
+}
+
 fn window_handle(window: &HostWindow) -> clap_window_handle {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     return clap_window_handle { x11: window.handle() as _ };
@@ -51,7 +61,7 @@ impl ClapEditor {
         unsafe {
             let g = &*gui;
             let api = API.as_ptr();
-            if !g.is_api_supported.is_some_and(|f| f(plugin, api, false)) {
+            if !is_supported(plugin, gui) {
                 bail!("{} has no embeddable {} GUI", info.name, API.to_string_lossy());
             }
             if !g.create.is_some_and(|f| f(plugin, api, false)) {
@@ -182,5 +192,61 @@ impl Drop for ClapEditor {
                 d(self.plugin);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{CStr, c_char};
+
+    unsafe extern "C" fn native_embedded_api(_: *const clap_plugin, api: *const c_char, floating: bool) -> bool {
+        let expected = if cfg!(target_os = "macos") {
+            c"cocoa"
+        } else if cfg!(target_os = "windows") {
+            c"win32"
+        } else {
+            c"x11"
+        };
+        !floating && !api.is_null() && unsafe { CStr::from_ptr(api) } == expected
+    }
+
+    const GUI: clap_plugin_gui = clap_plugin_gui {
+        is_api_supported: Some(native_embedded_api),
+        get_preferred_api: None,
+        create: None,
+        destroy: None,
+        set_scale: None,
+        get_size: None,
+        can_resize: None,
+        get_resize_hints: None,
+        adjust_size: None,
+        set_size: None,
+        set_parent: None,
+        set_transient: None,
+        suggest_title: None,
+        show: None,
+        hide: None,
+    };
+
+    #[test]
+    fn detects_native_embedded_editor() {
+        assert!(unsafe { is_supported(std::ptr::null(), &GUI) });
+    }
+
+    #[test]
+    fn rejects_floating_only_editor() {
+        unsafe extern "C" fn floating_only(_: *const clap_plugin, _: *const c_char, floating: bool) -> bool {
+            floating
+        }
+        let gui = clap_plugin_gui { is_api_supported: Some(floating_only), ..GUI };
+        assert!(!unsafe { is_supported(std::ptr::null(), &gui) });
+    }
+
+    #[test]
+    fn handles_missing_gui_extension_or_probe() {
+        assert!(!unsafe { is_supported(std::ptr::null(), std::ptr::null()) });
+        let gui = clap_plugin_gui { is_api_supported: None, ..GUI };
+        assert!(!unsafe { is_supported(std::ptr::null(), &gui) });
     }
 }

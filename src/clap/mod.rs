@@ -949,9 +949,7 @@ impl plugins::Instance for ClapPlugin {
     }
 
     fn has_editor(&self) -> bool {
-        unsafe { self.ext.gui.as_ref() }
-            .and_then(|g| g.is_api_supported)
-            .is_some_and(|f| unsafe { f(self.plugin, CLAP_WINDOW_API_X11.as_ptr(), false) })
+        unsafe { editor::is_supported(self.plugin, self.ext.gui) }
     }
 
     fn open_editor(&mut self, placement: Placement) -> Result<Box<dyn plugins::Editor>> {
