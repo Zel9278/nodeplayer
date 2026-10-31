@@ -925,6 +925,17 @@ impl Control {
         }
     }
 
+    /// The position to show: past the selection loop's end before the player thread got to
+    /// going back (it was held up), it is where the sound is, back from the start.
+    fn shown_position(&self) -> f64 {
+        let now = self.now();
+        let duration = self.file.as_ref().map_or(f64::INFINITY, |f| f.info.duration);
+        match self.loop_range.map(|(a, b)| (a, b.min(duration))) {
+            Some((a, b)) if self.position < b && now >= b && b - a > 0.0 => a + (now - b) % (b - a),
+            _ => now,
+        }
+    }
+
 }
 
 /// Changes to the keys' counts (`Shared::down`, `presses`, `channel_of`, `notes_played`)
@@ -1622,7 +1633,7 @@ impl MidiPlayer {
     pub fn status(&self) -> Status {
         let (playing, now) = {
             let c = self.control();
-            (c.playing, c.now())
+            (c.playing, c.shown_position())
         };
         Status {
             name: self.loaded.as_ref().map(|(n, _)| n.clone()),
