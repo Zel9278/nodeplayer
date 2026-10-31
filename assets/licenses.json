@@ -643,6 +643,11 @@
       "license": "MIT/Apache-2.0"
     },
     {
+      "name": "claxon",
+      "version": "0.4.3",
+      "license": "Apache-2.0"
+    },
+    {
       "name": "clipboard-win",
       "version": "5.4.1",
       "license": "BSL-1.0"

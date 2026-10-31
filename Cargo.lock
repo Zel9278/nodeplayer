@@ -842,6 +842,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a76abbdb2907f6fd97fb6bc0b7be96b77d328f2dd9669d1075cc03369ed22154"
 
 [[package]]
+name = "claxon"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bfbf56724aa9eca8afa4fcfadeb479e722935bb2a0900c2d37e0cc477af0688"
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1126,8 +1132,9 @@ dependencies = [
 [[package]]
 name = "csynth"
 version = "0.1.0"
-source = "git+https://git.c30.life/ced/csynth-v2#c00c23cf65a845fbf11b57f838a499f84f2fd6b9"
+source = "git+https://git.c30.life/ced/csynth-v2#c1d9c3653d95ea43a85e7dec945f18174237182d"
 dependencies = [
+ "claxon",
  "lewton",
  "libc",
  "log",
@@ -4651,7 +4658,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.5.0",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
