@@ -105,9 +105,36 @@ fn x11_event_loop_hook() -> Option<eframe::EventLoopBuilderHook> {
     if std::env::var_os("NODEPLAYER_WAYLAND").is_some() || std::env::var_os("DISPLAY").is_none() {
         return None;
     }
+    pick_xim_server();
     Some(Box::new(|builder| {
         builder.with_x11();
     }))
+}
+
+/// An X11 window reaches the input method (fcitx, ibus) through XIM, named by `XMODIFIERS`.
+/// Wayland sessions often leave it unset, as Wayland apps don't need it; then the first server
+/// the display lists is used. Runs before any thread is started.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn pick_xim_server() {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+    if std::env::var_os("XMODIFIERS").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    let Ok((conn, screen)) = x11rb::connect(None) else { return };
+    let root = conn.setup().roots[screen].root;
+    let server = (|| {
+        let servers = conn.intern_atom(true, b"XIM_SERVERS").ok()?.reply().ok()?.atom;
+        let reply = conn.get_property(false, root, servers, AtomEnum::ATOM, 0, 64).ok()?.reply().ok()?;
+        let first = reply.value32()?.next()?;
+        let name = conn.get_atom_name(first).ok()?.reply().ok()?.name;
+        String::from_utf8(name).ok()?.strip_prefix("@server=").map(str::to_owned)
+    })();
+    if let Some(server) = server {
+        log::info!("XMODIFIERS is not set; using the XIM server {server}");
+        // SAFETY: no other thread is running yet.
+        unsafe { std::env::set_var("XMODIFIERS", format!("@im={server}")) };
+    }
 }
 
 /// Headless smoke test: instantiate the classes whose name contains `filter` and run a sine
