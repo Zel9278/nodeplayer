@@ -261,6 +261,16 @@ pub struct App {
     /// App extensions from native plugins.
     extensions: Extensions,
     about: crate::about::About,
+    loop_editor: crate::loop_editor::LoopEditor,
+    /// The stretch the selection loop plays, of the track loaded.
+    selection: Option<crate::loop_editor::Selection>,
+    /// Every track's selection and presets; `selection` is kept there.
+    loops: crate::loop_editor::LoopStore,
+    /// The track `selection` was brought for, and the selection as last kept.
+    selection_track: Option<PathBuf>,
+    selection_kept: Option<crate::loop_editor::Selection>,
+    /// The store's revision saved, and when it last changed.
+    loops_saved: (u64, Instant),
     /// What extensions were last told: current track and whether it played.
     ext_seen: (Option<PathBuf>, bool),
     /// The library revision the extensions' snapshot was taken from.
@@ -335,6 +345,12 @@ impl App {
             capture_scroll: false,
             extensions: Extensions::default(),
             about: Default::default(),
+            loop_editor: Default::default(),
+            selection: None,
+            loops: session::load_loops(),
+            selection_track: None,
+            selection_kept: None,
+            loops_saved: (0, Instant::now()),
             ext_seen: (None, false),
             ext_library: u64::MAX,
             track_ended: false,
@@ -352,6 +368,12 @@ impl App {
         app.library.shuffle = saved.shuffle;
         app.rate = saved.rate.unwrap_or(1.0);
         app.player.midi().player.set_skip_drums(saved.midi_no_drums);
+        // The single selection kept before tracks had their own.
+        if let Some(s) = &saved.selection
+            && app.loops.selection(&s.path).is_none()
+        {
+            app.loops.set_selection(&s.path, Some((s.start, s.end)));
+        }
         app.library.sort = saved.library_sort;
         app.library.columns = saved.library_columns.clone().unwrap_or_default();
         match initial_file {
@@ -791,6 +813,7 @@ impl App {
             shuffle: self.library.shuffle,
             rate: Some(self.rate),
             midi_no_drums: self.player.midi().player.settings.skip_drums,
+            selection: None,
             dock: Some(self.dock.clone()),
             tabs_seen: Tab::ALL.to_vec(),
         };
@@ -983,6 +1006,7 @@ impl App {
         }
         // Save first: plugin state has to be read before the plugins go away.
         self.save_session();
+        self.keep_selection(true);
         self.extensions = Extensions::default();
         for (_, node) in self.snarl.nodes_ids_mut() {
             if let NodeKind::Plugin(p) = &mut node.kind {
@@ -1160,6 +1184,52 @@ impl App {
         }
     }
 
+    /// Each track has its own selection: brought back when the track comes, kept in the
+    /// store when it changes, and the store saved a moment after.
+    fn keep_selection(&mut self, now: bool) {
+        let path = self.player.status().path;
+        if path != self.selection_track {
+            self.selection_track = path.clone();
+            self.selection = path.as_deref().and_then(|p| self.loops.selection(p));
+            self.selection_kept = self.selection.clone();
+        } else if !self.loop_editor.dragging() && self.selection != self.selection_kept {
+            if let Some(p) = &path {
+                let range = self.selection.as_ref().filter(|s| &s.path == p).map(|s| (s.start, s.end));
+                self.loops.set_selection(p, range);
+            }
+            self.selection_kept = self.selection.clone();
+        }
+        if self.loops.revision != self.loops_saved.0 {
+            // Typing or dragging a time changes it every frame: saved at most once a second.
+            if self.loops_saved.1.elapsed() > Duration::from_secs(1) || now {
+                session::save_loops(&self.loops);
+                self.loops_saved = (self.loops.revision, Instant::now());
+            }
+        } else {
+            self.loops_saved.1 = Instant::now();
+        }
+    }
+
+    /// Hands the selection loop to the player. When it changes and the playhead is outside
+    /// it, playing goes to its start.
+    fn sync_loop(&mut self) {
+        if self.loop_editor.dragging() {
+            return;
+        }
+        let path = self.player.status().path;
+        let want = crate::loop_editor::loop_region(self.library.repeat, self.selection.as_ref(), path.as_deref());
+        if self.player.loop_region() == want {
+            return;
+        }
+        self.player.set_loop(want);
+        if let Some((start, end)) = want {
+            let pos = self.player.position();
+            if pos < start || pos >= end {
+                self.player.seek(start);
+            }
+        }
+    }
+
     fn poll_background(&mut self) {
         self.collect_garbage();
 
@@ -1172,11 +1242,17 @@ impl App {
         }
         if self.player.take_ended() {
             self.track_ended = true;
-            match self.library.next(true) {
-                Some(i) => self.play_track(i),
-                None => {
-                    self.misskey.stopped(&self.player.status());
-                    self.discord.stopped();
+            // Played on past the selection: back to its start.
+            if let Some((start, _)) = self.player.loop_region().filter(|_| self.library.repeat == library::Repeat::Selection) {
+                self.player.seek(start);
+                self.player.set_playing(true);
+            } else {
+                match self.library.next(true) {
+                    Some(i) => self.play_track(i),
+                    None => {
+                        self.misskey.stopped(&self.player.status());
+                        self.discord.stopped();
+                    }
                 }
             }
         }
@@ -1278,8 +1354,15 @@ impl App {
             if ui.add_enabled(has_tracks, egui::Button::new("⏭")).on_hover_text("next").clicked() {
                 self.next_track();
             }
-            if ui.button(self.library.repeat.label()).on_hover_text("repeat").clicked() {
+            if ui
+                .button(self.library.repeat.label())
+                .on_hover_text("repeat: off, all, one, or the selection (the loop editor's; without one, the track without a gap)")
+                .clicked()
+            {
                 self.library.repeat = self.library.repeat.next();
+            }
+            if ui.selectable_label(self.loop_editor.open, "〰").on_hover_text("loop editor: select a stretch of the track to play over and over").clicked() {
+                self.loop_editor.open = !self.loop_editor.open;
             }
             ui.toggle_value(&mut self.library.shuffle, "🔀").on_hover_text("shuffle");
             let items = self.extensions.menu_items();
@@ -1312,6 +1395,15 @@ impl App {
             if r.drag_stopped() || (r.changed() && !r.dragged()) {
                 self.player.seek(t);
                 self.seek_drag = None;
+            }
+            // The selection, under the slider.
+            if let Some(s) = self.selection.as_ref().filter(|s| Some(&s.path) == status.path.as_ref() && dur > 0.0) {
+                let rail = r.rect.shrink2(egui::vec2(ui.spacing().interact_size.y / 2.0, 0.0));
+                let x = |t: f64| rail.left() + (t / dur).clamp(0.0, 1.0) as f32 * rail.width();
+                let looping = self.library.repeat == library::Repeat::Selection;
+                let color = if looping { Color32::from_rgb(110, 170, 255) } else { Color32::from_gray(120) };
+                let band = egui::Rect::from_x_y_ranges(x(s.start)..=x(s.end).max(x(s.start) + 2.0), rail.bottom() - 3.0..=rail.bottom() - 1.0);
+                ui.painter().rect_filled(band, 1.0, color);
             }
 
             if let Some(p) = &status.path {
@@ -2077,6 +2169,8 @@ impl eframe::App for App {
             return;
         }
         self.poll_background();
+        self.keep_selection(false);
+        self.sync_loop();
         let events = self.mpris.as_ref().map(|m| m.events()).unwrap_or_default();
         for e in events {
             self.media_event(e, ctx);
@@ -2198,6 +2292,7 @@ impl eframe::App for App {
         });
         self.param_windows(&ctx);
         self.about.show(&ctx);
+        self.loop_editor.show(&ctx, &self.player, &mut self.selection, &mut self.library.repeat, &mut self.loops);
 
         let mut dock = std::mem::replace(&mut self.dock, egui_dock::DockState::new(Vec::new()));
         let closed: Vec<Tab> = Tab::ALL

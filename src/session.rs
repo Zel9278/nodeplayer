@@ -134,6 +134,9 @@ pub struct Session {
     pub rate: Option<f32>,
     /// Leave out channel 10 (drums) when playing MIDI files.
     pub midi_no_drums: bool,
+    /// The selection, as kept before each track had its own (in `loops.json` now).
+    #[serde(skip_serializing)]
+    pub selection: Option<crate::loop_editor::Selection>,
     /// How the panels are docked; dropped (back to the default) if it can't be read.
     #[serde(deserialize_with = "dock_layout")]
     pub dock: Option<egui_dock::DockState<crate::app::Tab>>,
@@ -203,6 +206,23 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let text = std::fs::read(path).with_context(|| path.display().to_string())?;
     serde_json::from_slice(&text).with_context(|| path.display().to_string())
+}
+
+/// Every track's loop selection and presets.
+fn loops_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("loops.json"))
+}
+
+pub fn load_loops() -> crate::loop_editor::LoopStore {
+    let Some(path) = loops_path().filter(|p| p.exists()) else { return Default::default() };
+    read_json(&path).map_err(|e| log::warn!("can't read the loops: {e:#}")).unwrap_or_default()
+}
+
+pub fn save_loops(loops: &crate::loop_editor::LoopStore) {
+    let Some(path) = loops_path() else { return };
+    if let Err(e) = write_json(&path, loops) {
+        log::warn!("can't save the loops: {e:#}");
+    }
 }
 
 pub fn load_session() -> Option<Session> {

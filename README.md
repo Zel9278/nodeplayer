@@ -16,6 +16,8 @@ Written in Rust, for Linux, Windows and macOS.
 - **Plugins**: VST3, CLAP and JSFX, with their editors drawn inside the nodes; Windows plugins
   on Linux through yabridge; its own plugin SDK for DSP nodes and app extensions
 - **Playback rate**: 0.5–2×, speed and pitch together like a tape, also for MIDI files
+- **Selection loop**: a stretch of a track played over and over without a gap, chosen in an
+  editor that draws the waveform like an oscilloscope, down to the samples
 - **MIDI**: MIDI files (even black MIDI) played through the built-in piano CSynth or any
   instrument plugin, MIDI ports, a MIDI monitor, and audio-to-MIDI conversion
 - **Lyrics and video**: synced lyrics (local LRC files, tags, or online) and the picture of

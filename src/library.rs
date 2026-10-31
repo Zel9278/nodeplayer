@@ -182,6 +182,9 @@ pub enum Repeat {
     Off,
     All,
     One,
+    /// The selection loop: the selection of the track over and over, or the whole track
+    /// without a gap.
+    Selection,
 }
 
 impl Repeat {
@@ -189,7 +192,8 @@ impl Repeat {
         match self {
             Self::Off => Self::All,
             Self::All => Self::One,
-            Self::One => Self::Off,
+            Self::One => Self::Selection,
+            Self::Selection => Self::Off,
         }
     }
 
@@ -198,6 +202,7 @@ impl Repeat {
             Self::Off => "🔁 off",
             Self::All => "🔁 all",
             Self::One => "🔂 one",
+            Self::Selection => "🔂 selection",
         }
     }
 }
@@ -520,7 +525,7 @@ impl Library {
             return None;
         }
         let Some(cur) = self.current else { return Some(0) };
-        if finished && self.repeat == Repeat::One {
+        if finished && matches!(self.repeat, Repeat::One | Repeat::Selection) {
             return Some(cur);
         }
         if self.shuffle && n > 1 {

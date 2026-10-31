@@ -772,6 +772,14 @@ impl MidiFile {
         self.tempo.tick_at(seconds) / self.ticks_per_beat()
     }
 
+    /// The time of `beat` (in quarter notes), in seconds.
+    pub fn seconds_at_beat(&self, beat: f64) -> f64 {
+        let tick = beat.max(0.0) * self.ticks_per_beat();
+        let points = &self.tempo.points;
+        let p = points[points.partition_point(|p| (p.tick as f64) <= tick).max(1) - 1];
+        p.seconds + (tick - p.tick as f64) * p.tick_seconds
+    }
+
     /// Quarter notes a minute at `seconds`.
     pub fn bpm_at(&self, seconds: f64) -> f64 {
         let points = &self.tempo.points;
@@ -896,6 +904,11 @@ struct Control {
     /// The channels' set-up sent so far, by chase slot (`chase_slot`): handed to an output
     /// that comes later, when a file may already have started.
     channels: Vec<Option<u32>>,
+    /// Play `.0..1` (seconds) over and over; an end past the file's loops it whole.
+    loop_range: Option<(f64, f64)>,
+    /// When the loop's end was due, for the seek back to its start: the clock starts again
+    /// from there, and what the seek sends is timed for then.
+    loop_at: Option<Instant>,
     quit: bool,
 }
 
@@ -1048,7 +1061,10 @@ impl Shared {
 
     fn send(&self, c: &Control, out: &[u32]) {
         if let Some(o) = c.out.as_ref().filter(|_| !out.is_empty()) {
-            o.send(out);
+            match c.loop_at {
+                Some(at) => o.send_at(out, &vec![at + PLAYBACK_LATENCY; out.len()]),
+                None => o.send(out),
+            }
         }
     }
 
@@ -1148,7 +1164,7 @@ impl Shared {
                 {
                     c.playhead = Some(playhead);
                     c.position = target;
-                    c.anchor = Instant::now();
+                    c.anchor = c.loop_at.unwrap_or_else(Instant::now);
                     // the notes up to here count as played, after a seek back too
                     self.notes_played.store(notes.played(c.skip_drums), Ordering::Relaxed);
                     for &msg in &chase {
@@ -1166,6 +1182,7 @@ impl Shared {
                     }
                     self.flush_keys(&mut c);
                 }
+                c.loop_at = None;
                 continue;
             }
             // Paused, the playhead stays put: taking it would lose the position.
@@ -1173,11 +1190,24 @@ impl Shared {
                 c = self.wake.wait(c).unwrap_or_else(|e| e.into_inner());
                 continue;
             };
-            let mut playhead = c.playhead.take().expect("checked above");
-
             let now = c.now();
             let speed = c.speed;
             let (anchor, origin) = (c.anchor, c.position);
+            // The selection loop, once inside it (a seek past its end plays on).
+            let looping = c.loop_range.map(|(a, b)| (a, b.min(file.info.duration))).filter(|&(_, b)| origin < b);
+            if let Some((start, end)) = looping
+                && now >= end
+            {
+                // Back to the start, timed from when the end was due.
+                let at = anchor + Duration::from_secs_f64(((end - origin) / speed).max(0.0));
+                c.loop_at = Some(at);
+                c.seek_request = Some(start);
+                self.seeks.fetch_add(1, Ordering::Relaxed);
+                c.position = start;
+                c.anchor = at;
+                continue;
+            }
+            let mut playhead = c.playhead.take().expect("checked above");
             let due = file.tempo.tick_at(now);
             // Read the due events without the lock: black MIDI has millions a
             // second, and the UI takes the lock every frame.
@@ -1185,7 +1215,13 @@ impl Shared {
             // Behind (a file denser than can be played, or a stall), a round takes a stretch
             // of the song at a time, sized to keep it to about `ROUND_EVENTS`: all that is due
             // at once would need gigabytes. The rounds then follow each other without a wait.
-            let target = due.floor().max(0.0) as u64;
+            let mut target = due.floor().max(0.0) as u64;
+            // Short of the loop's end: what is on it comes after going back.
+            if let Some((_, end)) = looping
+                && end < file.info.duration
+            {
+                target = target.min((file.tempo.tick_at(end).ceil() as u64).saturating_sub(1));
+            }
             let round_due = match playhead.peek_tick() {
                 Some(next) => target.min(file.tempo.tick_at(file.tempo.seconds(next) + round_span).ceil() as u64),
                 None => target,
@@ -1259,6 +1295,14 @@ impl Shared {
                 drop(c);
                 std::thread::sleep(Duration::from_micros(250));
                 c = self.lock();
+                continue;
+            }
+            if let Some((_, end)) = looping
+                && next.is_none_or(|n| file.tempo.seconds(n) >= end)
+            {
+                // Waiting for the loop's end.
+                let wait = ((end - now) / c.speed).clamp(0.002, 0.05);
+                c = self.wake.wait_timeout(c, Duration::from_secs_f64(wait)).unwrap_or_else(|e| e.into_inner()).0;
                 continue;
             }
             let Some(next) = next else {
@@ -1407,6 +1451,8 @@ impl MidiPlayer {
                 held: vec![0; 16 * NOTES],
                 keys: KeyCounts::default(),
                 channels: vec![None; CHASE_SLOTS],
+                loop_range: None,
+                loop_at: None,
                 quit: false,
             }),
             wake: Condvar::new(),
@@ -1708,6 +1754,12 @@ impl MidiPlayer {
         c.seek_request = Some(position);
         self.shared.seeks.fetch_add(1, Ordering::Relaxed);
         c.position = position;
+        self.shared.wake.notify_all();
+    }
+
+    /// Plays `start..end` (seconds) over and over; `None` plays on.
+    pub fn set_loop(&self, range: Option<(f64, f64)>) {
+        self.control().loop_range = range;
         self.shared.wake.notify_all();
     }
 

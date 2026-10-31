@@ -18,6 +18,7 @@ In the settings folder:
 |---|---|
 | `session.json` | the graph with every node's settings and plugin states, the library sources, the layout, repeat and shuffle, the playback rate, and the last track and position |
 | `presets/<name>.json` | graph presets |
+| `loops.json` | each track's loop selection and loop presets |
 | `node-presets/<name>.json` | node presets |
 | `misskey.json`, `discord.json` | the sharing settings, with their tokens and keys (readable only by you) |
 | `setup.json` | the answers to the first-start questions |

@@ -8,7 +8,7 @@ Player node feeds effects, plugins and visualizers, and an Output node plays the
 ## Contents
 
 1. [Getting started](getting-started.md): installing, the first start, the window, playing a song
-2. [Library and playback](library-and-playback.md): the track list, the transport, the playback rate, Now playing, media keys
+2. [Library and playback](library-and-playback.md): the track list, the transport, looping a selection, the playback rate, Now playing, media keys
 3. [The node graph](node-graph.md): adding and wiring nodes, the built-in nodes and visualizers, presets
 4. [MIDI](midi.md): MIDI files as songs, CSynth, MIDI ports, the MIDI Monitor, Audio → MIDI
 5. [Plugins](plugins.md): VST3, CLAP, JSFX and native plugins, plugin editors, Windows plugins through yabridge

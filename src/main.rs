@@ -14,6 +14,7 @@ mod info;
 mod graph;
 mod jsfx;
 mod library;
+mod loop_editor;
 mod lyrics;
 mod midi;
 mod midi_song;

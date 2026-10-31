@@ -33,6 +33,10 @@ pub const RATE_RANGE: RangeInclusive<f32> = 0.5..=2.0;
 const VARISPEED_CHUNK: usize = 64;
 /// Frames played at 1× kept to prime the resampler with when the rate first changes.
 const VARISPEED_HISTORY: usize = 512;
+/// The shortest selection loop, in seconds.
+pub const MIN_LOOP: f64 = 0.01;
+/// At most this long (seconds) of what follows the loop's end fades out under its start.
+const LOOP_FADE: f64 = 0.005;
 
 #[derive(Default)]
 struct Shared {
@@ -54,6 +58,24 @@ struct Shared {
     /// Recently decoded packets: start and length in the file (seconds) and size in bytes,
     /// for the bitrate at the playing position.
     packets: Mutex<VecDeque<(f64, f64, u32)>>,
+    /// Where the file time is known to be: the ring frame (counted like `frames_played`) and
+    /// the file time from there on. Where the resampler's delay ends after a load or seek,
+    /// and where the selection loop went back; the last one played and those to come.
+    wraps: Mutex<VecDeque<(u64, f64)>>,
+}
+
+impl Shared {
+    /// The playing position in the file, in seconds.
+    fn position(&self, device_rate: u32) -> f64 {
+        let played = self.frames_played.load(Ordering::Acquire);
+        let wraps = self.wraps.lock().unwrap();
+        match wraps.iter().rev().find(|(at, _)| *at <= played) {
+            Some(&(from, secs)) => secs + (played - from) as f64 / device_rate as f64,
+            // Still in the resampler's delay.
+            None if let Some(&(_, secs)) = wraps.front() => secs,
+            None => f64::from_bits(self.base_secs.load(Ordering::Acquire)) + played as f64 / device_rate as f64,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -94,6 +116,8 @@ enum Cmd {
     /// Let go of the file (a MIDI file plays instead).
     Unload,
     Seek(f64),
+    /// Play `.0..1` over and over; `None` plays on.
+    Loop(Option<(f64, f64)>),
     Attach(rtrb::Producer<f32>),
 }
 
@@ -105,6 +129,7 @@ pub struct Player {
     midi: Mutex<MidiSong>,
     /// The MIDI file loaded, when it is one; the decoder then has nothing.
     midi_path: Mutex<Option<PathBuf>>,
+    loop_region: Mutex<Option<(f64, f64)>>,
 }
 
 impl Player {
@@ -124,12 +149,17 @@ impl Player {
             pending: Vec::new(),
             decoder_done: true,
             path: None,
+            loop_region: None,
+            fed: 0,
+            stretch: (0, 0.0),
+            fade: Vec::new(),
+            faded: 0,
         };
         std::thread::Builder::new()
             .name("decoder".into())
             .spawn(move || worker.run())
             .expect("spawn decoder thread");
-        Self { tx, shared, status, device_rate, midi: Mutex::new(MidiSong::new()), midi_path: Mutex::new(None) }
+        Self { tx, shared, status, device_rate, midi: Mutex::new(MidiSong::new()), midi_path: Mutex::new(None), loop_region: Mutex::new(None) }
     }
 
     /// Creates the audio-thread source. Only the most recently created source receives audio.
@@ -167,7 +197,28 @@ impl Player {
         f32::from_bits(self.shared.rate.load(Ordering::Acquire))
     }
 
+    /// Plays `start..end` (seconds) over and over, without a gap; an end past the file's
+    /// loops the whole file from `start`. `None` plays on. Getting to the end from inside the
+    /// range starts it again; a position past it plays on to the end. Loading a file clears it.
+    pub fn set_loop(&self, region: Option<(f64, f64)>) {
+        let region = region.filter(|(a, b)| *a >= 0.0 && b - a >= MIN_LOOP);
+        {
+            let mut l = self.loop_region.lock().unwrap();
+            if *l == region {
+                return;
+            }
+            *l = region;
+        }
+        self.midi.lock().unwrap().player.set_loop(region);
+        let _ = self.tx.send(Cmd::Loop(region));
+    }
+
+    pub fn loop_region(&self) -> Option<(f64, f64)> {
+        *self.loop_region.lock().unwrap()
+    }
+
     pub fn load(&self, path: &Path) {
+        self.set_loop(None);
         // Clear a stale end-of-file now so the source doesn't stop again before the decoder
         // gets to the command.
         self.shared.eof.store(false, Ordering::Release);
@@ -228,8 +279,7 @@ impl Player {
         if self.is_midi() {
             return self.midi().player.status().position;
         }
-        f64::from_bits(self.shared.base_secs.load(Ordering::Acquire))
-            + self.shared.frames_played.load(Ordering::Acquire) as f64 / self.device_rate as f64
+        self.shared.position(self.device_rate)
     }
 
     /// The file played to the end and hasn't been started again.
@@ -280,6 +330,34 @@ impl Player {
             secs += dur.min(pos - start);
         }
         (secs > 0.25).then(|| bytes as f64 * 8.0 / secs / 1000.0)
+    }
+}
+
+/// A file's audio as interleaved stereo at its own rate, read like the player reads it (for
+/// drawing it).
+pub struct AudioReader(Decoder);
+
+impl AudioReader {
+    pub fn open(path: &Path) -> Result<Self> {
+        Decoder::open(path).map(Self)
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.0.sample_rate()
+    }
+
+    pub fn duration(&self) -> Option<f64> {
+        self.0.duration_secs()
+    }
+
+    /// The next stretch of audio, appended to `out`; false at the end.
+    pub fn read(&mut self, out: &mut Vec<f32>) -> Result<bool> {
+        self.0.next_stereo(out)
+    }
+
+    /// Reading goes on from exactly `secs`.
+    pub fn seek(&mut self, secs: f64) -> Result<()> {
+        self.0.seek(secs)
     }
 }
 
@@ -367,6 +445,9 @@ struct SymDecoder {
     channels: usize,
     time_base: Option<TimeBase>,
     last_packet: Option<(f64, f64, u32)>,
+    /// After a seek: the time asked for. Seeks land on a packet at or before it; what comes
+    /// before it is left out.
+    trim_to: Option<f64>,
 }
 
 impl SymDecoder {
@@ -395,7 +476,7 @@ impl SymDecoder {
         let channels = params.channels.as_ref().map(|c| c.count()).unwrap_or(2);
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(params, &AudioDecoderOptions::default())?;
-        Ok(Self { format, decoder, track_id, sample_rate, channels, time_base, last_packet: None })
+        Ok(Self { format, decoder, track_id, sample_rate, channels, time_base, last_packet: None, trim_to: None })
     }
 
     fn tags(&mut self) -> Tags {
@@ -440,10 +521,12 @@ impl SymDecoder {
             if packet.track_id != self.track_id {
                 continue;
             }
+            let mut start = None;
             if let Some(tb) = self.time_base {
-                let start = tb.calc_time_saturating(packet.pts).as_secs_f64();
+                let secs = tb.calc_time_saturating(packet.pts).as_secs_f64();
                 let dur = tb.calc_duration(packet.dur).map_or(0.0, |t| t.as_secs_f64());
-                self.last_packet = Some((start, dur, packet.data.len() as u32));
+                self.last_packet = Some((secs, dur, packet.data.len() as u32));
+                start = Some(secs);
             }
             match self.decoder.decode(&packet) {
                 Ok(buf) => {
@@ -453,7 +536,15 @@ impl SymDecoder {
                         1 => (&planes[0], &planes[0]),
                         _ => (&planes[0], &planes[1]),
                     };
-                    out.extend(l.iter().zip(r).flat_map(|(a, b)| [*a, *b]));
+                    let skip = match (self.trim_to, start) {
+                        (Some(to), Some(at)) => ((to - at) * self.sample_rate as f64).round().max(0.0) as usize,
+                        _ => 0,
+                    };
+                    if skip >= l.len() {
+                        continue;
+                    }
+                    self.trim_to = None;
+                    out.extend(l[skip..].iter().zip(&r[skip..]).flat_map(|(a, b)| [*a, *b]));
                     return Ok(true);
                 }
                 Err(SymError::DecodeError(e)) => log::warn!("decode error: {e}"),
@@ -468,9 +559,9 @@ impl SymDecoder {
 
     fn seek(&mut self, secs: f64) -> Result<()> {
         let time = Time::try_from_secs_f64(secs).ok_or_else(|| anyhow!("bad seek time"))?;
-        self.format
-            .seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) })?;
+        let to = self.format.seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) })?;
         self.decoder.reset();
+        self.trim_to = self.time_base.and_then(|tb| tb.calc_time(to.required_ts)).map(|t| t.as_secs_f64());
         Ok(())
     }
 }
@@ -490,6 +581,15 @@ struct Worker {
     decoder_done: bool,
     /// The file currently loaded, for reopening it.
     path: Option<PathBuf>,
+    loop_region: Option<(f64, f64)>,
+    /// Source frames decoded since the stream was last reset.
+    fed: u64,
+    /// Where the stretch being decoded began: at which of those frames, and its file time.
+    stretch: (u64, f64),
+    /// What followed the loop's end (interleaved), fading out under its start; `faded`
+    /// frames of it are done.
+    fade: Vec<f32>,
+    faded: usize,
 }
 
 impl Worker {
@@ -523,7 +623,7 @@ impl Worker {
         match cmd {
             Cmd::Attach(p) => self.ring = Some(p),
             Cmd::Unload => {
-                self.reset_stream();
+                self.reset_stream(0.0);
                 self.decoder = None;
                 self.decoder_done = true;
                 self.path = None;
@@ -532,7 +632,7 @@ impl Worker {
             }
             Cmd::Load(path) => {
                 log::info!("load {}", path.display());
-                self.reset_stream();
+                self.reset_stream(0.0);
                 match Decoder::open(&path) {
                     Ok(mut d) => {
                         *self.status.lock().unwrap() = Status {
@@ -560,6 +660,7 @@ impl Worker {
                         self.decoder = Some(d);
                         self.decoder_done = false;
                         self.path = Some(path);
+                        self.mark_start(0.0);
                     }
                     Err(e) => {
                         let mut st = self.status.lock().unwrap();
@@ -596,15 +697,99 @@ impl Worker {
                         }
                     }
                 }
-                self.reset_stream();
+                self.reset_stream(at);
+                self.mark_start(at);
                 self.decoder_done = false;
                 self.shared.base_secs.store(at.to_bits(), Ordering::Release);
+            }
+            Cmd::Loop(region) => {
+                self.loop_region = region;
+                // Audio from past a new end may be on its way already: it goes, and playing
+                // goes on from where it is.
+                let Some((_, end)) = region else { return };
+                let pos = self.shared.position(self.device_rate);
+                if self.decoder.is_some() && pos < end && self.decoded_to().is_some_and(|t| t > end) {
+                    self.handle(Cmd::Seek(pos));
+                }
             }
         }
     }
 
-    /// Drops everything buffered between the decoder and the speakers.
-    fn reset_stream(&mut self) {
+    /// The file time decoding has got to.
+    fn decoded_to(&self) -> Option<f64> {
+        let rate = self.decoder.as_ref()?.sample_rate();
+        Some(self.stretch.1 + (self.fed - self.stretch.0) as f64 / rate as f64)
+    }
+
+    /// Through the resampler, the file starts (at `at`) once its delay is out.
+    fn mark_start(&self, at: f64) {
+        if self.resampler.is_some() {
+            self.shared.wraps.lock().unwrap().push_back((self.ring_frame(0), at));
+        }
+    }
+
+    /// The ring frame that source frame `fed` comes out at.
+    fn ring_frame(&self, fed: u64) -> u64 {
+        match (&self.resampler, &self.decoder) {
+            (Some(rs), Some(d)) => {
+                (fed as f64 * self.device_rate as f64 / d.sample_rate() as f64).round() as u64 + rs.output_delay() as u64
+            }
+            _ => fed,
+        }
+    }
+
+    /// Goes back to `start` for the selection loop; false if the file can't be read from
+    /// there.
+    fn wrap(&mut self, start: f64) -> bool {
+        let Some(d) = &mut self.decoder else { return false };
+        if let Err(e) = d.seek(start) {
+            log::debug!("loop: seek failed, reopening: {e}");
+            let Some(path) = &self.path else { return false };
+            match Decoder::open(path).and_then(|mut d| d.seek(start).map(|_| d)) {
+                Ok(d) => self.decoder = Some(d),
+                Err(e) => {
+                    log::warn!("loop: can't go back in {}: {e}", path.display());
+                    return false;
+                }
+            }
+        }
+        self.stretch = (self.fed, start);
+        let mark = (self.ring_frame(self.fed), start);
+        let played = self.shared.frames_played.load(Ordering::Acquire);
+        let mut wraps = self.shared.wraps.lock().unwrap();
+        while wraps.len() > 1 && wraps[1].0 <= played {
+            wraps.pop_front();
+        }
+        wraps.push_back(mark);
+        true
+    }
+
+    /// Fades the end of the last loop out under the frames from `acc[from..]` on.
+    fn crossfade(&mut self, from: usize) {
+        let len = self.fade.len() / 2;
+        if self.faded >= len {
+            return;
+        }
+        for fr in self.acc[from..].chunks_exact_mut(2) {
+            if self.faded >= len {
+                break;
+            }
+            let t = (self.faded as f32 + 0.5) / len as f32 * std::f32::consts::FRAC_PI_2;
+            let (fade_in, fade_out) = t.sin_cos();
+            fr[0] = fr[0] * fade_in + self.fade[self.faded * 2] * fade_out;
+            fr[1] = fr[1] * fade_in + self.fade[self.faded * 2 + 1] * fade_out;
+            self.faded += 1;
+        }
+    }
+
+    /// Drops everything buffered between the decoder and the speakers; decoding goes on from
+    /// file time `at`.
+    fn reset_stream(&mut self, at: f64) {
+        self.fed = 0;
+        self.stretch = (0, at);
+        self.fade.clear();
+        self.faded = 0;
+        self.shared.wraps.lock().unwrap().clear();
         self.acc.clear();
         self.pending.clear();
         if let Some(r) = &mut self.resampler {
@@ -644,6 +829,7 @@ impl Worker {
             self.decoder_done = true;
             return false;
         };
+        let before = self.acc.len();
         let more = match d.next_stereo(&mut self.acc) {
             Ok(m) => m,
             Err(e) => {
@@ -651,6 +837,7 @@ impl Worker {
                 false
             }
         };
+        let rate = d.sample_rate() as f64;
         if let Some(p) = d.take_packet() {
             let mut packets = self.shared.packets.lock().unwrap();
             // A few seconds behind is plenty: the ring holds well under one.
@@ -659,7 +846,56 @@ impl Worker {
             }
             packets.push_back(p);
         }
-        self.resample(!more);
+        let got = (self.acc.len() - before) / 2;
+        let from = self.decoded_to().unwrap_or(0.0);
+        self.fed += got as u64;
+        self.crossfade(before);
+        let mut wrapped = false;
+        if let Some((start, end)) = self.loop_region {
+            let to = from + got as f64 / rate;
+            // The end passed in these frames, or the file ended before it (inside the range,
+            // and not straight after going back, for a start past the end).
+            let crossed = from < end && to >= end;
+            let file_ended = !more && from < end && to > start && self.fed > self.stretch.0;
+            if crossed || file_ended {
+                let fade = (LOOP_FADE * rate) as usize;
+                self.fade.clear();
+                self.faded = 0;
+                if crossed {
+                    let keep = (((end - from) * rate).round() as usize).min(got);
+                    let tail = before + keep * 2;
+                    self.fade.extend_from_slice(&self.acc[tail..(tail + fade * 2).min(self.acc.len())]);
+                    self.acc.truncate(tail);
+                    self.fed -= (got - keep) as u64;
+                    // The end fell on the end of a packet: what follows is in the next ones.
+                    if let Some(d) = &mut self.decoder {
+                        let mut next = Vec::new();
+                        while self.fade.len() < fade * 2 && matches!(d.next_stereo(&mut next), Ok(true)) {
+                            self.fade.append(&mut next);
+                        }
+                        self.fade.truncate(fade * 2);
+                    }
+                }
+                if self.fade.len() < fade * 2 {
+                    // Nothing (or too little) after the end to fade out under the start, as
+                    // at the end of the file: the end fades out, and the start in.
+                    let n = fade.min(self.acc.len() / 2);
+                    let at = self.acc.len() - n * 2;
+                    for (i, fr) in self.acc[at..].chunks_exact_mut(2).enumerate() {
+                        let g = ((i as f32 + 0.5) / n as f32 * std::f32::consts::FRAC_PI_2).cos();
+                        fr[0] *= g;
+                        fr[1] *= g;
+                    }
+                    self.fade.clear();
+                    self.fade.resize(fade * 2, 0.0);
+                }
+                wrapped = self.wrap(start);
+            }
+        }
+        let more = more || wrapped;
+        // Looping, the last frames wait here: if the file ends next, they fade out.
+        let hold = if self.loop_region.is_some() { (LOOP_FADE * rate) as usize } else { 0 };
+        self.resample(!more, hold);
         if !more {
             self.decoder_done = true;
             if self.pending.is_empty() {
@@ -669,9 +905,13 @@ impl Worker {
         true
     }
 
-    fn resample(&mut self, last: bool) {
+    /// Moves decoded frames on, through the resampler if there is one; all of them if
+    /// `last`, else all but the last `hold`.
+    fn resample(&mut self, last: bool, hold: usize) {
+        let hold = if last { 0 } else { hold * 2 };
         let Some(rs) = &mut self.resampler else {
-            self.pending.append(&mut self.acc);
+            let n = self.acc.len().saturating_sub(hold);
+            self.pending.extend(self.acc.drain(..n));
             return;
         };
         let mut out = vec![0.0f32; rs.output_frames_max() * 2];
@@ -690,7 +930,7 @@ impl Worker {
             }
         };
         let chunk = RESAMPLE_CHUNK * 2;
-        while self.acc.len() >= chunk {
+        while self.acc.len() >= chunk + hold {
             run(&self.acc[..chunk], None, &mut self.pending);
             self.acc.drain(..chunk);
         }
@@ -1039,6 +1279,237 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         false
+    }
+
+    /// A 32-bit float stereo WAV at 48 kHz, `secs` long, each sample the time it is at.
+    fn ramp_wav(name: &str, secs: f64) -> PathBuf {
+        ramp_wav_at(name, secs, 48_000)
+    }
+
+    fn ramp_wav_at(name: &str, secs: f64, rate: u32) -> PathBuf {
+        let frames = (secs * rate as f64) as u32;
+        let mut b = Vec::new();
+        let data = frames * 8;
+        b.extend(b"RIFF");
+        b.extend((36 + data).to_le_bytes());
+        b.extend(b"WAVEfmt ");
+        b.extend(16u32.to_le_bytes());
+        b.extend(3u16.to_le_bytes());
+        b.extend(2u16.to_le_bytes());
+        b.extend(rate.to_le_bytes());
+        b.extend((rate * 8).to_le_bytes());
+        b.extend(8u16.to_le_bytes());
+        b.extend(32u16.to_le_bytes());
+        b.extend(b"data");
+        b.extend(data.to_le_bytes());
+        for i in 0..frames {
+            let v = i as f32 / rate as f32;
+            b.extend(v.to_le_bytes());
+            b.extend(v.to_le_bytes());
+        }
+        let dir = std::env::temp_dir().join(format!("nodeplayer-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ramp.wav");
+        std::fs::write(&path, b).unwrap();
+        path
+    }
+
+    /// Plays `frames` frames from the source as the audio thread would, waiting for the
+    /// decoder to keep up; returns the left channel and the position after each block.
+    fn pull(src: &mut PlayerSource, player: &Player, frames: usize) -> (Vec<f32>, Vec<f64>) {
+        let mut out = vec![StereoBuf::new()];
+        let (mut l, mut pos) = (Vec::new(), Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while l.len() < frames {
+            assert!(Instant::now() < deadline, "the decoder keeps up");
+            if src.shared.flush.load(Ordering::Acquire) {
+                // The audio thread lets the old audio go.
+                src.process(512, &mut [], &mut out);
+                continue;
+            }
+            if src.ring.slots() < 4096 {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            src.process(512, &mut [], &mut out);
+            l.extend_from_slice(&out[0].l[..512]);
+            pos.push(player.position());
+        }
+        (l, pos)
+    }
+
+    #[test]
+    fn seeking_lands_on_the_exact_time() {
+        let path = ramp_wav("seek", 1.0);
+        let player = Player::new(48_000);
+        let mut src = player.make_source();
+        player.load(&path);
+        player.seek(0.3);
+        // The seek is carried out after the load: skip what came before it.
+        assert!(wait_for(|| player.position() == 0.3 && src.ring.slots() > 4096));
+        let (l, _) = pull(&mut src, &player, 512);
+        assert!((l[0] - 0.3).abs() < 1.0 / 48_000.0, "starts at {}", l[0]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The selection loop goes back to its start without a gap, and the position follows.
+    #[test]
+    fn the_selection_loops_seamlessly() {
+        let path = ramp_wav("loop", 1.0);
+        let player = Player::new(48_000);
+        let mut src = player.make_source();
+        player.load(&path);
+        player.set_loop(Some((0.25, 0.5)));
+        assert!(wait_for(|| player.status().path.is_some()));
+        let (l, pos) = pull(&mut src, &player, 48_000 + 512);
+        let step = 1.0 / 48_000.0;
+        // Up to the end as it is, then from the start again: one frame to the next, the
+        // ramp goes on or jumps back by the loop's length. The fade is over in 5 ms.
+        let fade = 240;
+        for (i, w) in l.windows(2).enumerate() {
+            let j = i + 1;
+            let in_fade = j >= 24_000 && (j - 24_000) % 12_000 <= fade;
+            if !in_fade {
+                assert!((w[1] - w[0] - step).abs() < 1e-5, "frame {j}: {} → {}", w[0], w[1]);
+            }
+        }
+        // The fade starts from what followed the end.
+        assert!((l[24_000] - (0.25 * 0.0 + 0.5 * 1.0)).abs() < 0.01, "first after the end: {}", l[24_000]);
+        assert!((l[24_000 + fade] - (0.25 + fade as f32 * step)).abs() < 1e-4);
+        // Played 1 s: 0.5 s to the end, then twice round the 0.25 s loop.
+        let last = *pos.last().unwrap();
+        assert!((0.25..0.5).contains(&last), "position {last}");
+        assert!(pos.iter().all(|p| *p < 0.5 + 0.02), "the position stays inside");
+        // Each sample is its time: the position is that of the last one played.
+        // (Not in the fade, where it is the two mixed.)
+        for (b, p) in pos.iter().enumerate().filter(|(_, p)| !(0.25..0.256).contains(*p)) {
+            let heard = l[b * 512 + 511] as f64 + step as f64;
+            assert!((p - heard).abs() < 1e-4, "block {b}: position {p}, playing {heard}");
+        }
+        assert!(player.is_playing() && !player.take_ended());
+
+        // Whole: an end past the file's loops it from the start.
+        player.set_loop(Some((0.0, f64::INFINITY)));
+        // (What was decoded ahead for the old range plays first: up to half a second more.)
+        let (l, pos) = pull(&mut src, &player, 120_000);
+        let backs = pos.windows(2).filter(|w| w[1] < w[0] - 0.5).count();
+        assert!((2..=3).contains(&backs), "loops round each second: {backs} times in 2.5 s");
+        // Nothing follows the file's end: it fades out, and the start fades in, so there is
+        // no step.
+        let worst = l.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.01, "a step of {worst}");
+        assert!(!player.take_ended());
+
+        // Off, it plays to the end.
+        player.set_loop(None);
+        assert!(wait_for(|| {
+            let mut out = vec![StereoBuf::new()];
+            src.process(512, &mut [], &mut out);
+            player.take_ended()
+        }));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Through the resampler (a 44.1 kHz file on a 48 kHz device), too.
+    #[test]
+    fn the_selection_loops_through_the_resampler() {
+        let path = ramp_wav_at("loop-44k", 1.0, 44_100);
+        let player = Player::new(48_000);
+        let mut src = player.make_source();
+        player.load(&path);
+        player.set_loop(Some((0.25, 0.5)));
+        assert!(wait_for(|| player.status().path.is_some()));
+        let (l, pos) = pull(&mut src, &player, 48_000 * 2);
+        // 0.5 s to the end, then round the 0.25 s loop (23.4 blocks of 512 frames).
+        let backs: Vec<usize> = pos.windows(2).enumerate().filter(|(_, w)| w[1] < w[0]).map(|(b, _)| b).collect();
+        assert_eq!(backs[0], 46, "first back after 0.5 s");
+        assert!(backs.len() >= 6 && backs.windows(2).all(|w| (23..=24).contains(&(w[1] - w[0]))), "goes back each 0.25 s: {backs:?}");
+        // Skip the resampler's start, and the fades (the sinc's ringing at the joins too).
+        let mut worst = 0.0f64;
+        for (b, p) in pos.iter().enumerate().skip(4).filter(|(_, p)| !(0.25..0.256).contains(*p) && **p < 0.499) {
+            let heard = l[b * 512 + 511] as f64;
+            worst = worst.max((p - heard).abs());
+            assert!((p - heard).abs() < 2e-4, "block {b}: position {p}, playing {heard}");
+        }
+        assert!(pos.iter().all(|p| *p < 0.5 + 0.001), "the position stays inside");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A new end before what is already decoded takes effect at once.
+    #[test]
+    fn moving_the_end_back_drops_what_was_decoded_past_it() {
+        let path = ramp_wav("loop-end", 2.0);
+        let player = Player::new(48_000);
+        let mut src = player.make_source();
+        player.load(&path);
+        assert!(wait_for(|| player.status().path.is_some() && src.ring.slots() > 20_000));
+        let _ = pull(&mut src, &player, 4096);
+        // The ring holds half a second ahead of the position.
+        player.set_loop(Some((0.0, 0.2)));
+        // The audio thread plays in real time: it can't run ahead of the decoder getting to
+        // the command, as this would. The decoder starts over from the position: it asks
+        // for what is buffered to go.
+        assert!(wait_for(|| src.shared.flush.load(Ordering::Acquire)));
+        let (l, _) = pull(&mut src, &player, 24_000);
+        assert!(l.iter().all(|v| *v < 0.2 + 1e-3), "nothing from past the end: {}", l.iter().fold(0.0f32, |m, v| m.max(*v)));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn midi_files_loop_too() {
+        // A note every 0.1 s for 1 s at the default 120 BPM (480 ticks a beat: 96 ticks).
+        let mut track = Vec::new();
+        for i in 0..10 {
+            track.extend([0x00, 0x90, 60 + i, 100, 0x60, 0x80, 60 + i, 0]);
+        }
+        track.extend([0x00, 0xff, 0x2f, 0x00]);
+        let mut bytes = b"MThd\0\0\0\x06\0\0\0\x01\x01\xe0MTrk".to_vec();
+        bytes.extend((track.len() as u32).to_be_bytes());
+        bytes.extend(track);
+        let dir = std::env::temp_dir().join(format!("nodeplayer-midi-loop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.mid");
+        std::fs::write(&path, bytes).unwrap();
+
+        let player = Player::new(48_000);
+        let mut src = player.make_source();
+        player.load(&path);
+        assert!(wait_for(|| player.status().duration.is_some()), "the file loads");
+        assert!((player.status().duration.unwrap() - 1.0).abs() < 1e-6);
+        player.set_loop(Some((0.2, 0.4)));
+        // The audio thread, in real time: 10 ms blocks.
+        let (mut seen, mut notes, mut at) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut out, mut midi) = (vec![StereoBuf::new()], MidiBuf::new());
+        let start = Instant::now();
+        for block in 1..=150u32 {
+            midi.clear();
+            src.process_midi(480, &mut [], &mut out, &[], &mut midi);
+            for e in midi.events().iter().filter(|e| e.data[0] & 0xf0 == 0x90 && e.data[2] > 0) {
+                notes.push(e.data[1]);
+                at.push((block - 1) * 480 + e.time);
+            }
+            seen.push(player.position());
+            if let Some(wait) = (Duration::from_millis(10) * block).checked_sub(start.elapsed()) {
+                std::thread::sleep(wait);
+            }
+        }
+        // The notes up to the end, then those from the start again: 62 and 63 (at 0.2 and
+        // 0.3 s) over and over, never 64 (on the end).
+        assert_eq!(notes[..4], [60, 61, 62, 63], "{notes:?}");
+        assert!(notes[4..].chunks(2).all(|c| c[0] == 62 && c.get(1).is_none_or(|k| *k == 63)), "{notes:?}");
+        assert!(notes.len() >= 4 + 2 * 4, "goes round again and again: {notes:?}");
+        // A note every 0.1 s from the first going back on, the jumps included. (Before it, the
+        // file is still loading as this test's clock starts, which can bend the first gaps.)
+        let gaps: Vec<i64> = at[3..].windows(2).map(|w| i64::from(w[1]) - i64::from(w[0])).collect();
+        // This test's clock is a thread sleeping 10 ms at a time: with the other tests running
+        // alongside, it can stall now and then, which moves a note by a block.
+        let off = gaps.iter().filter(|g| (*g - 4800).abs() >= 240).count();
+        assert!(off <= 2, "frames between notes: {gaps:?}");
+        let last = *seen.last().unwrap();
+        assert!((0.2..0.45).contains(&last), "position {last}");
+        assert!(seen.iter().all(|p| *p < 0.45), "stays inside: {:?}", seen.iter().fold(0.0f64, |m, p| m.max(*p)));
+        assert!(player.is_playing() && !player.take_ended());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

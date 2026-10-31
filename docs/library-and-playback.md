@@ -30,9 +30,47 @@ The 🎵 Library tab is the track list.
 | ▶ / ⏸ | Play and pause (also Space) |
 | ⏹ | Stop and go back to the start |
 | ⏭ | Next track |
-| Repeat | Off, all, one (the button shows which) |
+| Repeat | Off, all, one, or selection (the button shows which); see [Looping a selection](#looping-a-selection) |
+| 〰 | Opens the loop editor |
 | Shuffle | Plays the list in random order |
-| Position bar | Click or drag to seek |
+| Position bar | Click or drag to seek; a line under it marks the selection (blue while it loops) |
+
+## Looping a selection
+
+The repeat mode **selection** plays a stretch of the track over and over. The jump back has no
+gap: the decoder goes back to the start itself, and the few milliseconds after the end fade
+out under the start, so there is no click. Without a selection, the whole track loops without
+a gap. MIDI files loop the same way, with the notes timed across the jump.
+
+The selection is made in the **loop editor** (〰 next to the repeat button). It's a window of
+its own that draws the track's waveform like an oscilloscope, left channel over right:
+
+- **Drag** across the waveform to select. **Drag an edge** to move it, **Ctrl+drag** inside
+  the selection to move all of it, and **click** to seek. The ruler above seeks too.
+- **The wheel** zooms in and out around the pointer, **Shift+wheel** or **middle-drag** scrolls,
+  and **Ctrl+wheel** scales the height. Zoomed in far enough, the samples themselves are drawn,
+  joined by a line, and as dots when they're far apart.
+- The strip at the top shows the whole track: click or drag it to go there.
+- **Start** and **End** can be dragged or typed (`m:ss.mmm`). **Set start** and **Set end**
+  put them at the playhead.
+- **Loop selection** turns the loop on and off; off brings back the repeat mode from before.
+- **Follow playback** keeps the playhead in view. For MIDI files, which have no waveform, the
+  editor draws the bars and beats instead, and **Snap to beats** pulls the edges onto them.
+- **Presets** (the panel on the right) keep selections of the track under a name: type one
+  (or leave it as `Loop 1`, `Loop 2`, …) and press **Save selection** or Enter. Click a preset
+  to select it again, or press its number key (1–9); ✖ deletes it. Saving under a name already
+  there replaces that preset.
+- Keys: Space plays and pauses, L turns the loop on and off, A and B set the start and end at
+  the playhead, Z zooms to the selection, F shows the whole track, Esc clears the selection, and
+  1–9 select the presets.
+
+Turning the loop on, or changing the selection, while the playhead is outside it goes to its
+start. Seeking past the end on purpose plays on to the end of the track, and then goes back to
+the selection's start.
+
+Each track keeps its own selection and presets, also after nodeplayer is closed: coming back to
+a track brings its selection back. They are stored in `loops.json` in the settings folder, by
+the file's path, so a track that is moved or renamed starts without them.
 
 ## The playback rate
 
