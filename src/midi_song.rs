@@ -134,6 +134,13 @@ pub struct MidiFeed {
 const LATE_LIMIT: Duration = Duration::from_millis(100);
 
 impl MidiFeed {
+    /// The messages queued, with the times the player gave them, taken as they are.
+    #[cfg(test)]
+    pub fn take_queued(&mut self) -> Vec<Timed> {
+        let mut rx = self.rx.lock().unwrap();
+        std::iter::from_fn(|| rx.pop().ok()).collect()
+    }
+
     /// Puts the messages due in the next `n` frames into `midi_out`, at the playback `rate`.
     pub fn run(&mut self, n: usize, midi_out: &mut MidiBuf, rate: f32) {
         // Blocks follow each other at the sample rate; the clock only jumps to the wall

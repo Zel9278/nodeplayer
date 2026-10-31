@@ -1477,34 +1477,29 @@ mod tests {
         assert!(wait_for(|| player.status().duration.is_some()), "the file loads");
         assert!((player.status().duration.unwrap() - 1.0).abs() < 1e-6);
         player.set_loop(Some((0.2, 0.4)));
-        // The audio thread, in real time: 10 ms blocks.
+        // What the player sends, with the times it gives each message: the audio thread
+        // plays each at its time. (Read straight from the queue, so a busy machine stalling
+        // the threads now and then changes nothing here.)
         let (mut seen, mut notes, mut at) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut out, mut midi) = (vec![StereoBuf::new()], MidiBuf::new());
         let start = Instant::now();
-        for block in 1..=150u32 {
-            midi.clear();
-            src.process_midi(480, &mut [], &mut out, &[], &mut midi);
-            for e in midi.events().iter().filter(|e| e.data[0] & 0xf0 == 0x90 && e.data[2] > 0) {
-                notes.push(e.data[1]);
-                at.push((block - 1) * 480 + e.time);
+        while start.elapsed() < Duration::from_millis(1500) {
+            for (time, msg) in src.midi.take_queued() {
+                if msg & 0xf0 == 0x90 && msg >> 16 & 0x7f > 0 {
+                    notes.push((msg >> 8 & 0x7f) as u8);
+                    at.push(time.expect("notes are timed"));
+                }
             }
             seen.push(player.position());
-            if let Some(wait) = (Duration::from_millis(10) * block).checked_sub(start.elapsed()) {
-                std::thread::sleep(wait);
-            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         // The notes up to the end, then those from the start again: 62 and 63 (at 0.2 and
         // 0.3 s) over and over, never 64 (on the end).
         assert_eq!(notes[..4], [60, 61, 62, 63], "{notes:?}");
         assert!(notes[4..].chunks(2).all(|c| c[0] == 62 && c.get(1).is_none_or(|k| *k == 63)), "{notes:?}");
         assert!(notes.len() >= 4 + 2 * 4, "goes round again and again: {notes:?}");
-        // A note every 0.1 s from the first going back on, the jumps included. (Before it, the
-        // file is still loading as this test's clock starts, which can bend the first gaps.)
-        let gaps: Vec<i64> = at[3..].windows(2).map(|w| i64::from(w[1]) - i64::from(w[0])).collect();
-        // This test's clock is a thread sleeping 10 ms at a time: with the other tests running
-        // alongside, it can stall now and then, which moves a note by a block.
-        let off = gaps.iter().filter(|g| (*g - 4800).abs() >= 240).count();
-        assert!(off <= 2, "frames between notes: {gaps:?}");
+        // A note every 0.1 s all along, the jumps back included.
+        let gaps: Vec<f64> = at.windows(2).map(|w| (w[1] - w[0]).as_secs_f64()).collect();
+        assert!(gaps.iter().all(|g| (g - 0.1).abs() < 1e-6), "seconds between notes: {gaps:?}");
         let last = *seen.last().unwrap();
         assert!((0.2..0.45).contains(&last), "position {last}");
         assert!(seen.iter().all(|p| *p < 0.45), "stays inside: {:?}", seen.iter().fold(0.0f64, |m, p| m.max(*p)));

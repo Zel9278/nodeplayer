@@ -1195,18 +1195,6 @@ impl Shared {
             let (anchor, origin) = (c.anchor, c.position);
             // The selection loop, once inside it (a seek past its end plays on).
             let looping = c.loop_range.map(|(a, b)| (a, b.min(file.info.duration))).filter(|&(_, b)| origin < b);
-            if let Some((start, end)) = looping
-                && now >= end
-            {
-                // Back to the start, timed from when the end was due.
-                let at = anchor + Duration::from_secs_f64(((end - origin) / speed).max(0.0));
-                c.loop_at = Some(at);
-                c.seek_request = Some(start);
-                self.seeks.fetch_add(1, Ordering::Relaxed);
-                c.position = start;
-                c.anchor = at;
-                continue;
-            }
             let mut playhead = c.playhead.take().expect("checked above");
             let due = file.tempo.tick_at(now);
             // Read the due events without the lock: black MIDI has millions a
@@ -1295,6 +1283,21 @@ impl Shared {
                 drop(c);
                 std::thread::sleep(Duration::from_micros(250));
                 c = self.lock();
+                continue;
+            }
+            // At the loop's end, with all before it sent (also after a stall that went past
+            // it): back to the start, timed from when the end was due.
+            if let Some((start, end)) = looping
+                && now >= end
+                && c.seek_request.is_none()
+                && c.anchor == anchor
+            {
+                let at = anchor + Duration::from_secs_f64(((end - origin) / speed).max(0.0));
+                c.loop_at = Some(at);
+                c.seek_request = Some(start);
+                self.seeks.fetch_add(1, Ordering::Relaxed);
+                c.position = start;
+                c.anchor = at;
                 continue;
             }
             if let Some((_, end)) = looping
