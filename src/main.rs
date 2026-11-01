@@ -5,6 +5,7 @@ mod av;
 mod card;
 mod clap;
 mod csynth_node;
+mod diagnostics;
 mod dirs;
 mod discord;
 mod engine;
