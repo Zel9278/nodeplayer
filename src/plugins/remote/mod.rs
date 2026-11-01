@@ -230,8 +230,22 @@ impl Instance for RemoteInstance {
         Ok(Box::new(processor::RemoteProcessor::new(self.core.clone())))
     }
     fn save_state(&self) -> Option<Vec<u8>> {
-        self.core.enqueue(Command::Checkpoint);
-        self.state.clone()
+        // State serialization is only called from non-audio threads. Briefly wait for a
+        // changed landed blob; unchanged blobs fall back to the cached fast-path value.
+        let cached = self.state.clone();
+        if !self.core.enqueue(Command::Checkpoint) {
+            return cached;
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Ok(snapshot) = self.core.snapshot.try_lock()
+                && snapshot.state != cached
+            {
+                return snapshot.state.clone();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cached
     }
     fn load_state(&mut self, data: &[u8]) -> Result<()> {
         if data.len() > protocol::MAX_STATE {
