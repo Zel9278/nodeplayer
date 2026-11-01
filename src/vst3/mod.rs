@@ -362,15 +362,15 @@ impl Vst3Plugin {
             // Buses: ask for stereo on the main buses, keep whatever the rest use.
             use BusDirections_::*;
             use MediaTypes_::*;
-            let n_in = component.getBusCount(kAudio, kInput).max(0) as usize;
-            let n_out = component.getBusCount(kAudio, kOutput).max(0) as usize;
+            let n_in = component.getBusCount(kAudio as i32, kInput as i32).max(0) as usize;
+            let n_out = component.getBusCount(kAudio as i32, kOutput as i32).max(0) as usize;
             let mut in_arr = vec![SpeakerArr::kStereo; n_in];
             let mut out_arr = vec![SpeakerArr::kStereo; n_out];
             for (i, a) in in_arr.iter_mut().enumerate().skip(1) {
-                audio.getBusArrangement(kInput, i as i32, a);
+                audio.getBusArrangement(kInput as i32, i as i32, a);
             }
             for (i, a) in out_arr.iter_mut().enumerate().skip(1) {
-                audio.getBusArrangement(kOutput, i as i32, a);
+                audio.getBusArrangement(kOutput as i32, i as i32, a);
             }
             if audio.setBusArrangements(
                 in_arr.as_mut_ptr(),
@@ -385,36 +385,36 @@ impl Vst3Plugin {
                 (0..n)
                     .map(|i| {
                         let mut bi: BusInfo = std::mem::zeroed();
-                        component.getBusInfo(kAudio, dir, i as i32, &mut bi);
+                        component.getBusInfo(kAudio as i32, dir, i as i32, &mut bi);
                         bi.channelCount.max(0) as usize
                     })
                     .collect()
             };
-            let in_ch = bus_channels(kInput, n_in);
-            let out_ch = bus_channels(kOutput, n_out);
+            let in_ch = bus_channels(kInput as i32, n_in);
+            let out_ch = bus_channels(kOutput as i32, n_out);
             if n_in > 0 {
-                component.activateBus(kAudio, kInput, 0, 1);
+                component.activateBus(kAudio as i32, kInput as i32, 0, 1);
             }
             if n_out > 0 {
-                component.activateBus(kAudio, kOutput, 0, 1);
+                component.activateBus(kAudio as i32, kOutput as i32, 0, 1);
             }
             // The first event bus of each direction carries the node's MIDI.
-            let ev_in = component.getBusCount(kEvent, kInput) > 0;
-            let ev_out = component.getBusCount(kEvent, kOutput) > 0;
+            let ev_in = component.getBusCount(kEvent as i32, kInput as i32) > 0;
+            let ev_out = component.getBusCount(kEvent as i32, kOutput as i32) > 0;
             if ev_in {
-                component.activateBus(kEvent, kInput, 0, 1);
+                component.activateBus(kEvent as i32, kInput as i32, 0, 1);
             }
             if ev_out {
-                component.activateBus(kEvent, kOutput, 0, 1);
+                component.activateBus(kEvent as i32, kOutput as i32, 0, 1);
             }
             self.midi = (ev_in, ev_out);
 
-            if audio.canProcessSampleSize(SymbolicSampleSizes_::kSample32) != kResultTrue {
+            if audio.canProcessSampleSize(SymbolicSampleSizes_::kSample32 as i32) != kResultTrue {
                 bail!("plugin can't process 32-bit float");
             }
             let mut setup = ProcessSetup {
-                processMode: ProcessModes_::kRealtime,
-                symbolicSampleSize: SymbolicSampleSizes_::kSample32,
+                processMode: ProcessModes_::kRealtime as i32,
+                symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
                 maxSamplesPerBlock: max_block as i32,
                 sampleRate: sample_rate,
             };
