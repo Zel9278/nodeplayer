@@ -221,6 +221,10 @@ pub trait Instance {
     fn latency(&self) -> u32 {
         0
     }
+    /// Fixed process-bridge latency included in `latency`, if any.
+    fn bridge_latency(&self) -> u32 {
+        0
+    }
     /// Whether the plugin takes MIDI in and sends MIDI out.
     fn midi_ports(&self) -> (bool, bool) {
         (false, false)
