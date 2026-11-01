@@ -11,6 +11,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use std::{
     ffi::OsString,
+    io::BufRead,
     net::{SocketAddr, TcpStream},
     path::PathBuf,
     sync::{
@@ -44,10 +45,10 @@ impl Drop for AudioOwner {
         // Child-only join is allowed: parent supervisor kills a wedged child on its deadline.
     }
 }
-/// Internal CLI args: <loopback-address> <256-bit-token> <mmap-path> <generation>.
+/// Internal CLI args: <loopback-address> <mmap-path> <generation>; token is first stdin line.
 /// This entry must execute before the normal app creates windows/audio/extensions.
 pub fn worker_main(args: &[OsString]) -> Result<()> {
-    if args.len() != 4 {
+    if args.len() != 3 {
         bail!("invalid plugin worker arguments")
     }
     let address: SocketAddr = args[0]
@@ -57,15 +58,16 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
     if !address.ip().is_loopback() {
         bail!("worker control endpoint must be loopback")
     }
-    let token = args[1]
-        .to_str()
-        .context("invalid worker credential")?
-        .to_owned();
+    let mut token = String::new();
+    std::io::stdin().lock().read_line(&mut token).context("read worker credential")?;
+    let token = token.trim_end_matches(['\r', '\n']).to_owned();
     if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("invalid worker credential")
     }
-    let path = PathBuf::from(&args[2]);
-    let generation: u64 = args[3].to_str().context("invalid generation")?.parse()?;
+    let path = PathBuf::from(&args[1]);
+    let generation: u64 = args[2].to_str().context("invalid generation")?.parse()?;
+    // Open before connecting so parent can unlink immediately after handshake.
+    let map = Arc::new(Shared::open(&path, generation)?);
     let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
     socket.set_nodelay(true)?;
     socket.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -109,7 +111,6 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
                 }
             }
         })?;
-    let map = Arc::new(Shared::open(&path, generation)?);
     #[cfg(windows)]
     let _com = ComInit::new();
     let mut host = Host::default();

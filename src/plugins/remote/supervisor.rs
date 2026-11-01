@@ -8,12 +8,16 @@ use anyhow::{Context, Result, bail};
 use crossbeam_channel::Receiver;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
+
     collections::HashMap,
+    io::Write,
     net::{Ipv4Addr, TcpListener, TcpStream},
     process::{Child, Command as ProcessCommand, Stdio},
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, atomic::{AtomicU64, Ordering}},
     time::{Duration, Instant},
 };
+
+static MAP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn run(core: Arc<Core>, rx: Receiver<Command>, info: PluginInfo, sr: f32) {
     let mut generation = 0u64;
@@ -21,7 +25,12 @@ pub(super) fn run(core: Arc<Core>, rx: Receiver<Command>, info: PluginInfo, sr: 
     while !core.stop.load(Ordering::Acquire) {
         generation = generation.wrapping_add(1);
         core.recover.store(false, Ordering::Release);
-        if info.id == "org.nodeplayer.test-fixture" {
+        // Diagnostics deliberately reserve fixture parameters >=100 as fault triggers.
+        // The worker is a separate process, so this gate is based on the shared
+        // diagnostic scenario signal (also inherited as an explicit env marker below).
+        if std::env::var_os("NODEPLAYER_DIAGNOSTIC_WORKER").is_some()
+            && info.id == "org.nodeplayer.test-fixture"
+        {
             journal.retain(|id, _| *id < 100);
         }
         status(&core, "starting");
@@ -109,7 +118,8 @@ fn session(
         .fill(&mut entropy)
         .map_err(|_| anyhow::anyhow!("OS random source unavailable"))?;
     let token: String = entropy.iter().map(|b| format!("{b:02x}")).collect();
-    let path = std::env::temp_dir().join(format!("nodeplayer-{}-{token}.mmap", std::process::id()));
+    let serial = MAP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("nodeplayer-{}-{serial}.mmap", std::process::id()));
     let map = Arc::new(Shared::create(path.clone(), generation)?);
     // Every mapping remains supervisor-owned through processor retirement. Old proxies may
     // be pending in the engine garbage queue; they cannot unmap on the audio thread.
@@ -124,14 +134,23 @@ fn session(
     command
         .arg("--plugin-worker")
         .arg(listener.local_addr()?.to_string())
-        .arg(&token)
         .arg(&path)
-        .arg(generation.to_string())
-        .stdin(Stdio::null())
+        .arg(generation.to_string());
+    if crate::runtime::get().data_root.is_some() {
+        command.arg("--data-root").arg(crate::runtime::get().data_root.as_ref().unwrap());
+    }
+    if crate::diagnostics::active().is_some() {
+        command.env("NODEPLAYER_DIAGNOSTIC_WORKER", "1");
+    }
+    command
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // No inherited stdout/stderr pipes: a log-flooding plugin cannot deadlock the worker.
     let mut child = OwnedChild::new(command.spawn().context("spawn isolated plugin worker")?);
+    if let Some(mut stdin) = child.child.stdin.take() {
+        writeln!(stdin, "{token}")?;
+    }
     let operation = (|| -> Result<()> {
         let startup = Instant::now() + Duration::from_secs(30);
         let mut stream = loop {
@@ -153,7 +172,8 @@ fn session(
                     // and the framed control protocol require blocking, deadline-bound IO.
                     stream.set_nonblocking(false)?;
                     stream.set_nodelay(true)?;
-                    stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+                    // protocol::receive applies one absolute deadline to the entire hello frame.
+                    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
                     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                     let hello = protocol::receive::<Hello>(&mut stream);
                     if hello.is_ok_and(|h| {
@@ -184,6 +204,9 @@ fn session(
         )?;
         let first: Reply = protocol::receive(&mut stream)?;
         validate(&first, generation, 0)?;
+        // Child opens the mapping before connecting; after its authenticated hello and
+        // initial reply, unlink while retaining mapped handles until all proxies retire.
+        let _ = std::fs::remove_file(&path);
         apply(core, first)?;
         let mut id = 0;
         stream.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -228,6 +251,14 @@ fn session(
         loop {
             reclaim(core);
             if core.stop.load(Ordering::Acquire) {
+                // Drain the finite bounded queue before shutdown so the final checkpoint and
+                // other already-enqueued UI commands land before the worker is closed.
+                for _ in 0..128 {
+                    match rx.try_recv() {
+                        Ok(c) => transact_recorded(&mut stream, core, generation, &mut id, journal, c)?,
+                        Err(_) => break,
+                    }
+                }
                 let _ = transact(&mut stream, core, generation, &mut id, Command::Shutdown);
                 return Ok(());
             }
@@ -315,8 +346,15 @@ fn transact_recorded(
     c: Command,
 ) -> Result<()> {
     let checkpoint = matches!(&c, Command::Checkpoint);
+    let long_timeout = checkpoint || matches!(&c, Command::Load(_));
     remember(core, journal, &c);
+    if long_timeout {
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    }
     let cached_state = transact(stream, core, generation, id, c)?;
+    if long_timeout {
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    }
     checkpoint_journal(journal, checkpoint && cached_state);
     Ok(())
 }
@@ -488,6 +526,19 @@ mod tests {
 
     fn encoded(commands: Vec<Command>) -> serde_json::Value {
         serde_json::to_value(commands).unwrap()
+    }
+
+    #[test]
+    fn shutdown_queue_drain_is_bounded_and_preserves_checkpoint_order() {
+        let (tx, rx) = crossbeam_channel::bounded(128);
+        for i in 0..127 {
+            tx.try_send(Command::SetParam(i, i as f64 / 127.0)).unwrap();
+        }
+        tx.try_send(Command::Checkpoint).unwrap();
+        let drained = (0..128).filter_map(|_| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(drained.len(), 128);
+        assert!(matches!(drained.last(), Some(Command::Checkpoint)));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
