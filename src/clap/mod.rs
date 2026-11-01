@@ -1062,7 +1062,7 @@ impl ClapProcessor {
                 },
                 Dialect::Clap => {
                     let on = s & 0xf0 == 0x90 && vel > 0;
-                    let panic = s & 0xf0 == 0xb0 && matches!(key, 120 | 123);
+                    let panic = crate::runtime::get().experimental_pdc && s & 0xf0 == 0xb0 && matches!(key, 120 | 123);
                     if !on && !panic && !matches!(s & 0xf0, 0x80 | 0x90) {
                         continue;
                     }
