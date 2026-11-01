@@ -99,7 +99,10 @@ impl Vst3Processor {
     ) -> Self {
         let mut ctx: Box<ProcessContext> = Box::new(unsafe { std::mem::zeroed() });
         use ProcessContext_::StatesAndFlags_::*;
-        ctx.state = (kPlaying | kTempoValid | kTimeSigValid | kContTimeValid) as u32;
+        #[cfg(windows)]
+        { ctx.state = (kPlaying | kTempoValid | kTimeSigValid | kContTimeValid) as u32; }
+        #[cfg(not(windows))]
+        { ctx.state = kPlaying | kTempoValid | kTimeSigValid | kContTimeValid; }
         ctx.sampleRate = sample_rate;
         ctx.tempo = 120.0;
         ctx.timeSigNumerator = 4;

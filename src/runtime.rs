@@ -260,10 +260,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
         options.experimental_plugin_isolation = true;
     }
     options.experimental_pdc |= options.experimental_plugin_isolation;
-    if !unknown_options.is_empty() {
-        if options.experimental_pdc || options.experimental_plugin_isolation {
-            bail!("unknown option {:?}; use -- before a path beginning with '-'", unknown_options[0]);
-        }
+    if !unknown_options.is_empty() && (options.experimental_pdc || options.experimental_plugin_isolation) {
+        bail!("unknown option {:?}; use -- before a path beginning with '-'", unknown_options[0]);
     }
     if let Some(scenario) = scenario {
         options.diagnostic = Some(DiagnosticOptions {
