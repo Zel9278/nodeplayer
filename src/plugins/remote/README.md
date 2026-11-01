@@ -11,7 +11,8 @@ in the parent. JSFX / Native are not routed here.
   a pending proxy immediately. No file/mmap creation, process spawn, plugin load or
   synchronous RPC is performed on this calling thread.
 - `worker_main(&[OsString]) -> Result<()>` consumes only arguments **after**
-  `--plugin-worker`: loopback socket address, random token, mapping path, generation.
+  `--plugin-worker`: loopback socket address, mapping path, generation; the 256-bit token is
+  sent as the first stdin line, never in argv.
   Run this entry before ordinary GUI, audio device, extensions or session startup.
 - Worker uses `Host::default().create_local`, avoiding recursive isolation.
 - Optional instance hooks: `remote_status`, `request_remote_restart`, `bridge_latency`,
@@ -82,18 +83,19 @@ protocol version/generation, strictly increasing request ID, bounded JSON frame
 size, absolute whole-frame read/write deadlines and no external-interface bind.
 This fallback avoids adding dependencies. Token is compared without content-
 dependent early exit. Plugin stdout/stderr are null, not IPC pipes, so plugin log
-flooding cannot deadlock or fill disk. Child args contain token and mapping path:
-a same-user privileged process may inspect them. Windows inherited temp directory
-ACLs are relied on; Unix mapping files are mode 0600. This is crash isolation, not
-isolation from a malicious same-user process. Owner-only named pipes/UDS would be
+flooding cannot deadlock or fill disk. The token is passed through the child's stdin (first line), not argv; the mmap filename
+contains only process/generation identifiers and is created privately (Unix mode 0600).
+The child opens the mapping before connecting; after the authenticated hello and parent
+init/reply handshake, the parent unlinks the pathname while mapped handles remain valid.
+This is crash isolation, not isolation from a malicious same-user process. Owner-only named pipes/UDS would be
 a preferable future hardening step.
 
 Parent supervisor sends polling requests independently of UI (typically 8 ms when
 idle), detects child exit, control timeout (3 s), startup timeout (30 s), and DSP
 progress timeout (2 s while parent cursor continues advancing). A single blocked
 control RPC can delay the DSP-progress check up to its own bounded 3 s deadline.
-Unauthenticated connection hello is limited to 250 ms per attempt and the overall
-startup deadline. No stdout protocol is used.
+Each unauthenticated connection gets at most a 1 s authentication read deadline, bounded
+independently by the overall 30 s startup deadline. No stdout protocol is used.
 
 Child independently exits if parent control heartbeat ceases for 20 s, with a
 35 s startup allowance; this watchdog starts before plugin creation. Windows
@@ -134,7 +136,9 @@ clears preceding parameter writes; an acknowledged checkpoint clears the journal
 only when it supplies a new cached state. Coalescing never crosses state/editor
 lifecycle barriers. This is still not a transactional state/parameter version history.
 The known diagnostic fixture's fault trigger params >=100 are not replayed on
-manual restart; production plugins have no such special handling.
+manual restart. This deterministic fixture-only behavior is enabled by the parent's
+`NODEPLAYER_DIAGNOSTIC_WORKER=1` marker (diagnostic scenario runs only); production
+workers do not receive this special journal handling.
 
 No infinite automatic restart loop: recovery is explicit. A changed sample rate
 requires creating a new remote instance; metadata-only proxy restart does not

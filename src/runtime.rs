@@ -141,11 +141,21 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
         .is_some_and(|s| s == OsStr::new("--plugin-worker"))
     {
         args.next();
+        let mut worker_args = Vec::new();
+        let mut options = RuntimeOptions::default();
+        while let Some(arg) = args.next() {
+            if arg == OsStr::new("--data-root") {
+                if options.data_root.is_some() {
+                    bail!("duplicate worker --data-root");
+                }
+                options.data_root = Some(nonempty_path(args.next().ok_or_else(|| anyhow!("--data-root requires a value"))?)?);
+            } else {
+                worker_args.push(arg);
+            }
+        }
         return Ok(ParsedArgs {
-            mode: Mode::PluginWorker {
-                args: args.collect(),
-            },
-            options: RuntimeOptions::default(),
+            mode: Mode::PluginWorker { args: worker_args },
+            options,
         });
     }
     let mut options = RuntimeOptions::default();
@@ -157,6 +167,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
     let mut metrics = None;
     let mut help = false;
     let mut literal = false;
+    let mut unknown_options = Vec::new();
     while let Some(arg) = args.next() {
         if literal {
             positional.push(arg);
@@ -232,10 +243,10 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
                     _ => "editor",
                 });
             }
-            _ if arg.as_encoded_bytes().starts_with(b"-") => bail!(
-                "unknown option {:?}; use -- before a path beginning with '-'",
-                arg
-            ),
+            _ if arg.as_encoded_bytes().starts_with(b"-") => {
+                unknown_options.push(arg.clone());
+                positional.push(arg);
+            }
             _ => positional.push(arg),
         }
     }
@@ -249,6 +260,11 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
         options.experimental_plugin_isolation = true;
     }
     options.experimental_pdc |= options.experimental_plugin_isolation;
+    if !unknown_options.is_empty() {
+        if options.experimental_pdc || options.experimental_plugin_isolation {
+            bail!("unknown option {:?}; use -- before a path beginning with '-'", unknown_options[0]);
+        }
+    }
     if let Some(scenario) = scenario {
         options.diagnostic = Some(DiagnosticOptions {
             scenario,
@@ -264,7 +280,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
         Mode::Help
     } else {
         match mode {
-            None if count <= 1 => Mode::Gui {
+            None if count <= 1 || (!options.experimental_pdc && !options.experimental_plugin_isolation) => Mode::Gui {
                 initial_file: p.next().map(PathBuf::from),
             },
             Some("scan") if count == 2 => Mode::ScanPlugin {
@@ -333,12 +349,14 @@ mod tests {
     fn flags_and_errors() {
         let p = parse(&["--experimental-plugin-isolation", "--data-root", "a b"]).unwrap();
         assert!(p.options.experimental_pdc && p.options.experimental_plugin_isolation);
+        assert!(matches!(parse(&["--unknown"]).unwrap().mode, Mode::Gui { .. }));
+        assert!(matches!(parse(&["a", "b"]).unwrap().mode, Mode::Gui { .. }));
+        assert!(parse(&["--experimental-pdc", "--unknown"]).is_err());
+        assert!(parse(&["--experimental-plugin-isolation", "a", "b"]).is_err());
         for a in [
-            &["--unknown"][..],
-            &["--data-root"],
-            &["a", "b"],
-            &["--diagnostic-duration", "NaN"],
-            &["--diagnostic-output", "out"],
+            & ["--data-root"][..],
+            &["--diagnostic-duration", "NaN"][..],
+            &["--diagnostic-output", "out"][..],
         ] {
             assert!(parse(a).is_err());
         }
@@ -353,6 +371,13 @@ mod tests {
             }
         );
         assert!(!p.options.experimental_plugin_isolation);
+    }
+    #[test]
+    fn worker_data_root_is_parsed_separately_from_worker_arguments() {
+        let parsed = parse(&["--plugin-worker", "127.0.0.1:1234", "mapping", "2", "--data-root", "worker root"]).unwrap();
+        assert_eq!(parsed.options.data_root.as_deref(), Some(std::path::Path::new("worker root")));
+        assert_eq!(parsed.mode, Mode::PluginWorker { args: vec!["127.0.0.1:1234".into(), "mapping".into(), "2".into()] });
+        assert!(parse(&["--plugin-worker", "--data-root"]).is_err());
     }
     #[test]
     fn isolated_test_enables_required_policy() {
