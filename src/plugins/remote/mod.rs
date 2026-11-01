@@ -24,6 +24,7 @@ pub const BRIDGE_LATENCY: u32 = shared::DELAY as u32;
 struct Snapshot {
     metadata: Option<Metadata>,
     state: Option<Vec<u8>>,
+    checkpoint_seq: u64,
     displays: HashMap<u32, (f64, String)>,
     status: String,
     revision: u64,
@@ -96,6 +97,7 @@ pub fn create(info: &PluginInfo, sr: f32, max_block: usize) -> Result<Created> {
         snapshot: Mutex::new(Snapshot {
             metadata: None,
             state: None,
+            checkpoint_seq: 0,
             displays: HashMap::new(),
             status: "pending".into(),
             revision: 0,
@@ -230,16 +232,17 @@ impl Instance for RemoteInstance {
         Ok(Box::new(processor::RemoteProcessor::new(self.core.clone())))
     }
     fn save_state(&self) -> Option<Vec<u8>> {
-        // State serialization is only called from non-audio threads. Briefly wait for a
-        // changed landed blob; unchanged blobs fall back to the cached fast-path value.
+        // State serialization is only called from non-audio threads. Wait for a landed
+        // checkpoint reply, falling back to the cached value on failure or timeout.
         let cached = self.state.clone();
+        let seq_before = self.core.snapshot.lock().unwrap().checkpoint_seq;
         if !self.core.enqueue(Command::Checkpoint) {
             return cached;
         }
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
         while Instant::now() < deadline {
             if let Ok(snapshot) = self.core.snapshot.try_lock()
-                && snapshot.state != cached
+                && snapshot.checkpoint_seq > seq_before
             {
                 return snapshot.state.clone();
             }
@@ -387,6 +390,7 @@ mod tests {
             snapshot: Mutex::new(Snapshot {
                 metadata: Some(metadata),
                 state: None,
+                checkpoint_seq: 0,
                 displays: HashMap::new(),
                 status: "running".into(),
                 revision: 0,

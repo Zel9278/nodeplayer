@@ -459,6 +459,8 @@ fn apply(core: &Core, r: Reply) -> Result<()> {
     }
     if let Some(state) = r.state {
         s.state = Some(state);
+        // Signal that a checkpoint reply landed.
+        s.checkpoint_seq = s.checkpoint_seq.wrapping_add(1);
     }
     if let Some((id, v, d)) = r.display
         && (s.displays.len() < protocol::MAX_PARAMS || s.displays.contains_key(&id))
@@ -526,6 +528,49 @@ mod tests {
 
     fn encoded(commands: Vec<Command>) -> serde_json::Value {
         serde_json::to_value(commands).unwrap()
+    }
+
+    #[test]
+    fn unchanged_checkpoint_advances_wait_sequence() {
+        use super::super::{Snapshot, AtomicBool, AtomicU32, Mutex};
+
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let blob = vec![1, 2, 3];
+        let core = Core {
+            stop: AtomicBool::new(false),
+            recover: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+            map: Mutex::new(None),
+            retired: Mutex::new(Vec::new()),
+            cursor: AtomicU64::new(0),
+            algorithm_latency: AtomicU32::new(0),
+            instrument: AtomicBool::new(false),
+            underruns: AtomicU64::new(0),
+            overflows: AtomicU64::new(0),
+            next_editor: AtomicU64::new(0),
+            snapshot: Mutex::new(Snapshot {
+                metadata: None,
+                state: Some(blob.clone()),
+                checkpoint_seq: 0,
+                displays: HashMap::new(),
+                status: "running".into(),
+                revision: 0,
+            }),
+            tx,
+        };
+        let seq_before = core.snapshot.lock().unwrap().checkpoint_seq;
+        apply(&core, Reply {
+            version: VERSION,
+            generation: 0,
+            id: 0,
+            metadata: None,
+            state: Some(blob.clone()),
+            display: None,
+            error: None,
+        }).unwrap();
+        let snapshot = core.snapshot.lock().unwrap();
+        assert!(snapshot.checkpoint_seq > seq_before);
+        assert_eq!(snapshot.state, Some(blob));
     }
 
     #[test]

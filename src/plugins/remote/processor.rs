@@ -398,6 +398,7 @@ mod tests {
                 displays: HashMap::new(),
                 status: "running".into(),
                 revision: 0,
+                checkpoint_seq: 0,
             }),
         })
     }
