@@ -35,7 +35,6 @@ as a dead end.
 | Mixer | Four inputs, each with its own gain. |
 | Kazu Limiter | Peak limiter (below). |
 | Playback Rate Shift | See [the playback rate](library-and-playback.md#the-playback-rate). |
-| Lyrics, Video | See [Lyrics and video](lyrics-and-video.md). |
 | MIDI In, MIDI Out, MIDI Monitor, CSynth, Audio → MIDI | See [MIDI](midi.md). |
 
 ### EQ

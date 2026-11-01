@@ -1,5 +1,5 @@
 //! FFmpeg, run as the `ffmpeg` and `ffprobe` programs: the audio of files symphonia can't open
-//! (most video files), the pictures for the video node, and tags and format details. Nothing
+//! (most video files), the pictures for the video panel, and tags and format details. Nothing
 //! links to FFmpeg's libraries, so any version works; the programs come from
 //! `~/.local/share/nodeplayer/ffmpeg/` (see [`crate::setup`]) or the PATH.
 
@@ -302,7 +302,7 @@ impl Drop for AudioDecoder {
     }
 }
 
-/// What the video node shows: the frames of a file's first real video stream, as RGBA.
+/// What the video panel shows: the frames of a file's first real video stream, as RGBA.
 pub struct VideoDecoder {
     path: PathBuf,
     index: u64,

@@ -1,4 +1,4 @@
-//! Lyrics node: shows the current track's lyrics, following the playback position when they
+//! Lyrics panel: shows the current track's lyrics, following the playback position when they
 //! are timed (LRC).
 //!
 //! Where they come from, first found wins:
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Align2, Color32, FontId, Rect, Sense, pos2, vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::player::Player;
@@ -31,12 +31,11 @@ pub struct LyricsSettings {
     /// Added to the playback position, in seconds; positive shows lines earlier.
     pub offset: f32,
     pub font_size: f32,
-    pub size: [f32; 2],
 }
 
 impl Default for LyricsSettings {
     fn default() -> Self {
-        Self { online: true, offset: 0.0, font_size: 16.0, size: [360.0, 300.0] }
+        Self { online: true, offset: 0.0, font_size: 16.0 }
     }
 }
 
@@ -410,7 +409,7 @@ fn lookup(t: &Track, online: bool, refresh: bool) -> State {
     }
 }
 
-pub struct LyricsNode {
+pub struct LyricsPanel {
     pub settings: LyricsSettings,
     track: Option<PathBuf>,
     state: Arc<Mutex<Option<State>>>,
@@ -421,7 +420,7 @@ pub struct LyricsNode {
     manual: Option<(f32, Instant)>,
 }
 
-impl LyricsNode {
+impl LyricsPanel {
     pub fn new(settings: LyricsSettings) -> Self {
         Self { settings, track: None, state: Arc::default(), generation: Arc::default(), manual: None }
     }
@@ -456,9 +455,8 @@ impl LyricsNode {
         });
     }
 
-    /// The body. `scroll` is the wheel movement the graph view handed over; the return value
-    /// says whether the pointer is over the lyrics (so the next wheel movement comes here).
-    pub fn ui(&mut self, ui: &mut egui::Ui, player: &Player, scroll: f32) -> bool {
+    /// The panel; the lyrics take the room below the controls, and the wheel scrolls them.
+    pub fn ui(&mut self, ui: &mut egui::Ui, player: &Player) {
         let path = player.status().path;
         if path != self.track {
             self.track = path;
@@ -503,28 +501,15 @@ impl LyricsNode {
             ui.add(egui::DragValue::new(&mut self.settings.font_size).speed(0.2).range(9.0..=48.0).fixed_decimals(0).prefix("size "));
         }
 
-        let [w, h] = self.settings.size;
-        let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+        let size = ui.available_size().max(vec2(80.0, 40.0));
+        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
-        let hovered = resp.hovered();
+        let scroll = if resp.hovered() { ui.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
 
         if let Some(State::Found(lyrics, _)) = &state {
-            self.draw(ui, &painter, rect, &resp, lyrics, player, if hovered { scroll } else { 0.0 });
+            self.draw(ui, &painter, rect, &resp, lyrics, player, scroll);
         }
-
-        // Resize from the corner, like the visualizers.
-        let handle = Rect::from_min_max(rect.max - vec2(12.0, 12.0), rect.max);
-        let hr = ui.interact(handle, ui.id().with("lyrics-resize"), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeNwSe);
-        let c = if hr.hovered() || hr.dragged() { Color32::from_gray(220) } else { Color32::from_gray(120) };
-        for k in [4.0, 8.0] {
-            painter.line_segment([pos2(handle.max.x - k, handle.max.y - 1.0), pos2(handle.max.x - 1.0, handle.max.y - k)], Stroke::new(1.0, c));
-        }
-        if hr.dragged() {
-            let d = hr.drag_delta();
-            self.settings.size = [(w + d.x).clamp(160.0, 1600.0), (h + d.y).clamp(80.0, 1600.0)];
-        }
-        hovered
     }
 
     #[allow(clippy::too_many_arguments)]

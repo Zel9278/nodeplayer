@@ -2,14 +2,14 @@
 
 ## Lyrics
 
-Add a **Lyrics** node (right-click the graph). It shows the current track's lyrics; it needs
-no wires.
+The **🎤 Lyrics** panel shows the current track's lyrics. Open it from the "+" of any tab bar,
+and dock it where you like, as with the other panels.
 
 - Timed lyrics (LRC) follow playback: the current line is highlighted and kept near the
   middle, clicking a line seeks there, and the wheel scrolls by hand (following resumes after
   4 seconds). **offset** shifts the timing when the lyrics run early or late.
 - Plain lyrics just scroll.
-- **size** sets the font size; the box resizes from its corner.
+- **size** sets the font size; the lyrics fill the panel.
 
 The lyrics come from the first of these that has them:
 
@@ -22,8 +22,8 @@ The lyrics come from the first of these that has them:
 
 ## Video
 
-Add a **Video** node to see the picture of a video file the Player plays (mp4, mkv, webm, mov
-and anything else FFmpeg reads). It needs FFmpeg (see
+The **🎬 Video** panel (from a tab bar's "+") shows the picture of a video file the Player
+plays (mp4, mkv, webm, mov and anything else FFmpeg reads). It needs FFmpeg (see
 [Getting started](getting-started.md#ffmpeg)).
 
 - The picture follows the player: pausing, seeking, the playback rate and the next track.
@@ -35,6 +35,9 @@ and anything else FFmpeg reads). It needs FFmpeg (see
 - **window**, or double-clicking the picture, also shows it in a window of its own. There,
   double-click or F / F11 toggles full screen, Esc leaves it, Space pauses, and ← / → seek 5
   seconds.
-- The box resizes from its corner.
+- The picture fills the panel.
+
+Graphs saved by earlier versions had Lyrics and Video nodes; their settings go to the panels,
+which open by themselves the first time.
 
 Next: [Sharing what's playing](sharing.md).

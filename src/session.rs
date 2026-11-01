@@ -58,6 +58,8 @@ pub enum SavedKind {
     MidiOut { port: Option<String> },
     MidiMonitor,
     CSynth(crate::csynth_node::CSynthSettings),
+    /// The lyrics and video nodes of older versions; they're panels now, which take these
+    /// settings (see `insert_graph`).
     Lyrics(crate::lyrics::LyricsSettings),
     Video(crate::video::VideoSettings),
     /// The MIDI File Player node of older versions; the Player plays MIDI files now, so only
@@ -144,6 +146,9 @@ pub struct Session {
     /// How the panels are docked; dropped (back to the default) if it can't be read.
     #[serde(deserialize_with = "dock_layout")]
     pub dock: Option<egui_dock::DockState<crate::app::Tab>>,
+    /// Settings of the lyrics and video panels.
+    pub lyrics: Option<crate::lyrics::LyricsSettings>,
+    pub video: Option<crate::video::VideoSettings>,
     /// The panels there were when the layout was saved; newer ones are added to it.
     #[serde(deserialize_with = "known_tabs")]
     pub tabs_seen: Vec<crate::app::Tab>,

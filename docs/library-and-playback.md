@@ -80,7 +80,7 @@ semitones.
 
 - Drag it, or double-click it to type a value. Right-click resets it to 1×.
 - A change is heard at once and glides while you drag.
-- The Video and Lyrics nodes follow the rate, and MIDI files change speed and pitch with it
+- The Video and Lyrics panels follow the rate, and MIDI files change speed and pitch with it
   (see [MIDI](midi.md#the-playback-rate)).
 - The same shift is a node too, **Playback Rate Shift**, with a slider and bypass. It counts
   while the Player's audio goes through it (the node says when it doesn't), several in a row

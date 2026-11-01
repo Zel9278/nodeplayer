@@ -10,8 +10,6 @@ use crate::engine::nodes::{self, LimiterMeter, LimiterParams, MIXER_INPUTS, Mete
 use crate::engine::{Processor, Schedule, Step};
 use crate::audio2midi::Audio2Midi;
 use crate::csynth_node::CSynthNode;
-use crate::lyrics::LyricsNode;
-use crate::video::VideoNode;
 use crate::midi::{Monitor, SeqNode};
 use crate::eq_editor::EqNode;
 use crate::player::Player;
@@ -91,8 +89,6 @@ pub enum NodeKind {
     MidiOut(Box<SeqNode>),
     MidiMonitor(Box<Monitor>),
     CSynth(Box<CSynthNode>),
-    Lyrics(Box<LyricsNode>),
-    Video(Box<VideoNode>),
     Group(Box<GroupNode>),
     /// Inside a group: what comes into the group.
     GroupIn,
@@ -143,8 +139,6 @@ impl NodeKind {
             Self::MidiOut(_) => "MIDI Out".into(),
             Self::MidiMonitor(_) => "MIDI Monitor".into(),
             Self::CSynth(_) => "CSynth".into(),
-            Self::Lyrics(_) => "Lyrics".into(),
-            Self::Video(_) => "Video".into(),
             Self::Group(g) => g.name.clone(),
             Self::GroupIn => "Group input".into(),
             Self::GroupOut => "Group output".into(),
@@ -159,8 +153,6 @@ impl NodeKind {
             | Self::MidiOut(_)
             | Self::MidiMonitor(_)
             | Self::CSynth(_)
-            | Self::Lyrics(_)
-            | Self::Video(_)
             | Self::GroupIn => 0,
             Self::Mixer { .. } => MIXER_INPUTS,
             _ => 1,
@@ -173,8 +165,6 @@ impl NodeKind {
             | Self::MidiIn(_)
             | Self::MidiOut(_)
             | Self::MidiMonitor(_)
-            | Self::Lyrics(_)
-            | Self::Video(_)
             | Self::GroupOut => 0,
             _ => 1,
         }
@@ -243,8 +233,6 @@ impl NodeKind {
             Self::MidiIn(m) | Self::MidiOut(m) => Box::new(m.processor()),
             Self::MidiMonitor(m) => Box::new(m.processor()),
             Self::CSynth(c) => Box::new(c.processor()),
-            // Shows what's playing; nothing to do on the audio thread.
-            Self::Lyrics(_) | Self::Video(_) => Box::new(nodes::MidiBridge::default()),
             // A group's own slot takes what comes in; the nodes inside pass it on.
             Self::Group(_) | Self::GroupIn | Self::GroupOut => Box::new(nodes::MidiBridge { thru: true, ..Default::default() }),
             Self::Plugin(_) => return None,

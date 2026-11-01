@@ -16,8 +16,8 @@ use crate::engine::nodes::{Delay, LimiterParams, MIXER_INPUTS, MidiBridge, Plugi
 use crate::engine::{Command, Engine, Garbage, MAX_BLOCK, NodeSlot};
 use crate::audio2midi::Audio2Midi;
 use crate::csynth_node::CSynthNode;
-use crate::lyrics::LyricsNode;
-use crate::video::VideoNode;
+use crate::lyrics::{LyricsPanel, LyricsSettings};
+use crate::video::{VideoPanel, VideoSettings};
 use crate::graph::{self, GraphNode, IdAlloc, NodeKind, PluginNode};
 use crate::library::{self, AUDIO_EXTS, Library};
 use crate::midi_song::MIDI_EXTS;
@@ -51,11 +51,23 @@ pub(crate) enum Tab {
     Misskey,
     Discord,
     Info,
+    Lyrics,
+    Video,
 }
 
 impl Tab {
-    pub(crate) const ALL: [Self; 8] =
-        [Self::Graph, Self::Library, Self::Presets, Self::Plugins, Self::Extensions, Self::Misskey, Self::Discord, Self::Info];
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Graph,
+        Self::Library,
+        Self::Presets,
+        Self::Plugins,
+        Self::Extensions,
+        Self::Misskey,
+        Self::Discord,
+        Self::Info,
+        Self::Lyrics,
+        Self::Video,
+    ];
 
     fn title(self) -> &'static str {
         match self {
@@ -67,6 +79,8 @@ impl Tab {
             Self::Misskey => "📢 Misskey",
             Self::Discord => "🎮 Discord",
             Self::Info => "ℹ Now playing",
+            Self::Lyrics => "🎤 Lyrics",
+            Self::Video => "🎬 Video",
         }
     }
 }
@@ -132,6 +146,8 @@ impl egui_dock::TabViewer for Tabs<'_> {
             Tab::Extensions => app.extensions_panel(ui),
             Tab::Misskey => app.misskey.ui(ui, &app.player.status()),
             Tab::Discord => app.discord.ui(ui, &app.player.status()),
+            Tab::Lyrics => app.lyrics.ui(ui, &app.player),
+            Tab::Video => app.video.ui(ui, &app.player),
             Tab::Info => {
                 let status = app.player.status();
                 let plays = status.path.as_deref().map(|p| app.library.play_stats(p)).unwrap_or_default();
@@ -220,6 +236,10 @@ pub struct App {
     snarl: Snarl<GraphNode>,
     /// The graphs around the one shown when it's a group's, outermost first.
     outer: Vec<Level>,
+    lyrics: LyricsPanel,
+    video: VideoPanel,
+    /// Panels to bring up once the layout is there: those an older graph had as nodes.
+    open_tabs: Vec<Tab>,
     style: SnarlStyle,
     ids: IdAlloc,
     dirty: bool,
@@ -325,6 +345,9 @@ impl App {
             sample_rate: sample_rate as f32,
             snarl: Snarl::new(),
             outer: Vec::new(),
+            lyrics: LyricsPanel::new(LyricsSettings::default()),
+            video: VideoPanel::new(VideoSettings::default()),
+            open_tabs: Vec::new(),
             // Editors that support scaling follow the zoom; others stay at their own size.
             style: SnarlStyle { collapsible: Some(true), max_scale: Some(2.0), ..SnarlStyle::new() },
             ids: IdAlloc::default(),
@@ -392,6 +415,12 @@ impl App {
         match saved.graph.as_ref().filter(|g| !g.nodes.is_empty()) {
             Some(g) => app.load_graph(g),
             None => app.default_graph(),
+        }
+        if let Some(s) = &saved.lyrics {
+            app.lyrics.settings = s.clone();
+        }
+        if let Some(s) = &saved.video {
+            app.video.settings = s.clone();
         }
         app.library.repeat = saved.repeat.unwrap_or(app.library.repeat);
         app.library.shuffle = saved.shuffle;
@@ -779,6 +808,19 @@ impl App {
                     ids.push(id);
                     continue;
                 }
+                // Lyrics and video are panels now; an older graph's nodes hand theirs over.
+                SavedKind::Lyrics(s) => {
+                    self.lyrics.settings = s.clone();
+                    self.open_tabs.push(Tab::Lyrics);
+                    ids.push(None);
+                    continue;
+                }
+                SavedKind::Video(s) => {
+                    self.video.settings = s.clone();
+                    self.open_tabs.push(Tab::Video);
+                    ids.push(None);
+                    continue;
+                }
                 // There's only one Player, in the main graph.
                 SavedKind::Player if self.in_group() => {
                     ids.push(None);
@@ -828,14 +870,14 @@ impl App {
                         }
                         SavedKind::MidiMonitor => NodeKind::MidiMonitor(Box::new(Monitor::new())),
                         SavedKind::CSynth(s) => NodeKind::CSynth(Box::new(CSynthNode::new(s.clone(), self.sample_rate))),
-                        SavedKind::Lyrics(s) => NodeKind::Lyrics(Box::new(LyricsNode::new(s.clone()))),
-                        SavedKind::Video(s) => NodeKind::Video(Box::new(VideoNode::new(s.clone()))),
                         SavedKind::MidiFile(_)
                         | SavedKind::Plugin { .. }
                         | SavedKind::Vst3 { .. }
                         | SavedKind::Group { .. }
                         | SavedKind::GroupIn
-                        | SavedKind::GroupOut => unreachable!(),
+                        | SavedKind::GroupOut
+                        | SavedKind::Lyrics(_)
+                        | SavedKind::Video(_) => unreachable!(),
                     };
                     self.add_node(kind, pos)
                 }
@@ -912,6 +954,8 @@ impl App {
             rate: Some(self.rate),
             midi_no_drums: self.player.midi().player.settings.skip_drums,
             selection: None,
+            lyrics: Some(self.lyrics.settings.clone()),
+            video: Some(self.video.settings.clone()),
             dock: Some(self.dock.clone()),
             tabs_seen: Tab::ALL.to_vec(),
         };
@@ -1937,6 +1981,27 @@ impl App {
         }
     }
 
+    /// Opens the panels an older graph had as nodes, in a column right of the graph so it
+    /// stays in view.
+    fn open_new_tabs(&mut self) {
+        let mut tabs = std::mem::take(&mut self.open_tabs);
+        tabs.dedup();
+        tabs.retain(|t| self.dock.find_tab(t).is_none());
+        if tabs.is_empty() {
+            return;
+        }
+        match self.dock.find_main_surface_tab(&Tab::Graph) {
+            Some((node, _)) => {
+                self.dock.main_surface_mut().split_right(node, 0.68, tabs);
+            }
+            None => {
+                for tab in tabs {
+                    self.dock.push_to_first_leaf(tab);
+                }
+            }
+        }
+    }
+
     /// Brings a panel to the front, opening it again if it was closed.
     fn show_tab(&mut self, tab: Tab) {
         match self.dock.find_tab(&tab) {
@@ -2487,11 +2552,8 @@ impl eframe::App for App {
             let _g = guard::enter(&p.tag);
             ed.place(spot.as_ref());
         }
-        for node in every_node(&mut self.snarl, &mut self.outer) {
-            if let NodeKind::Video(v) = &mut node.kind {
-                v.window(&ctx, &self.player, node.eid);
-            }
-        }
+        self.video.window(&ctx, &self.player);
+        self.open_new_tabs();
 
         for a in actions {
             match a {
@@ -2582,8 +2644,6 @@ fn save_nodes(snarl: &Snarl<GraphNode>, only: Option<&HashSet<NodeId>>) -> Saved
             NodeKind::MidiOut(m) => SavedKind::MidiOut { port: m.want.clone() },
             NodeKind::MidiMonitor(_) => SavedKind::MidiMonitor,
             NodeKind::CSynth(c) => SavedKind::CSynth(c.settings.clone()),
-            NodeKind::Lyrics(l) => SavedKind::Lyrics(l.settings.clone()),
-            NodeKind::Video(v) => SavedKind::Video(v.settings.clone()),
             NodeKind::Group(g) => SavedKind::Group { name: g.name.clone(), graph: save_nodes(&g.snarl, None) },
             NodeKind::GroupIn => SavedKind::GroupIn,
             NodeKind::GroupOut => SavedKind::GroupOut,
@@ -2855,8 +2915,6 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
             NodeKind::MidiIn(m) | NodeKind::MidiOut(m) => m.ui(ui),
             NodeKind::MidiMonitor(m) => m.ui(ui),
             NodeKind::CSynth(c) => sends.extend(c.ui(ui)),
-            NodeKind::Lyrics(l) => self.wants_scroll |= l.ui(ui, self.player, self.scroll.y),
-            NodeKind::Video(v) => v.ui(ui, self.player),
             NodeKind::Output { volume_db, level, .. } => {
                 if ui.add(egui::Slider::new(volume_db, -60.0..=12.0).suffix(" dB").text("vol")).changed() {
                     sends.push((0, *volume_db));
@@ -3066,8 +3124,6 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         add(ui, "Delay", NodeKind::delay);
         add(ui, "Mixer", || NodeKind::Mixer { gains_db: [0.0; MIXER_INPUTS] });
         add(ui, "Kazu Limiter", NodeKind::limiter);
-        add(ui, "Lyrics", || NodeKind::Lyrics(Box::new(LyricsNode::new(Default::default()))));
-        add(ui, "Video", || NodeKind::Video(Box::new(VideoNode::new(Default::default()))));
         if ui.button("Group").on_hover_text("a node with a graph inside; open it to add nodes and wire them").clicked() {
             self.actions.push(Action::AddGroup(pos));
             ui.close();

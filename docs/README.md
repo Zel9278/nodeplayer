@@ -12,7 +12,7 @@ Player node feeds effects, plugins and visualizers, and an Output node plays the
 3. [The node graph](node-graph.md): adding and wiring nodes, the built-in nodes and visualizers, presets
 4. [MIDI](midi.md): MIDI files as songs, CSynth, MIDI ports, the MIDI Monitor, Audio → MIDI
 5. [Plugins](plugins.md): VST3, CLAP, JSFX and native plugins, plugin editors, Windows plugins through yabridge
-6. [Lyrics and video](lyrics-and-video.md): the Lyrics and Video nodes
+6. [Lyrics and video](lyrics-and-video.md): the Lyrics and Video panels
 7. [Sharing what's playing](sharing.md): Misskey NowPlaying, Discord Rich Presence, the system's media controls
 8. [Files and troubleshooting](files-and-troubleshooting.md): where settings are kept, and fixes for common problems
 9. [Development](development.md): building, the AppImage, debug commands, the source layout

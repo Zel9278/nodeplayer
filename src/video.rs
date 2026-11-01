@@ -1,5 +1,5 @@
-//! Video node: shows the picture of the file the player is playing, kept in step with the
-//! player's position. Decoding runs on its own thread (FFmpeg, [`crate::av`]); the node
+//! Video panel: shows the picture of the file the player is playing, kept in step with the
+//! player's position. Decoding runs on its own thread (FFmpeg, [`crate::av`]); the panel
 //! only uploads the frame that's due. The picture can also go into a window of its own.
 
 use std::collections::VecDeque;
@@ -16,7 +16,6 @@ use crate::player::Player;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VideoSettings {
-    pub size: [f32; 2],
     /// Pictures are scaled down to this height; 0 keeps the file's size.
     pub max_height: u32,
     /// Shows pictures this much later (positive) or earlier than the audio.
@@ -27,7 +26,7 @@ pub struct VideoSettings {
 
 impl Default for VideoSettings {
     fn default() -> Self {
-        Self { size: [384.0, 216.0], max_height: 720, offset_ms: 0.0, window: false }
+        Self { max_height: 720, offset_ms: 0.0, window: false }
     }
 }
 
@@ -58,7 +57,7 @@ enum State {
     Failed(String),
 }
 
-pub struct VideoNode {
+pub struct VideoPanel {
     pub settings: VideoSettings,
     cmd: Sender<Cmd>,
     msgs: Receiver<(u64, Msg)>,
@@ -74,11 +73,11 @@ pub struct VideoNode {
     /// Player position at the last update and when that was, to notice seeks.
     last: Option<(f64, Instant)>,
     asked_at: Instant,
-    /// The pass the node was last updated in (the body and the window both update).
+    /// The pass the panel was last updated in (the panel and the window both update).
     pass: Option<u64>,
 }
 
-impl VideoNode {
+impl VideoPanel {
     pub fn new(settings: VideoSettings) -> Self {
         let (cmd, cmd_rx) = crossbeam_channel::unbounded();
         let (msg_tx, msgs) = crossbeam_channel::bounded(AHEAD);
@@ -245,13 +244,12 @@ impl VideoNode {
             ui.checkbox(&mut self.settings.window, "window").on_hover_text("also show it in a window of its own (double-click the picture)");
         });
 
-        let [w, h] = self.settings.size;
-        let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+        let size = ui.available_size().max(vec2(80.0, 45.0));
+        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
         self.paint(ui.painter(), rect);
         if resp.double_clicked() {
             self.settings.window = !self.settings.window;
         }
-        crate::eq_editor::resize_handle(ui, rect, &mut self.settings.size, ui.id().with("video"));
     }
 
     /// Black box with the picture fitted in, upright.
@@ -289,15 +287,15 @@ impl VideoNode {
     }
 
     /// The picture in a window of its own, while that's turned on. Call every pass, also
-    /// when the node isn't drawn. Double-click or F11 for full screen, Space to pause,
+    /// when the panel isn't shown. Double-click or F11 for full screen, Space to pause,
     /// arrows to seek.
-    pub fn window(&mut self, ctx: &egui::Context, player: &Player, eid: u32) {
+    pub fn window(&mut self, ctx: &egui::Context, player: &Player) {
         if !self.settings.window {
             return;
         }
         self.update(ctx, player);
         let title = player.status().title().map_or_else(|| "Video".to_string(), |t| format!("{t} — Video"));
-        let id = egui::ViewportId::from_hash_of(("video", eid));
+        let id = egui::ViewportId::from_hash_of("video");
         let builder = egui::ViewportBuilder::default().with_title(title).with_app_id("nodeplayer").with_inner_size([960.0, 540.0]);
         ctx.show_viewport_immediate(id, builder, |ui, _| {
             let ctx = ui.ctx().clone();
@@ -335,7 +333,7 @@ impl VideoNode {
     }
 }
 
-impl Drop for VideoNode {
+impl Drop for VideoPanel {
     fn drop(&mut self) {
         let _ = self.cmd.send(Cmd::Close);
     }

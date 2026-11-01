@@ -93,13 +93,13 @@ NODEPLAYER_DEBUG_PLUGIN="[FORMAT:]<path>|<class name>" nodeplayer  # add the plu
 | `src/midi.rs` | MIDI In / Out (ALSA sequencer) and MIDI Monitor nodes |
 | `src/midifile/` | MIDI file parser and player from midi-blocks-rs (indexing, parallel scan, packed events, tempo map, the player thread) |
 | `src/midi_song.rs` | MIDI files as songs: the Player node's MIDI section, and placing the player's timed messages on their frames |
-| `src/lyrics.rs` | Lyrics node: LRC parsing, local files and tags, NetEase / Kugou lookup and cache, the scrolling view |
+| `src/lyrics.rs` | Lyrics panel: LRC parsing, local files and tags, NetEase / Kugou lookup and cache, the scrolling view |
 | `src/csynth_node.rs` | CSynth instrument node: loading sounds in the background, MIDI to csynth on its clock, sustain pedal |
 | `src/about.rs` | The About window: author, license, and the crate list (`assets/licenses.json`) with the test that makes it |
 | `src/player.rs` | Decoder thread (symphonia, or FFmpeg for what it can't open, then rubato) feeding a ring buffer that the source node reads, and the rate shift (a variable-ratio sinc resampler on the audio thread); MIDI files go to `midi_song.rs` instead |
 | `src/av.rs` | FFmpeg as programs: `ffprobe` for streams and tags, `ffmpeg` piping audio as f32 and video pictures as RGBA (frame times from `showinfo`), seeking by restarting, rotation |
 | `src/setup.rs` | First start: the FFmpeg download and the AppImage's menu entry |
-| `src/video.rs` | Video node: the decode thread, following the player's position, the picture in the node and in its own window |
+| `src/video.rs` | Video panel: the decode thread, following the player's position, the picture in the panel and in its own window |
 | `src/info.rs` | The Now playing panel |
 | `src/discord.rs` | Discord Rich Presence: IPC connection, the activity, covers (R2 upload, iTunes lookup), the tab |
 | `src/r2.rs` | Cloudflare R2 through the S3 API: SigV4-signed PUT and HEAD |
