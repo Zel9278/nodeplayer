@@ -18,7 +18,7 @@ use crate::eq_editor::EqNode;
 use crate::player::Player;
 use crate::visual::Visualizer;
 use crate::plugins::guard::Tag;
-use crate::plugins::{Editor, Instance, Placement, PluginInfo};
+use crate::plugins::{Editor, Format, Instance, Placement, PluginInfo};
 
 /// A graph inside a node. Inside, a [`NodeKind::GroupIn`] node gives out what reaches the
 /// group's inputs, and what reaches the [`NodeKind::GroupOut`] node leaves by its outputs.
@@ -42,6 +42,7 @@ pub struct PluginNode {
     pub tag: Arc<Tag>,
     // Declared before the instance: an editor must close before its plugin goes away.
     pub editor: Option<Box<dyn Editor>>,
+    pub editor_view: crate::plugins::surface::view::EditorView,
     pub instance: Box<dyn Instance>,
     /// Last control-side timing accepted for the prepared bypass/graph plan.
     pub timing: (u32, u32),
@@ -57,6 +58,7 @@ impl PluginNode {
         Self {
             tag,
             editor: None,
+            editor_view: Default::default(),
             instance,
             timing,
             bypass: false,
@@ -72,7 +74,16 @@ impl PluginNode {
     /// (Re)opens the plugin's editor at `placement`.
     pub fn open_editor(&mut self, placement: Placement) -> anyhow::Result<()> {
         self.editor = None;
-        self.editor = Some(self.instance.open_editor(placement)?);
+        self.editor_view = Default::default();
+        self.editor = Some(if crate::runtime::get().experimental_editor_capture
+            && placement != Placement::Window && self.instance.remote_status().is_none()
+            && matches!(self.info().format, Format::Vst3 | Format::Clap)
+        {
+            let source = self.instance.open_editor(Placement::Window)?;
+            crate::plugins::surface::capture(source, placement)?
+        } else {
+            self.instance.open_editor(placement)?
+        });
         Ok(())
     }
 

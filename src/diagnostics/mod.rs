@@ -122,6 +122,7 @@ pub fn prepare(options: &mut RuntimeOptions) -> Result<Option<DiagnosticRun>> {
         "target": option_env!("TARGET"), "started_unix_ms": unix_ms(),
         "experimental_pdc": options.experimental_pdc || options.experimental_plugin_isolation,
         "experimental_plugin_isolation": options.experimental_plugin_isolation,
+        "experimental_editor_capture": options.experimental_editor_capture,
         "deadline_ms": duration.as_millis(), "metrics_mode": metrics_mode,
         "scenario": scenario.name, "scenario_mode": scenario.mode,
         "fixture": scenario.plugin.as_ref().map(|p| serde_json::json!({"format":p.format,"class_id":p.class_id,"name_filter":p.name_filter,"path":"[explicit fixture path redacted]"})),
@@ -130,7 +131,7 @@ pub fn prepare(options: &mut RuntimeOptions) -> Result<Option<DiagnosticRun>> {
         "actual_device_callback_sizes": serde_json::Value::Null,
         "q": serde_json::Value::Null, "d": serde_json::Value::Null, "h": serde_json::Value::Null,
         "policy": {"normal_profile":false,"native_extensions":false,"network":false,"auto_downloads":false,"library_discovery":false,"device_audio":scenario.audio_output == AudioOutput::Device},
-        "limitations": ["plugin-owned OS profile data is not isolated", "external watchdog required for UI/process hangs", "unavailable measurements are null", "no detailed trace, OS profiling, screenshots or uploads"]
+        "limitations": ["plugin-owned OS profile data is not isolated", "external watchdog required for UI/process hangs", "unavailable measurements are null", "screenshots require explicit scenario steps; no detailed trace, OS profiling or uploads"]
     });
     write_new_json(&root.join("manifest.json"), &manifest)?;
     let run = DiagnosticRun {

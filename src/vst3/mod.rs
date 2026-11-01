@@ -50,7 +50,7 @@ fn parse_cid_hex(s: &str) -> Option<TUID> {
 pub struct Module {
     factory: ComPtr<IPluginFactory>,
     // Plugins frequently misbehave when unloaded, so modules are kept for the process lifetime.
-    _lib: Library,
+    _lib: std::mem::ManuallyDrop<Library>,
 }
 
 unsafe impl Send for Module {}
@@ -119,7 +119,8 @@ impl Module {
                 .context("GetPluginFactory not exported")?;
             let factory =
                 ComPtr::from_raw(get_factory()).ok_or_else(|| anyhow!("null plugin factory"))?;
-            Ok(Self { factory, _lib: lib })
+            // Deferred native GUI objects may still execute plugin code during shutdown.
+            Ok(Self { factory, _lib: std::mem::ManuallyDrop::new(lib) })
         }
     }
 

@@ -59,7 +59,7 @@ pub struct Module {
     entry: *const clap_plugin_entry,
     factory: *const clap_plugin_factory,
     // Plugins frequently misbehave when unloaded, so modules are kept for the process lifetime.
-    _lib: Library,
+    _lib: std::mem::ManuallyDrop<Library>,
 }
 
 unsafe impl Send for Module {}
@@ -90,7 +90,8 @@ impl Module {
             if factory.is_null() {
                 bail!("no plugin factory");
             }
-            Ok(Self { entry, factory, _lib: lib })
+            // Native GUI cleanup can be deferred beyond the last instance/module drop.
+            Ok(Self { entry, factory, _lib: std::mem::ManuallyDrop::new(lib) })
         }
     }
 

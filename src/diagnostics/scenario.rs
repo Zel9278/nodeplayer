@@ -45,6 +45,13 @@ pub enum Step {
         embedded: bool,
     },
     CloseEditor,
+    /// Exercise the ordinary graph transform without changing the plugin GUI scale.
+    GraphZoom {
+        factor: f32,
+    },
+    Screenshot {
+        name: String,
+    },
     SetParam {
         id: u32,
         value: f64,
@@ -172,6 +179,12 @@ impl Scenario {
                     if !value.is_finite() || !(0.0..=1.0).contains(value) =>
                 {
                     bail!("parameter value must be finite and normalized")
+                }
+                Step::GraphZoom { factor } if !factor.is_finite() || !(0.2..=3.0).contains(factor) => {
+                    bail!("graph zoom must be finite and between 0.2 and 3.0");
+                }
+                Step::Screenshot { name } if name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => {
+                    bail!("invalid diagnostic screenshot name");
                 }
                 Step::Wait { duration_ms } if *duration_ms > 86_400_000 => {
                     bail!("wait duration exceeds limit")

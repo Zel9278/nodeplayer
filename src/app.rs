@@ -2117,6 +2117,8 @@ impl App {
             last_zoom: self.zoom,
             zooming: ui.input(|i| (i.zoom_delta() - 1.0).abs() > 1e-4),
             reset_zoom: std::mem::take(&mut self.reset_zoom),
+            diagnostic_zoom: self.diagnostic.as_ref().and_then(|d| d.editor_zoom),
+            diagnostic_target: self.diagnostic.as_ref().and_then(|d| d.node),
             node_presets: &self.node_presets,
             in_group,
             group_io,
@@ -2730,7 +2732,16 @@ impl eframe::App for App {
                 plugins::Spot { clip: at.clip, origin: at.origin, visible: plugins::uncovered(at.clip, &covers) }
             });
             let _g = guard::enter(&p.tag);
-            ed.place(spot.as_ref());
+            if ed.is_captured() {
+                let ppp = self.placements.get(&eid).map(|at| at.ppp).unwrap_or_else(|| {
+                    if cfg!(target_os = "macos") { ctx.pixels_per_point() / ctx.native_pixels_per_point().unwrap_or(1.0) } else { ctx.pixels_per_point() }
+                });
+                if let Err(error) = p.editor_view.dispatch(&ctx, ed.as_mut(), spot.as_ref(), ppp) {
+                    log::warn!("editor input: {error:#}");
+                }
+            } else {
+                ed.place(spot.as_ref());
+            }
         }
         self.video.window(&ctx, &self.player);
         self.open_new_tabs();
@@ -2938,6 +2949,8 @@ struct Viewer<'a> {
     last_zoom: f32,
     zooming: bool,
     reset_zoom: bool,
+    diagnostic_zoom: Option<f32>,
+    diagnostic_target: Option<NodeId>,
     node_presets: &'a [String],
     /// The graph shown is a group's inside, and whether it has its input and output nodes.
     in_group: bool,
@@ -2972,7 +2985,15 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
     /// The graph is drawn as a scaled picture, so text is only sharp at exactly 100% and on
     /// whole pixels: zoom snaps to 100% when it ends up near it (or when asked), and panning
     /// stays on the pixel grid.
-    fn current_transform(&mut self, to_global: &mut egui::emath::TSTransform, _snarl: &mut Snarl<GraphNode>) {
+    fn current_transform(&mut self, to_global: &mut egui::emath::TSTransform, snarl: &mut Snarl<GraphNode>) {
+        if let Some(zoom) = self.diagnostic_zoom {
+            to_global.scaling = zoom;
+            if let Some(node) = self.diagnostic_target.and_then(|id| snarl.get_node_info(id)) {
+                to_global.translation = self.view.min.to_vec2() + egui::vec2(25.0, 25.0) - node.pos.to_vec2() * zoom;
+            }
+            self.zoom = zoom;
+            return;
+        }
         let near = (to_global.scaling - 1.0).abs() < 0.08;
         // Fitting the graph into view (double-click) doesn't zoom in past 100%.
         let fitted_in = !self.zooming && to_global.scaling > 1.0 && (to_global.scaling - self.last_zoom).abs() > 1e-4;
@@ -3235,7 +3256,8 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                     self.wants_scroll |= io.wants_scroll;
                 }
                 let embedded = p.is_embedded();
-                if let Some(ed) = p.editor.as_mut().filter(|_| embedded) {
+                let PluginNode { editor, editor_view, .. } = &mut **p;
+                if let Some(ed) = editor.as_mut().filter(|_| embedded) {
                     // Reserve the editor's actual pixel size on screen; the X11 child window is
                     // moved over this rect after the graph is drawn. The editor is asked to
                     // follow the zoom, which it does if it can scale or resize.
@@ -3246,11 +3268,20 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                         self.ppp
                     };
                     let xf = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or_default();
-                    ed.set_zoom(ppp * xf.scaling);
-                    let (w, h) = ed.size();
-                    let k = ppp * xf.scaling;
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(w as f32 / k, h as f32 / k), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 0.0, Color32::from_gray(16));
+                    let rect = if ed.is_captured() {
+                        let rect = editor_view.paint(ui, ed.as_mut(), ppp);
+                        if ui.ctx().input(|input| input.modifiers.alt) && ui.ctx().pointer_latest_pos().is_some_and(|point| (xf * rect).contains(point)) {
+                            self.wants_scroll = true;
+                        }
+                        rect
+                    } else {
+                        ed.set_zoom(ppp * xf.scaling);
+                        let (w, h) = ed.size();
+                        let k = ppp * xf.scaling;
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(w as f32 / k, h as f32 / k), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 0.0, Color32::from_gray(16));
+                        rect
+                    };
                     let screen = xf * rect;
                     let clip = (xf * ui.clip_rect()).intersect(screen);
                     if clip.is_positive() {
