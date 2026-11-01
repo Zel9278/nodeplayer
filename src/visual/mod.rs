@@ -8,13 +8,16 @@ use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Sense, Stroke, Vec2, pos2,
 
 use crate::engine::nodes::{LimiterMeter, Tap};
 
+mod bands;
 mod spectral;
+use bands::{BandAnalyzer, BandSettings};
 pub use spectral::{FftSettings, Spectrum};
 use spectral::Spectrogram;
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VisKind {
     Spectrum,
+    Bands,
     Spectrogram,
     Scope,
     Vectorscope,
@@ -22,11 +25,12 @@ pub enum VisKind {
 }
 
 impl VisKind {
-    pub const ALL: [VisKind; 5] = [Self::Spectrum, Self::Spectrogram, Self::Scope, Self::Vectorscope, Self::Meter];
+    pub const ALL: [VisKind; 6] = [Self::Spectrum, Self::Bands, Self::Spectrogram, Self::Scope, Self::Vectorscope, Self::Meter];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Spectrum => "Spectrum",
+            Self::Bands => "Band analyzer",
             Self::Spectrogram => "Spectrogram",
             Self::Scope => "Oscilloscope",
             Self::Vectorscope => "Vectorscope",
@@ -37,6 +41,7 @@ impl VisKind {
     fn default_size(self) -> Vec2 {
         match self {
             Self::Spectrum | Self::Spectrogram => vec2(360.0, 170.0),
+            Self::Bands => vec2(420.0, 200.0),
             Self::Scope => vec2(320.0, 140.0),
             Self::Vectorscope => vec2(200.0, 200.0),
             Self::Meter => vec2(280.0, 64.0),
@@ -46,6 +51,7 @@ impl VisKind {
 
 enum View {
     Spectrum(Box<Spectrum>),
+    Bands(Box<BandAnalyzer>),
     Spectrogram(Box<Spectrogram>),
     Scope(Scope),
     Vectorscope,
@@ -71,6 +77,9 @@ pub struct VisSettings {
     /// Spectrum / spectrogram settings.
     #[serde(default)]
     pub fft: Option<FftSettings>,
+    /// Band analyzer settings.
+    #[serde(default)]
+    pub bands: Option<BandSettings>,
     // Older spectrum settings, read when `fft` is missing.
     #[serde(default, skip_serializing)]
     pub fft_size: Option<usize>,
@@ -90,6 +99,7 @@ impl Visualizer {
             kind: self.kind,
             size: self.size.into(),
             fft: None,
+            bands: None,
             fft_size: None,
             tilt: None,
             hold: None,
@@ -98,6 +108,7 @@ impl Visualizer {
         };
         match &self.view {
             View::Spectrum(sp) => s.fft = Some(sp.cfg),
+            View::Bands(b) => s.bands = Some(b.cfg),
             View::Spectrogram(sg) => s.fft = Some(sg.cfg),
             View::Scope(sc) => {
                 s.scope_ms = Some(sc.ms);
@@ -129,6 +140,11 @@ impl Visualizer {
                     **sg = Spectrogram::new(cfg);
                 }
             }
+            View::Bands(b) => {
+                if let Some(cfg) = s.bands {
+                    b.cfg = cfg;
+                }
+            }
             View::Scope(sc) => {
                 sc.ms = s.scope_ms.unwrap_or(sc.ms).clamp(1.0, 200.0);
                 sc.trigger = s.trigger.unwrap_or(sc.trigger);
@@ -141,6 +157,7 @@ impl Visualizer {
     pub fn new(kind: VisKind) -> Self {
         let view = match kind {
             VisKind::Spectrum => View::Spectrum(Box::new(Spectrum::new(FftSettings::spectrum()))),
+            VisKind::Bands => View::Bands(Box::new(BandAnalyzer::new(BandSettings::default()))),
             VisKind::Spectrogram => View::Spectrogram(Box::new(Spectrogram::new(FftSettings::spectrogram()))),
             VisKind::Scope => View::Scope(Scope { ms: 20.0, trigger: true }),
             VisKind::Vectorscope => View::Vectorscope,
@@ -166,6 +183,7 @@ impl Visualizer {
         match &mut self.view {
             View::Spectrum(s) => spectral::settings_ui(ui, &mut s.cfg, &mut s.show_settings, false, sample_rate),
             View::Spectrogram(s) => spectral::settings_ui(ui, &mut s.cfg, &mut s.show_settings, true, sample_rate),
+            View::Bands(b) => bands::settings_ui(ui, &mut b.cfg, &mut b.show_settings, sample_rate),
             View::Scope(s) => {
                 ui.horizontal(|ui| {
                     ui.add(egui::Slider::new(&mut s.ms, 1.0..=200.0).logarithmic(true).suffix(" ms"));
@@ -186,6 +204,10 @@ impl Visualizer {
                 read_latest(tap, s.size(), l, r);
                 s.update(l, r, sample_rate, dt);
                 s.draw(&painter, rect, sample_rate, hover);
+            }
+            View::Bands(b) => {
+                b.update(tap, sample_rate, dt);
+                b.draw(&painter, rect, sample_rate, hover);
             }
             View::Spectrogram(s) => {
                 s.update(tap, sample_rate, l, r);

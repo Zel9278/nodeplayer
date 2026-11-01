@@ -45,7 +45,7 @@ impl WindowFn {
     }
 
     /// Periodic window coefficient `k` of `n`.
-    fn coeff(self, k: usize, n: usize) -> f32 {
+    pub(super) fn coeff(self, k: usize, n: usize) -> f32 {
         let x = 2.0 * std::f64::consts::PI * k as f64 / n as f64;
         let cos_sum = |a: &[f64]| a.iter().enumerate().map(|(i, c)| c * (i as f64 * x).cos()).sum::<f64>();
         (match self {
@@ -91,7 +91,7 @@ impl Channel {
         }
     }
 
-    fn mix(self, l: &[f32], r: &[f32], out: &mut [f32]) {
+    pub(super) fn mix(self, l: &[f32], r: &[f32], out: &mut [f32]) {
         for (o, (a, b)) in out.iter_mut().zip(l.iter().zip(r)) {
             *o = match self {
                 Self::Mid | Self::Stereo => (a + b) * 0.5,

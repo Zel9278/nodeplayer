@@ -75,6 +75,25 @@ drag the corner handle to resize it. Put one inline, or branch it off any output
   - spectrum: Filled, Line or Bars, release speed, peak hold and its decay; hover to read a
     frequency and level
   - spectrogram: history length (0.5–60 s) and colours (Heat, Ice, Gray, Rainbow)
+- **Band analyzer**: the spectrum in bands, as bars. The top row picks how the bands are
+  measured, how they are drawn, and peak caps; ⚙ opens the rest:
+  - measuring: **Constant-Q** (each band analyzed with a window fitting its width, so the bass
+    is sharp and the treble quick), **FFT** (one FFT for all bands, 512–32768 points),
+    **SWIFT** (sliding resonators updated on every sample) or **Analog filters** (band-pass
+    filters with an RMS detector, like a hardware analyzer). For the last three, "Band width"
+    sets how wide each band listens, and "Order" how many filters each band has in a row
+    (more keeps neighboring bands apart); the analog filters also have a detector time. A
+    full-scale sine reads 0 dB in its band with any of them.
+  - bands: octave bands centered on the notes (1 to 48 per octave, tuned to A4 = 400–480 Hz;
+    12 gives one band per semitone), or 4–512 bands on a logarithmic, linear, Bark, ERB or Mel
+    scale
+  - looks: Bars, LED bars, Curve, Radial bars and Radial curve
+  - bars rise over the attack time and fall at a set speed; peak caps hold for a while, then
+    fall faster and faster
+  - colors: Classic, Prism, Turbo, Viridis, Magma, Gold, Ice or White, by level or by
+    frequency; the gap between bars and the size of an LED
+  - labels under the bars: the C of each octave, or frequencies; hover to read a band's note,
+    frequency and level
 - **Oscilloscope**: the left and right waveforms over 1–200 ms, triggered on zero crossings.
 - **Vectorscope**: a goniometer (mono is vertical) with a correlation meter.
 - **Level meter**: peak, 300 ms RMS, peak hold and a clip light. Click it to reset.

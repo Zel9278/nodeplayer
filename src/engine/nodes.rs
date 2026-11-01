@@ -448,7 +448,7 @@ impl Tap {
         self.written.load(Ordering::Acquire)
     }
 
-    pub(super) fn push(&self, l: &[f32], r: &[f32]) {
+    pub(crate) fn push(&self, l: &[f32], r: &[f32]) {
         let w = self.written.load(Ordering::Relaxed);
         for (k, (a, b)) in l.iter().zip(r).enumerate() {
             let i = ((w + k as u64) & Self::MASK) as usize;

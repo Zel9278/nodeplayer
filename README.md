@@ -11,7 +11,7 @@ Written in Rust, for Linux, Windows and macOS.
 - **Library**: folders and files with their tags, sorting, filtering, play counts, repeat and
   shuffle; audio, video and MIDI files are all tracks
 - **Node graph**: EQ with a graphic editor, limiter, delay, mixer, gain and pan, and
-  visualizers (spectrum, spectrogram, oscilloscope, vectorscope, level meter); graph and node
+  visualizers (spectrum, band analyzer, spectrogram, oscilloscope, vectorscope, level meter); graph and node
   presets
 - **Plugins**: VST3, CLAP and JSFX, with their editors drawn inside the nodes; Windows plugins
   on Linux through yabridge; its own plugin SDK for DSP nodes and app extensions
