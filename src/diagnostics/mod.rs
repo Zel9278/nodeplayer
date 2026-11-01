@@ -165,7 +165,7 @@ impl DiagnosticRun {
             .events
             .lock()
             .map_err(|_| anyhow!("diagnostic event lock poisoned"))?;
-        let event = serde_json::json!({"run_id":self.run_id,"pid":std::process::id(),"thread_role":"control","instance_id":null,"generation":null,"plan_epoch":null,"request_id":null,"sequence":writer.sequence,"elapsed_ms":self.start.elapsed().as_millis(),"event":name,"payload":payload});
+        let event: serde_json::Value = serde_json::json!({"run_id":self.run_id,"pid":std::process::id(),"thread_role":"control","instance_id":null,"generation":null,"plan_epoch":null,"request_id":null,"sequence":writer.sequence,"elapsed_ms":self.start.elapsed().as_millis(),"event":name,"payload":payload});
         let mut bytes = serde_json::to_vec(&event)?;
         bytes.push(b'\n');
         if bytes.len() > MAX_EVENT_BYTES

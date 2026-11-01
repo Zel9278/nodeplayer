@@ -175,29 +175,41 @@ impl Vst3Processor {
         let Some(list) = &self.out_events else { return };
         list.for_each(|e| {
             use Event_::EventTypes_::*;
+            #[cfg(windows)]
+            let (note_on, note_off, poly_pressure, legacy_midi_cc_out) = (
+                kNoteOnEvent as u32, kNoteOffEvent as u32, kPolyPressureEvent as u32, kLegacyMIDICCOutEvent as u32,
+            );
+            #[cfg(not(windows))]
+            let (note_on, note_off, poly_pressure, legacy_midi_cc_out) = (
+                kNoteOnEvent, kNoteOffEvent, kPolyPressureEvent, kLegacyMIDICCOutEvent,
+            );
+            #[cfg(windows)]
+            let (after_touch, pitch_bend) = (ControllerNumbers_::kAfterTouch as u32, ControllerNumbers_::kPitchBend as u32);
+            #[cfg(not(windows))]
+            let (after_touch, pitch_bend) = (ControllerNumbers_::kAfterTouch, ControllerNumbers_::kPitchBend);
             let time = (e.sampleOffset.max(0) as u32).min(n.saturating_sub(1) as u32);
             let vel = |v: f32| (v * 127.0).round().clamp(0.0, 127.0) as u8;
             let data = unsafe {
                 match e.r#type as u32 {
-                    t if t == kNoteOnEvent as u32 => {
+                    t if t == note_on => {
                         let x = e.__field0.noteOn;
                         [0x90 | (x.channel as u8 & 15), x.pitch as u8 & 127, vel(x.velocity).max(1)]
                     }
-                    t if t == kNoteOffEvent as u32 => {
+                    t if t == note_off => {
                         let x = e.__field0.noteOff;
                         [0x80 | (x.channel as u8 & 15), x.pitch as u8 & 127, vel(x.velocity)]
                     }
-                    t if t == kPolyPressureEvent as u32 => {
+                    t if t == poly_pressure => {
                         let x = e.__field0.polyPressure;
                         [0xa0 | (x.channel as u8 & 15), x.pitch as u8 & 127, vel(x.pressure)]
                     }
-                    t if t == kLegacyMIDICCOutEvent as u32 => {
+                    t if t == legacy_midi_cc_out => {
                         let x = e.__field0.midiCCOut;
                         let ch = x.channel as u8 & 15;
                         match x.controlNumber as u32 {
                             c if c < 128 => [0xb0 | ch, c as u8, x.value as u8 & 127],
-                            c if c == ControllerNumbers_::kAfterTouch as u32 => [0xd0 | ch, x.value as u8 & 127, 0],
-                            c if c == ControllerNumbers_::kPitchBend as u32 => [0xe0 | ch, x.value as u8 & 127, x.value2 as u8 & 127],
+                            c if c == after_touch => [0xd0 | ch, x.value as u8 & 127, 0],
+                            c if c == pitch_bend => [0xe0 | ch, x.value as u8 & 127, x.value2 as u8 & 127],
                             130 => [0xc0 | ch, x.value as u8 & 127, 0],
                             _ => return,
                         }
