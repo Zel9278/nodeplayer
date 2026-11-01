@@ -19,6 +19,23 @@ use crate::visual::Visualizer;
 use crate::plugins::guard::Tag;
 use crate::plugins::{Editor, Instance, Placement, PluginInfo};
 
+/// A graph inside a node. Inside, a [`NodeKind::GroupIn`] node gives out what reaches the
+/// group's inputs, and what reaches the [`NodeKind::GroupOut`] node leaves by its outputs.
+pub struct GroupNode {
+    pub name: String,
+    pub snarl: Snarl<GraphNode>,
+}
+
+impl GroupNode {
+    pub fn new(name: String) -> Self {
+        Self { name, snarl: Snarl::new() }
+    }
+
+    fn eid_of(&self, f: impl Fn(&NodeKind) -> bool) -> Option<u32> {
+        self.snarl.nodes().find(|n| f(&n.kind)).map(|n| n.eid)
+    }
+}
+
 pub struct PluginNode {
     /// Marks calls into the plugin, for crash reports.
     pub tag: Arc<Tag>,
@@ -76,6 +93,11 @@ pub enum NodeKind {
     CSynth(Box<CSynthNode>),
     Lyrics(Box<LyricsNode>),
     Video(Box<VideoNode>),
+    Group(Box<GroupNode>),
+    /// Inside a group: what comes into the group.
+    GroupIn,
+    /// Inside a group: what leaves the group.
+    GroupOut,
 }
 
 impl NodeKind {
@@ -123,6 +145,9 @@ impl NodeKind {
             Self::CSynth(_) => "CSynth".into(),
             Self::Lyrics(_) => "Lyrics".into(),
             Self::Video(_) => "Video".into(),
+            Self::Group(g) => g.name.clone(),
+            Self::GroupIn => "Group input".into(),
+            Self::GroupOut => "Group output".into(),
         }
     }
 
@@ -135,7 +160,8 @@ impl NodeKind {
             | Self::MidiMonitor(_)
             | Self::CSynth(_)
             | Self::Lyrics(_)
-            | Self::Video(_) => 0,
+            | Self::Video(_)
+            | Self::GroupIn => 0,
             Self::Mixer { .. } => MIXER_INPUTS,
             _ => 1,
         }
@@ -143,14 +169,20 @@ impl NodeKind {
 
     pub fn audio_outputs(&self) -> usize {
         match self {
-            Self::Output { .. } | Self::MidiIn(_) | Self::MidiOut(_) | Self::MidiMonitor(_) | Self::Lyrics(_) | Self::Video(_) => 0,
+            Self::Output { .. }
+            | Self::MidiIn(_)
+            | Self::MidiOut(_)
+            | Self::MidiMonitor(_)
+            | Self::Lyrics(_)
+            | Self::Video(_)
+            | Self::GroupOut => 0,
             _ => 1,
         }
     }
 
     pub fn midi_input(&self) -> bool {
         match self {
-            Self::MidiOut(_) | Self::MidiMonitor(_) | Self::CSynth(_) => true,
+            Self::MidiOut(_) | Self::MidiMonitor(_) | Self::CSynth(_) | Self::Group(_) | Self::GroupOut => true,
             Self::Plugin(p) => p.instance.midi_ports().0,
             _ => false,
         }
@@ -158,9 +190,19 @@ impl NodeKind {
 
     pub fn midi_output(&self) -> bool {
         match self {
-            Self::Player | Self::MidiIn(_) | Self::MidiMonitor(_) | Self::Audio2Midi(_) => true,
+            Self::Player | Self::MidiIn(_) | Self::MidiMonitor(_) | Self::Audio2Midi(_) | Self::Group(_) | Self::GroupIn => true,
             Self::Plugin(p) => p.instance.midi_ports().1,
             _ => false,
+        }
+    }
+
+    /// Stereo inputs and outputs of the node's engine slot. The group's input and output
+    /// nodes have one more than they show: the group feeds the first, the second feeds it.
+    pub fn engine_ports(&self) -> (usize, usize) {
+        match self {
+            Self::GroupIn => (1, 1),
+            Self::GroupOut => (1, 1),
+            k => (k.audio_inputs(), k.audio_outputs()),
         }
     }
 
@@ -203,6 +245,8 @@ impl NodeKind {
             Self::CSynth(c) => Box::new(c.processor()),
             // Shows what's playing; nothing to do on the audio thread.
             Self::Lyrics(_) | Self::Video(_) => Box::new(nodes::MidiBridge::default()),
+            // A group's own slot takes what comes in; the nodes inside pass it on.
+            Self::Group(_) | Self::GroupIn | Self::GroupOut => Box::new(nodes::MidiBridge { thru: true, ..Default::default() }),
             Self::Plugin(_) => return None,
         })
     }
@@ -284,52 +328,125 @@ pub fn would_cycle(snarl: &Snarl<GraphNode>, from: NodeId, to: NodeId) -> bool {
     false
 }
 
-/// Topologically sorts every node. Unconnected nodes are still scheduled so sources keep
-/// draining their queues.
-pub fn compile(snarl: &Snarl<GraphNode>) -> Schedule {
-    let mut indeg: HashMap<NodeId, usize> = snarl.node_ids().map(|(id, _)| (id, 0)).collect();
-    let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-    let mut sources: HashMap<(NodeId, usize), Vec<(u32, u32)>> = HashMap::new();
-    let mut midi: HashMap<NodeId, Vec<u32>> = HashMap::new();
-    for (o, i) in snarl.wires() {
-        *indeg.entry(i.node).or_default() += 1;
-        adj.entry(o.node).or_default().push(i.node);
-        let (from, to) = (&snarl[o.node].kind, &snarl[i.node].kind);
-        match (from.is_midi_output(o.output), to.is_midi_input(i.input)) {
-            (false, false) => sources.entry((i.node, i.input)).or_default().push((snarl[o.node].eid, o.output as u32)),
-            (true, true) => midi.entry(i.node).or_default().push(snarl[o.node].eid),
-            // Mismatched wires are refused when made; one could only survive a plugin
-            // changing its ports.
-            _ => {}
+/// Every node in `snarl` and in the groups inside it, groups' own nodes left out.
+pub fn collect_mut<'a>(snarl: &'a mut Snarl<GraphNode>, out: &mut Vec<&'a mut GraphNode>) {
+    for node in snarl.nodes_mut() {
+        if matches!(node.kind, NodeKind::Group(_)) {
+            let NodeKind::Group(g) = &mut node.kind else { unreachable!() };
+            collect_mut(&mut g.snarl, out);
+        } else {
+            out.push(node);
         }
     }
+}
 
-    let mut queue: VecDeque<NodeId> = indeg.iter().filter(|(_, d)| **d == 0).map(|(n, _)| *n).collect();
-    let mut order = Vec::with_capacity(indeg.len());
-    while let Some(n) = queue.pop_front() {
-        order.push(n);
-        for m in adj.get(&n).into_iter().flatten() {
-            let d = indeg.get_mut(m).unwrap();
-            *d -= 1;
-            if *d == 0 {
-                queue.push_back(*m);
+/// The groups to go into, from `snarl`, to reach the node with engine slot `eid`, and its id
+/// there.
+pub fn path_to(snarl: &Snarl<GraphNode>, eid: u32) -> Option<(Vec<NodeId>, NodeId)> {
+    for (id, node) in snarl.node_ids() {
+        if node.eid == eid {
+            return Some((Vec::new(), id));
+        }
+        if let NodeKind::Group(g) = &node.kind
+            && let Some((mut path, found)) = path_to(&g.snarl, eid)
+        {
+            path.insert(0, id);
+            return Some((path, found));
+        }
+    }
+    None
+}
+
+/// The graph with its groups opened up: engine slots and what connects them.
+#[derive(Default)]
+struct Flat {
+    /// Engine slot, its stereo inputs, and whether it goes to the device.
+    nodes: Vec<(u32, usize, bool)>,
+    /// `(from slot, output) -> (to slot, input)`.
+    audio: Vec<((u32, u32), (u32, usize))>,
+    /// MIDI from one slot to another.
+    midi: Vec<(u32, u32)>,
+}
+
+impl Flat {
+    fn add(&mut self, snarl: &Snarl<GraphNode>) {
+        for node in snarl.nodes() {
+            self.nodes.push((node.eid, node.kind.engine_ports().0, matches!(node.kind, NodeKind::Output { .. })));
+            if let NodeKind::Group(g) = &node.kind {
+                self.add(&g.snarl);
+                // The group's slot takes what comes in and hands it to the input node inside.
+                if let Some(input) = g.eid_of(|k| matches!(k, NodeKind::GroupIn)) {
+                    self.audio.push(((node.eid, 0), (input, 0)));
+                    self.midi.push((node.eid, input));
+                }
+            }
+        }
+        for (o, i) in snarl.wires() {
+            let (from, to) = (&snarl[o.node], &snarl[i.node]);
+            // What leaves a group comes from the output node inside it.
+            let src = match &from.kind {
+                NodeKind::Group(g) => match g.eid_of(|k| matches!(k, NodeKind::GroupOut)) {
+                    Some(eid) => eid,
+                    None => continue,
+                },
+                _ => from.eid,
+            };
+            match (from.kind.is_midi_output(o.output), to.kind.is_midi_input(i.input)) {
+                (false, false) => self.audio.push(((src, o.output as u32), (to.eid, i.input))),
+                (true, true) => self.midi.push((src, to.eid)),
+                // Mismatched wires are refused when made; one could only survive a plugin
+                // changing its ports.
+                _ => {}
             }
         }
     }
 
-    let mut schedule = Schedule::default();
-    for id in order {
-        let node = &snarl[id];
-        let inputs = (0..node.kind.audio_inputs())
-            .map(|p| sources.remove(&(id, p)).unwrap_or_default())
-            .collect();
-        let midi = midi.remove(&id).unwrap_or_default();
-        schedule.steps.push(Step { node: node.eid, inputs, midi });
-        if matches!(node.kind, NodeKind::Output { .. }) {
-            schedule.sinks.push(node.eid);
+    /// Topologically sorts every slot. Unconnected nodes are still scheduled so sources keep
+    /// draining their queues.
+    fn schedule(self) -> Schedule {
+        let mut indeg: HashMap<u32, usize> = self.nodes.iter().map(|n| (n.0, 0)).collect();
+        let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (from, to) in self.audio.iter().map(|(a, b)| (a.0, b.0)).chain(self.midi.iter().copied()) {
+            if indeg.contains_key(&from) && let Some(d) = indeg.get_mut(&to) {
+                *d += 1;
+                adj.entry(from).or_default().push(to);
+            }
         }
+        let mut queue: VecDeque<u32> = self.nodes.iter().map(|n| n.0).filter(|e| indeg[e] == 0).collect();
+        let mut order = Vec::with_capacity(self.nodes.len());
+        while let Some(n) = queue.pop_front() {
+            order.push(n);
+            for m in adj.get(&n).into_iter().flatten() {
+                let d = indeg.get_mut(m).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    queue.push_back(*m);
+                }
+            }
+        }
+        let info: HashMap<u32, (usize, bool)> = self.nodes.iter().map(|n| (n.0, (n.1, n.2))).collect();
+        let mut schedule = Schedule::default();
+        for eid in order {
+            let (ins, sink) = info[&eid];
+            let mut inputs = vec![Vec::new(); ins];
+            for (src, (_, k)) in self.audio.iter().filter(|(_, (to, k))| *to == eid && *k < ins) {
+                inputs[*k].push(*src);
+            }
+            let midi = self.midi.iter().filter(|(_, to)| *to == eid).map(|(from, _)| *from).collect();
+            schedule.steps.push(Step { node: eid, inputs, midi });
+            if sink {
+                schedule.sinks.push(eid);
+            }
+        }
+        schedule
     }
-    schedule
+}
+
+/// The engine's schedule for the whole graph, groups included.
+pub fn compile(snarl: &Snarl<GraphNode>) -> Schedule {
+    let mut flat = Flat::default();
+    flat.add(snarl);
+    flat.schedule()
 }
 
 #[cfg(test)]
@@ -344,6 +461,49 @@ mod tests {
 
     fn active(snarl: &Snarl<GraphNode>, id: NodeId) -> bool {
         matches!(snarl[id].kind, NodeKind::RateShift { active: true, .. })
+    }
+
+    fn wire(snarl: &mut Snarl<GraphNode>, from: NodeId, out: usize, to: NodeId, inp: usize) {
+        snarl.connect(OutPinId { node: from, output: out }, InPinId { node: to, input: inp });
+    }
+
+    #[test]
+    fn groups_open_up_into_one_schedule() {
+        let at = egui::pos2(0.0, 0.0);
+        // Inside: In → Gain → Out, and In's MIDI → Out's MIDI.
+        let mut inside = Snarl::new();
+        let i = inside.insert_node(at, GraphNode { eid: 10, kind: NodeKind::GroupIn });
+        let g = inside.insert_node(at, GraphNode { eid: 11, kind: NodeKind::Gain { db: 0.0 } });
+        let o = inside.insert_node(at, GraphNode { eid: 12, kind: NodeKind::GroupOut });
+        wire(&mut inside, i, 0, g, 0);
+        wire(&mut inside, g, 0, o, 0);
+        wire(&mut inside, i, 1, o, 1);
+        // Outside: Player → group → Output, the Player's MIDI into the group.
+        let mut snarl = Snarl::new();
+        let p = snarl.insert_node(at, GraphNode { eid: 0, kind: NodeKind::Player });
+        let group = GroupNode { name: "G".into(), snarl: inside };
+        let gr = snarl.insert_node(at, GraphNode { eid: 1, kind: NodeKind::Group(Box::new(group)) });
+        let out = snarl.insert_node(at, GraphNode { eid: 2, kind: NodeKind::output() });
+        wire(&mut snarl, p, 0, gr, 0);
+        wire(&mut snarl, p, 1, gr, 1);
+        wire(&mut snarl, gr, 0, out, 0);
+
+        let s = compile(&snarl);
+        let step = |eid: u32| s.steps.iter().find(|st| st.node == eid).unwrap_or_else(|| panic!("no step for {eid}"));
+        let pos = |eid: u32| s.steps.iter().position(|st| st.node == eid).unwrap();
+        assert_eq!(step(1).inputs, vec![vec![(0, 0)]], "the group's slot takes the Player");
+        assert_eq!(step(1).midi, vec![0]);
+        assert_eq!(step(10).inputs, vec![vec![(1, 0)]], "the input node takes the group's slot");
+        assert_eq!(step(10).midi, vec![1]);
+        assert_eq!(step(11).inputs, vec![vec![(10, 0)]]);
+        assert_eq!(step(12).inputs, vec![vec![(11, 0)]]);
+        assert_eq!(step(12).midi, vec![10]);
+        assert_eq!(step(2).inputs, vec![vec![(12, 0)]], "the Output takes the output node");
+        assert_eq!(s.sinks, vec![2]);
+        for (a, b) in [(0, 1), (1, 10), (10, 11), (11, 12), (12, 2)] {
+            assert!(pos(a) < pos(b), "{a} before {b}");
+        }
+        assert_eq!(path_to(&snarl, 11), Some((vec![gr], g)));
     }
 
     #[test]

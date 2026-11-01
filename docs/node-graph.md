@@ -98,6 +98,25 @@ drag the corner handle to resize it. Put one inline, or branch it off any output
 - **Vectorscope**: a goniometer (mono is vertical) with a correlation meter.
 - **Level meter**: peak, 300 ms RMS, peak hold and a clip light. Click it to reset.
 
+## Groups
+
+A group is a node with a graph inside it. Right-click → **Group** adds one: it has an audio
+input and output and a MIDI input and output, and inside, a **Group input** node wired to a
+**Group output** node. What reaches the group's inputs comes out of Group input; what reaches
+Group output leaves by the group's outputs.
+
+- **Open** on the group (or in its right-click menu) shows the graph inside, to add nodes and
+  wire them as in the main graph. The row above it shows where you are: **⬅ Back** goes out
+  one level, and the names go back to that level. Each level keeps its own view.
+- **Add a node preset inside** adds a node preset's nodes in the group, to wire them to its
+  input and output.
+- The name field on the group renames it.
+- Groups can go inside groups. The Player stays in the main graph; a node preset with a Player
+  added inside a group leaves it out.
+- Removing a group removes everything in it. Groups are saved with the session, graph presets
+  and node presets.
+- A plugin's editor inside a group shows while the group is open.
+
 ## Presets
 
 - **Graph presets** (💾 Presets tab): "Save" keeps the whole graph under a name, "Load"

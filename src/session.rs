@@ -78,6 +78,10 @@ pub enum SavedKind {
         /// Base64 of the plugin's state.
         state: Option<String>,
     },
+    /// A graph inside a node, with its own input and output nodes.
+    Group { name: String, graph: SavedGraph },
+    GroupIn,
+    GroupOut,
     /// VST3 plugins as saved before other formats existed.
     Vst3 {
         path: PathBuf,

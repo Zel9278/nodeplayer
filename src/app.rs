@@ -180,8 +180,29 @@ impl egui_dock::TabViewer for Tabs<'_> {
 /// How often the session is written while running (it's also written on exit).
 const AUTOSAVE: Duration = Duration::from_secs(30);
 
+/// A graph around the one shown, and the group in it that the shown one is the inside of.
+struct Level {
+    snarl: Snarl<GraphNode>,
+    group: NodeId,
+}
+
+/// Every node at every level: the graph shown, the ones around it, and the groups in them.
+fn every_node<'a>(snarl: &'a mut Snarl<GraphNode>, outer: &'a mut [Level]) -> Vec<&'a mut GraphNode> {
+    let mut all = Vec::new();
+    graph::collect_mut(snarl, &mut all);
+    for level in outer {
+        graph::collect_mut(&mut level.snarl, &mut all);
+    }
+    all
+}
+
 enum Action {
     Add(NodeKind, Pos2),
+    AddGroup(Pos2),
+    OpenGroup(NodeId),
+    /// Go back out to the graph at this depth (0 = the main graph).
+    Leave(usize),
+    LoadIntoGroup(NodeId, String),
     AddPlugin(PluginInfo, Pos2),
     Remove(NodeId),
     Changed,
@@ -195,7 +216,10 @@ pub struct App {
     engine: Option<Engine>,
     sample_rate: f32,
     player: Player,
+    /// The graph shown: the main one, or the inside of a group (see [`App::enter_group`]).
     snarl: Snarl<GraphNode>,
+    /// The graphs around the one shown when it's a group's, outermost first.
+    outer: Vec<Level>,
     style: SnarlStyle,
     ids: IdAlloc,
     dirty: bool,
@@ -234,7 +258,8 @@ pub struct App {
     /// Whether FFmpeg was found, and when that was checked.
     ffmpeg: (bool, Instant),
     /// Restored plugin nodes whose editor was open; reopened once the window exists.
-    pending_editors: Vec<NodeId>,
+    /// Engine slots of plugins whose editors open once the window exists.
+    pending_editors: Vec<u32>,
     last_save: Instant,
     shut_down: bool,
     preset_name: String,
@@ -299,6 +324,7 @@ impl App {
             engine,
             sample_rate: sample_rate as f32,
             snarl: Snarl::new(),
+            outer: Vec::new(),
             // Editors that support scaling follow the zoom; others stay at their own size.
             style: SnarlStyle { collapsible: Some(true), max_scale: Some(2.0), ..SnarlStyle::new() },
             ids: IdAlloc::default(),
@@ -528,7 +554,7 @@ impl App {
                 }
                 ExtCommand::SetVolume(db) => {
                     let mut sends = Vec::new();
-                    for (_, n) in self.snarl.nodes_ids_mut() {
+                    for n in every_node(&mut self.snarl, &mut self.outer) {
                         if let NodeKind::Output { volume_db, .. } = &mut n.kind {
                             *volume_db = db;
                             sends.push(n.eid);
@@ -571,7 +597,95 @@ impl App {
         }
     }
 
+    /// Shows the inside of group `id` (in the graph shown) instead; false if it isn't one.
+    fn enter_group(&mut self, id: NodeId) -> bool {
+        let Some(NodeKind::Group(g)) = self.snarl.get_node_mut(id).map(|n| &mut n.kind) else { return false };
+        let inside = std::mem::take(&mut g.snarl);
+        let around = std::mem::replace(&mut self.snarl, inside);
+        self.outer.push(Level { snarl: around, group: id });
+        true
+    }
+
+    /// Goes back out of the group shown; false at the main graph.
+    fn leave_group(&mut self) -> bool {
+        let Some(level) = self.outer.pop() else { return false };
+        let inside = std::mem::replace(&mut self.snarl, level.snarl);
+        match self.snarl.get_node_mut(level.group).map(|n| &mut n.kind) {
+            Some(NodeKind::Group(g)) => g.snarl = inside,
+            // The group went away meanwhile (it can't while shown, but don't leak its nodes).
+            _ => self.retire_all(inside),
+        }
+        true
+    }
+
+    /// The groups entered to show the current graph.
+    fn group_path(&self) -> Vec<NodeId> {
+        self.outer.iter().map(|l| l.group).collect()
+    }
+
+    fn in_group(&self) -> bool {
+        !self.outer.is_empty()
+    }
+
+    /// Runs `f` with the main graph shown, then goes back in as far as the groups are still
+    /// there.
+    fn with_root<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let path = self.group_path();
+        while self.leave_group() {}
+        let r = f(self);
+        for id in path {
+            if !self.enter_group(id) {
+                break;
+            }
+        }
+        r
+    }
+
+    /// Runs `f` with the graph holding engine slot `eid` shown, and the node's id in it.
+    fn at_eid<R>(&mut self, eid: u32, f: impl FnOnce(&mut Self, NodeId) -> R) -> Option<R> {
+        if let Some(id) = self.snarl.node_ids().find(|(_, n)| n.eid == eid).map(|(id, _)| id) {
+            return Some(f(self, id));
+        }
+        self.with_root(|app| {
+            let (path, id) = graph::path_to(&app.snarl, eid)?;
+            for g in &path {
+                app.enter_group(*g);
+            }
+            let r = f(app, id);
+            for _ in &path {
+                app.leave_group();
+            }
+            Some(r)
+        })
+    }
+
+    /// Adds an empty group, its input wired to its output.
+    fn add_group(&mut self, pos: Pos2) -> Option<NodeId> {
+        let count = self.snarl.nodes().filter(|n| matches!(n.kind, NodeKind::Group(_))).count();
+        let id = self.add_node(NodeKind::Group(Box::new(graph::GroupNode::new(format!("Group {}", count + 1)))), pos)?;
+        self.enter_group(id);
+        let i = self.add_node(NodeKind::GroupIn, pos2(0.0, 0.0));
+        let o = self.add_node(NodeKind::GroupOut, pos2(300.0, 0.0));
+        if let (Some(i), Some(o)) = (i, o) {
+            self.snarl.connect(OutPinId { node: i, output: 0 }, InPinId { node: o, input: 0 });
+            self.snarl.connect(OutPinId { node: i, output: 1 }, InPinId { node: o, input: 1 });
+        }
+        self.leave_group();
+        Some(id)
+    }
+
+    /// Adds a node preset inside group `id` (in the graph shown), to the right of what's there.
+    fn load_into_group(&mut self, id: NodeId, name: &str) {
+        if !self.enter_group(id) {
+            return;
+        }
+        let right = self.snarl.nodes_pos().map(|(p, _)| p.x).fold(f32::NEG_INFINITY, f32::max);
+        self.add_node_preset(name, pos2(if right.is_finite() { right + 320.0 } else { 0.0 }, 160.0));
+        self.leave_group();
+    }
+
     fn clear_graph(&mut self) {
+        while self.leave_group() {}
         self.pending_editors.clear();
         let ids: Vec<NodeId> = self.snarl.node_ids().map(|(id, _)| id).collect();
         for id in ids {
@@ -579,62 +693,9 @@ impl App {
         }
     }
 
-    fn save_graph(&self) -> SavedGraph {
-        self.save_nodes(None)
-    }
-
-    /// The nodes in `only` (all when `None`) and the wires between them.
-    fn save_nodes(&self, only: Option<&HashSet<NodeId>>) -> SavedGraph {
-        let mut index = HashMap::new();
-        let mut nodes = Vec::new();
-        for (id, n) in self.snarl.nodes_ids_data() {
-            if only.is_some_and(|o| !o.contains(&id)) {
-                continue;
-            }
-            let kind = match &n.value.kind {
-                NodeKind::Player => SavedKind::Player,
-                NodeKind::Output { volume_db, .. } => SavedKind::Output { volume_db: *volume_db },
-                NodeKind::Gain { db } => SavedKind::Gain { db: *db },
-                NodeKind::Pan { pan } => SavedKind::Pan { pan: *pan },
-                NodeKind::RateShift { rate, bypass, .. } => SavedKind::RateShift { rate: *rate, bypass: *bypass },
-                NodeKind::Eq(e) => SavedKind::ParamEq(e.settings.clone()),
-                NodeKind::Delay { time_ms, feedback, mix } => {
-                    SavedKind::Delay { time_ms: *time_ms, feedback: *feedback, mix: *mix }
-                }
-                NodeKind::Mixer { gains_db } => SavedKind::Mixer { gains_db: *gains_db },
-                NodeKind::Limiter { p, .. } => SavedKind::Limiter(*p),
-                NodeKind::Visual(v) => SavedKind::Visual(v.settings()),
-                NodeKind::Audio2Midi(a) => SavedKind::Audio2Midi { config: a.config, dest: a.want.clone() },
-                NodeKind::MidiIn(m) => SavedKind::MidiIn { port: m.want.clone() },
-                NodeKind::MidiOut(m) => SavedKind::MidiOut { port: m.want.clone() },
-                NodeKind::MidiMonitor(_) => SavedKind::MidiMonitor,
-                NodeKind::CSynth(c) => SavedKind::CSynth(c.settings.clone()),
-                NodeKind::Lyrics(l) => SavedKind::Lyrics(l.settings.clone()),
-                NodeKind::Video(v) => SavedKind::Video(v.settings.clone()),
-                NodeKind::Plugin(p) => {
-                    let _g = guard::enter(&p.tag);
-                    let state = p.instance.save_state().map(|b| BASE64.encode(b));
-                    let info = p.info();
-                    SavedKind::Plugin {
-                        format: info.format,
-                        path: info.path.clone(),
-                        id: info.id.clone(),
-                        name: info.name.clone(),
-                        bypass: p.bypass,
-                        editor: p.editor.is_some(),
-                        state,
-                    }
-                }
-            };
-            index.insert(id, nodes.len());
-            nodes.push(SavedNode { pos: n.pos.into(), open: n.open, kind });
-        }
-        let wires = self
-            .snarl
-            .wires()
-            .filter_map(|(o, i)| Some([*index.get(&o.node)?, o.output, *index.get(&i.node)?, i.input]))
-            .collect();
-        SavedGraph { nodes, wires }
+    /// The whole graph, groups included, whichever is shown.
+    fn save_graph(&mut self) -> SavedGraph {
+        self.with_root(|app| save_nodes(&app.snarl, None))
     }
 
     /// Replaces the graph with `g`. Nodes that can't be recreated (a plugin that's gone) are
@@ -648,7 +709,7 @@ impl App {
     /// kept relative to the group's top-left corner.
     fn save_node_preset(&mut self, name: &str, selected: &[NodeId]) {
         let only: HashSet<NodeId> = selected.iter().copied().filter(|id| self.snarl.get_node(*id).is_some()).collect();
-        let mut g = self.save_nodes(Some(&only));
+        let mut g = save_nodes(&self.snarl, Some(&only));
         let min = g.nodes.iter().fold([f32::INFINITY; 2], |m, n| [m[0].min(n.pos[0]), m[1].min(n.pos[1])]);
         for n in &mut g.nodes {
             n.pos = [n.pos[0] - min[0], n.pos[1] - min[1]];
@@ -694,7 +755,36 @@ impl App {
                 }
                 SavedKind::Plugin { .. } => self.restore_plugin(&n.kind, pos),
                 SavedKind::Vst3 { .. } => n.kind.upgraded().and_then(|k| self.restore_plugin(&k, pos)),
-                // There's only one Player; a node preset's wires from it go to the one there is.
+                SavedKind::Group { name, graph: inside } => {
+                    let id = self.add_node(NodeKind::Group(Box::new(graph::GroupNode::new(name.clone()))), pos);
+                    if let Some(id) = id
+                        && self.enter_group(id)
+                    {
+                        self.insert_graph(inside, egui::Vec2::ZERO);
+                        self.leave_group();
+                    }
+                    id
+                }
+                // Only a group has an input and an output node, one of each; a node preset's wires
+                // from them go to the ones there are.
+                SavedKind::GroupIn | SavedKind::GroupOut => {
+                    let input = matches!(n.kind, SavedKind::GroupIn);
+                    let is_it = |k: &NodeKind| if input { matches!(k, NodeKind::GroupIn) } else { matches!(k, NodeKind::GroupOut) };
+                    let existing = self.snarl.node_ids().find(|(_, x)| is_it(&x.kind)).map(|(id, _)| id);
+                    let id = match existing {
+                        Some(id) => Some(id),
+                        None if self.in_group() => self.add_node(if input { NodeKind::GroupIn } else { NodeKind::GroupOut }, pos),
+                        None => None,
+                    };
+                    ids.push(id);
+                    continue;
+                }
+                // There's only one Player, in the main graph.
+                SavedKind::Player if self.in_group() => {
+                    ids.push(None);
+                    continue;
+                }
+                // A node preset's wires from it go to the one there is.
                 SavedKind::Player if self.snarl.nodes().any(|x| matches!(x.kind, NodeKind::Player)) => {
                     let existing = self.snarl.node_ids().find(|(_, n)| matches!(n.kind, NodeKind::Player)).map(|(id, _)| id);
                     ids.push(existing);
@@ -740,7 +830,12 @@ impl App {
                         SavedKind::CSynth(s) => NodeKind::CSynth(Box::new(CSynthNode::new(s.clone(), self.sample_rate))),
                         SavedKind::Lyrics(s) => NodeKind::Lyrics(Box::new(LyricsNode::new(s.clone()))),
                         SavedKind::Video(s) => NodeKind::Video(Box::new(VideoNode::new(s.clone()))),
-                        SavedKind::MidiFile(_) | SavedKind::Plugin { .. } | SavedKind::Vst3 { .. } => unreachable!(),
+                        SavedKind::MidiFile(_)
+                        | SavedKind::Plugin { .. }
+                        | SavedKind::Vst3 { .. }
+                        | SavedKind::Group { .. }
+                        | SavedKind::GroupIn
+                        | SavedKind::GroupOut => unreachable!(),
                     };
                     self.add_node(kind, pos)
                 }
@@ -797,7 +892,7 @@ impl App {
             e.send(Command::SetParam(eid, 0, 1.0));
         }
         if *editor {
-            self.pending_editors.push(id);
+            self.pending_editors.push(eid);
         }
         Some(id)
     }
@@ -891,9 +986,12 @@ impl App {
 
     fn reopen_editors(&mut self) {
         let Some(xid) = self.host_xid else { return };
-        for id in std::mem::take(&mut self.pending_editors) {
-            let Some(n) = self.snarl.get_node_info_mut(id) else { continue };
-            if let NodeKind::Plugin(p) = &mut n.value.kind {
+        let want = std::mem::take(&mut self.pending_editors);
+        for n in every_node(&mut self.snarl, &mut self.outer) {
+            if !want.contains(&n.eid) {
+                continue;
+            }
+            if let NodeKind::Plugin(p) = &mut n.kind {
                 let _g = guard::enter(&p.tag);
                 if let Err(e) = p.open_editor(Placement::Embedded(xid)) {
                     log::warn!("{e:#}");
@@ -942,7 +1040,8 @@ impl App {
             return None;
         };
         if let Some(e) = &mut self.engine {
-            let slot = NodeSlot::new(proc, kind.audio_inputs(), kind.audio_outputs()).with_tag(kind.tag());
+            let (ins, outs) = kind.engine_ports();
+            let slot = NodeSlot::new(proc, ins, outs).with_tag(kind.tag());
             e.send(Command::AddNode(eid, slot));
         }
         self.dirty = true;
@@ -1011,7 +1110,8 @@ impl App {
         self.save_session();
         self.keep_selection(true);
         self.extensions = Extensions::default();
-        for (_, node) in self.snarl.nodes_ids_mut() {
+        while self.leave_group() {}
+        for node in every_node(&mut self.snarl, &mut self.outer) {
             if let NodeKind::Plugin(p) = &mut node.kind {
                 let _g = guard::enter(&p.tag);
                 p.editor = None;
@@ -1022,40 +1122,54 @@ impl App {
             let _g = guard::enter(&p.tag.clone());
             drop(p);
         }
-        let ids: Vec<NodeId> = self.snarl.node_ids().map(|(id, _)| id).collect();
-        for id in ids {
-            let node = self.snarl.remove_node(id);
-            let _g = node.kind.tag().map(|t| guard::enter(&t));
-            drop(node);
-        }
+        drop_nodes(std::mem::take(&mut self.snarl));
     }
 
     fn remove_node(&mut self, id: NodeId) {
         let node = self.snarl.remove_node(id);
         // Engine must stop scheduling the node before the slot is removed.
         self.recompile();
-        let mut plugin = match node.kind {
+        self.retire(node);
+    }
+
+    /// Takes the nodes of a graph no longer in the tree off the engine.
+    fn retire_all(&mut self, mut snarl: Snarl<GraphNode>) {
+        let ids: Vec<NodeId> = snarl.node_ids().map(|(id, _)| id).collect();
+        for id in ids {
+            self.retire(snarl.remove_node(id));
+        }
+    }
+
+    /// Takes a node that's out of the graph (and the schedule) off the engine, and what's in it
+    /// if it's a group.
+    fn retire(&mut self, node: GraphNode) {
+        let GraphNode { eid, kind } = node;
+        let mut plugin = match kind {
             NodeKind::Plugin(mut p) => {
                 let _g = guard::enter(&p.tag);
                 p.editor = None;
                 Some(p)
             }
+            NodeKind::Group(g) => {
+                self.retire_all(g.snarl);
+                None
+            }
             _ => None,
         };
         match &mut self.engine {
             Some(e) => {
-                e.send(Command::RemoveNode(node.eid));
+                e.send(Command::RemoveNode(eid));
                 if let Some(p) = plugin.take() {
-                    self.pending_teardown.insert(node.eid, p);
+                    self.pending_teardown.insert(eid, p);
                 }
             }
-            None => self.ids.free(node.eid),
+            None => self.ids.free(eid),
         }
     }
 
     fn recompile(&mut self) {
         self.dirty = false;
-        let schedule = graph::compile(&self.snarl);
+        let schedule = self.with_root(|app| graph::compile(&app.snarl));
         if let Some(e) = &mut self.engine {
             e.send(Command::SetSchedule(Box::new(schedule)));
         }
@@ -1089,16 +1203,20 @@ impl App {
     /// plugin restarts once it's back, in [`finish_restart`](Self::finish_restart).
     fn begin_restart(&mut self, eid: u32) {
         let Some(e) = &mut self.engine else { return };
-        let Some(node) = self.snarl.nodes().find(|n| n.eid == eid) else { return };
+        let Some(node) = every_node(&mut self.snarl, &mut self.outer).into_iter().find(|n| n.eid == eid) else { return };
         if !self.restarting.insert(eid) {
             return;
         }
-        let slot = NodeSlot::new(Box::new(MidiBridge::default()), node.kind.audio_inputs(), node.kind.audio_outputs());
+        let (ins, outs) = node.kind.engine_ports();
+        let slot = NodeSlot::new(Box::new(MidiBridge::default()), ins, outs);
         e.send(Command::ReplaceNode(eid, slot));
     }
 
     fn finish_restart(&mut self, eid: u32) {
-        let Some(id) = self.snarl.node_ids().find(|(_, n)| n.eid == eid).map(|(id, _)| id) else { return };
+        self.at_eid(eid, |app, id| app.restart_plugin(eid, id));
+    }
+
+    fn restart_plugin(&mut self, eid: u32, id: NodeId) {
         let NodeKind::Plugin(p) = &mut self.snarl[id].kind else { return };
         let name = p.info().name.clone();
         let tag = p.tag.clone();
@@ -1290,7 +1408,7 @@ impl App {
 
         let mut closed = Vec::new();
         let mut restart = Vec::new();
-        for (_, node) in self.snarl.nodes_ids_mut() {
+        for node in every_node(&mut self.snarl, &mut self.outer) {
             match &mut node.kind {
                 NodeKind::Plugin(p) => {
                     let _g = guard::enter(&p.tag);
@@ -1451,7 +1569,7 @@ impl App {
             ui.weak(format!("→ {effective:.2}×")).on_hover_text("with the Playback Rate Shift nodes (0.5–2× at most)");
         }
         if r.changed() || r.secondary_clicked() {
-            let nodes = graph::rate_shift(&mut self.snarl);
+            let nodes = self.with_root(|app| graph::rate_shift(&mut app.snarl));
             self.player.set_rate(self.rate * nodes);
         }
     }
@@ -1726,7 +1844,35 @@ impl App {
 
     /// The node graph (a tab of the dock).
     fn graph_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        let has_player = self.snarl.nodes().any(|n| matches!(n.kind, NodeKind::Player));
+        if self.in_group() {
+            // Where we are: the main graph, then each group entered; click one to go back out.
+            ui.horizontal(|ui| {
+                if ui.button("⬅ Back").on_hover_text("out of this group").clicked() {
+                    actions.push(Action::Leave(self.outer.len() - 1));
+                }
+                if ui.link("Graph").clicked() {
+                    actions.push(Action::Leave(0));
+                }
+                let depth = self.outer.len();
+                for (k, level) in self.outer.iter().enumerate() {
+                    ui.label("›");
+                    let name = level.snarl.get_node(level.group).map(|n| n.kind.title()).unwrap_or_default();
+                    if k + 1 == depth {
+                        ui.strong(name);
+                    } else if ui.link(name).clicked() {
+                        actions.push(Action::Leave(k + 1));
+                    }
+                }
+            });
+        }
+        let in_group = self.in_group();
+        let has_player = in_group || self.snarl.nodes().any(|n| matches!(n.kind, NodeKind::Player));
+        let group_io = (
+            self.snarl.nodes().any(|n| matches!(n.kind, NodeKind::GroupIn)),
+            self.snarl.nodes().any(|n| matches!(n.kind, NodeKind::GroupOut)),
+        );
+        // Each level keeps its own pan, zoom and selection.
+        let salt = egui::Id::new("graph").with(self.group_path());
         // The graph pans on the wheel before node bodies see it, so take it out first.
         let scroll = if self.capture_scroll {
             ui.ctx().input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta))
@@ -1754,6 +1900,8 @@ impl App {
             zooming: ui.input(|i| (i.zoom_delta() - 1.0).abs() > 1e-4),
             reset_zoom: std::mem::take(&mut self.reset_zoom),
             node_presets: &self.node_presets,
+            in_group,
+            group_io,
         };
         // Selectable node titles would swallow drags meant to move the node.
         ui.style_mut().interaction.selectable_labels = false;
@@ -1762,8 +1910,8 @@ impl App {
         if !std::mem::replace(&mut self.graph_shown, true) {
             style.max_scale = Some(1.0);
         }
-        SnarlWidget::new().id_salt("graph").style(style).show(&mut self.snarl, &mut viewer, ui);
-        self.selected = SnarlWidget::new().id_salt("graph").get_selected_nodes(ui);
+        SnarlWidget::new().id_salt(salt).style(style).show(&mut self.snarl, &mut viewer, ui);
+        self.selected = SnarlWidget::new().id_salt(salt).get_selected_nodes(ui);
         // Zoom readout; clicking it goes back to 100% (where text is sharp).
         let zoom = viewer.zoom;
         self.zoom = zoom;
@@ -2117,7 +2265,7 @@ impl App {
     }
 
     fn param_windows(&mut self, ctx: &egui::Context) {
-        for (_, node) in self.snarl.nodes_ids_mut() {
+        for node in every_node(&mut self.snarl, &mut self.outer) {
             let eid = node.eid;
             let NodeKind::Plugin(p) = &mut node.kind else { continue };
             if !p.show_params {
@@ -2195,7 +2343,7 @@ impl eframe::App for App {
             self.library.add_play(path);
         }
         self.info.sample(status.path.as_deref(), self.player.is_playing(), || self.player.live_bitrate());
-        let nodes = graph::rate_shift(&mut self.snarl);
+        let nodes = self.with_root(|app| graph::rate_shift(&mut app.snarl));
         self.player.set_rate(self.rate * nodes);
         self.discord.update(&status, self.player.is_playing(), self.player.position(), f64::from(self.rate * nodes));
         self.update_extensions();
@@ -2328,7 +2476,7 @@ impl eframe::App for App {
         // Move embedded editors over the space their nodes reserved this frame (none when the
         // graph tab is behind another), less what egui draws over them: native views sit
         // above everything the app draws, so they are cut out where they should be covered.
-        for (_, node) in self.snarl.nodes_ids_mut() {
+        for node in every_node(&mut self.snarl, &mut self.outer) {
             let eid = node.eid;
             let NodeKind::Plugin(p) = &mut node.kind else { continue };
             let Some(ed) = &mut p.editor else { continue };
@@ -2339,7 +2487,7 @@ impl eframe::App for App {
             let _g = guard::enter(&p.tag);
             ed.place(spot.as_ref());
         }
-        for node in self.snarl.nodes_mut() {
+        for node in every_node(&mut self.snarl, &mut self.outer) {
             if let NodeKind::Video(v) = &mut node.kind {
                 v.window(&ctx, &self.player, node.eid);
             }
@@ -2350,6 +2498,18 @@ impl eframe::App for App {
                 Action::Add(kind, pos) => {
                     self.add_node(kind, pos);
                 }
+                Action::AddGroup(pos) => {
+                    self.add_group(pos);
+                }
+                Action::OpenGroup(id) => {
+                    self.enter_group(id);
+                    self.graph_shown = false;
+                }
+                Action::Leave(depth) => {
+                    while self.outer.len() > depth && self.leave_group() {}
+                    self.graph_shown = false;
+                }
+                Action::LoadIntoGroup(id, name) => self.load_into_group(id, &name),
                 Action::AddPlugin(info, pos) => {
                     self.add_plugin(&info, pos);
                 }
@@ -2379,6 +2539,77 @@ impl eframe::App for App {
             });
         ctx.request_repaint_after(Duration::from_millis(if animate { 16 } else { 30 }));
     }
+}
+
+/// Drops every node of `snarl`, groups' insides too, each marked for crash reports.
+fn drop_nodes(mut snarl: Snarl<GraphNode>) {
+    let ids: Vec<NodeId> = snarl.node_ids().map(|(id, _)| id).collect();
+    for id in ids {
+        let node = snarl.remove_node(id);
+        if let NodeKind::Group(g) = node.kind {
+            drop_nodes(g.snarl);
+            continue;
+        }
+        let _g = node.kind.tag().map(|t| guard::enter(&t));
+        drop(node);
+    }
+}
+
+/// The nodes of `snarl` in `only` (all when `None`), groups with what's inside them, and the
+/// wires between them.
+fn save_nodes(snarl: &Snarl<GraphNode>, only: Option<&HashSet<NodeId>>) -> SavedGraph {
+    let mut index = HashMap::new();
+    let mut nodes = Vec::new();
+    for (id, n) in snarl.nodes_ids_data() {
+        if only.is_some_and(|o| !o.contains(&id)) {
+            continue;
+        }
+        let kind = match &n.value.kind {
+            NodeKind::Player => SavedKind::Player,
+            NodeKind::Output { volume_db, .. } => SavedKind::Output { volume_db: *volume_db },
+            NodeKind::Gain { db } => SavedKind::Gain { db: *db },
+            NodeKind::Pan { pan } => SavedKind::Pan { pan: *pan },
+            NodeKind::RateShift { rate, bypass, .. } => SavedKind::RateShift { rate: *rate, bypass: *bypass },
+            NodeKind::Eq(e) => SavedKind::ParamEq(e.settings.clone()),
+            NodeKind::Delay { time_ms, feedback, mix } => {
+                SavedKind::Delay { time_ms: *time_ms, feedback: *feedback, mix: *mix }
+            }
+            NodeKind::Mixer { gains_db } => SavedKind::Mixer { gains_db: *gains_db },
+            NodeKind::Limiter { p, .. } => SavedKind::Limiter(*p),
+            NodeKind::Visual(v) => SavedKind::Visual(v.settings()),
+            NodeKind::Audio2Midi(a) => SavedKind::Audio2Midi { config: a.config, dest: a.want.clone() },
+            NodeKind::MidiIn(m) => SavedKind::MidiIn { port: m.want.clone() },
+            NodeKind::MidiOut(m) => SavedKind::MidiOut { port: m.want.clone() },
+            NodeKind::MidiMonitor(_) => SavedKind::MidiMonitor,
+            NodeKind::CSynth(c) => SavedKind::CSynth(c.settings.clone()),
+            NodeKind::Lyrics(l) => SavedKind::Lyrics(l.settings.clone()),
+            NodeKind::Video(v) => SavedKind::Video(v.settings.clone()),
+            NodeKind::Group(g) => SavedKind::Group { name: g.name.clone(), graph: save_nodes(&g.snarl, None) },
+            NodeKind::GroupIn => SavedKind::GroupIn,
+            NodeKind::GroupOut => SavedKind::GroupOut,
+            NodeKind::Plugin(p) => {
+                let _g = guard::enter(&p.tag);
+                let state = p.instance.save_state().map(|b| BASE64.encode(b));
+                let info = p.info();
+                SavedKind::Plugin {
+                    format: info.format,
+                    path: info.path.clone(),
+                    id: info.id.clone(),
+                    name: info.name.clone(),
+                    bypass: p.bypass,
+                    editor: p.editor.is_some(),
+                    state,
+                }
+            }
+        };
+        index.insert(id, nodes.len());
+        nodes.push(SavedNode { pos: n.pos.into(), open: n.open, kind });
+    }
+    let wires = snarl
+        .wires()
+        .filter_map(|(o, i)| Some([*index.get(&o.node)?, o.output, *index.get(&i.node)?, i.input]))
+        .collect();
+    SavedGraph { nodes, wires }
 }
 
 // ---------------------------------------------------------------------------
@@ -2468,6 +2699,9 @@ struct Viewer<'a> {
     zooming: bool,
     reset_zoom: bool,
     node_presets: &'a [String],
+    /// The graph shown is a group's inside, and whether it has its input and output nodes.
+    in_group: bool,
+    group_io: (bool, bool),
 }
 
 impl Viewer<'_> {
@@ -2574,7 +2808,11 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
     }
 
     fn has_body(&mut self, node: &GraphNode) -> bool {
-        !matches!(node.kind, NodeKind::Player) || self.player.is_midi()
+        match node.kind {
+            NodeKind::Player => self.player.is_midi(),
+            NodeKind::GroupIn | NodeKind::GroupOut => false,
+            _ => true,
+        }
     }
 
     fn show_body(
@@ -2588,6 +2826,29 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         let eid = snarl[node].eid;
         let mut sends: Vec<(usize, f32)> = Vec::new();
         ui.vertical(|ui| match &mut snarl[node].kind {
+            NodeKind::Group(g) => {
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut g.name).desired_width(130.0)).on_hover_text("the group's name");
+                    if ui.button("Open").on_hover_text("show what's inside, to edit it").clicked() {
+                        self.actions.push(Action::OpenGroup(node));
+                    }
+                });
+                let inside = g.snarl.nodes().filter(|n| !matches!(n.kind, NodeKind::GroupIn | NodeKind::GroupOut)).count();
+                ui.weak(format!("{inside} node{} inside", if inside == 1 { "" } else { "s" }));
+                if !self.node_presets.is_empty() {
+                    ui.menu_button("Add a node preset inside", |ui| {
+                        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                            for name in self.node_presets {
+                                if ui.button(name).clicked() {
+                                    self.actions.push(Action::LoadIntoGroup(node, name.clone()));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
+                }
+            }
+            NodeKind::GroupIn | NodeKind::GroupOut => {}
             NodeKind::Player => self.player.midi().ui(ui),
             NodeKind::Visual(v) => v.show(ui, self.sample_rate),
             NodeKind::Audio2Midi(a) => audio2midi_body(ui, a, eid, self.sample_rate),
@@ -2791,6 +3052,12 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         if !self.has_player {
             add(ui, "Player", || NodeKind::Player);
         }
+        if self.in_group && !self.group_io.0 {
+            add(ui, "Group input", || NodeKind::GroupIn);
+        }
+        if self.in_group && !self.group_io.1 {
+            add(ui, "Group output", || NodeKind::GroupOut);
+        }
         add(ui, "Output", NodeKind::output);
         add(ui, "Gain", || NodeKind::Gain { db: 0.0 });
         add(ui, "Pan", || NodeKind::Pan { pan: 0.0 });
@@ -2801,6 +3068,10 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         add(ui, "Kazu Limiter", NodeKind::limiter);
         add(ui, "Lyrics", || NodeKind::Lyrics(Box::new(LyricsNode::new(Default::default()))));
         add(ui, "Video", || NodeKind::Video(Box::new(VideoNode::new(Default::default()))));
+        if ui.button("Group").on_hover_text("a node with a graph inside; open it to add nodes and wire them").clicked() {
+            self.actions.push(Action::AddGroup(pos));
+            ui.close();
+        }
         ui.menu_button("MIDI", |ui| {
             let mut add = |ui: &mut egui::Ui, label: &str, make: &dyn Fn() -> NodeKind| {
                 if ui.button(label).clicked() {
@@ -2847,8 +3118,12 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         _inputs: &[InPin],
         _outputs: &[OutPin],
         ui: &mut egui::Ui,
-        _snarl: &mut Snarl<GraphNode>,
+        snarl: &mut Snarl<GraphNode>,
     ) {
+        if matches!(snarl[node].kind, NodeKind::Group(_)) && ui.button("Open").clicked() {
+            self.actions.push(Action::OpenGroup(node));
+            ui.close();
+        }
         if ui.button("Remove").clicked() {
             self.actions.push(Action::Remove(node));
             ui.close();
