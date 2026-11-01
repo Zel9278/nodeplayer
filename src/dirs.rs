@@ -8,6 +8,29 @@
 
 use std::path::{Path, PathBuf};
 
+/// Pure path construction for an explicit profile. Does not mutate process state or create files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Paths {
+    pub config: PathBuf,
+    pub cache: PathBuf,
+    pub state: PathBuf,
+    pub data: PathBuf,
+}
+impl Paths {
+    pub fn under(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref();
+        Self {
+            config: root.join("config"),
+            cache: root.join("cache"),
+            state: root.join("state"),
+            data: root.join("data"),
+        }
+    }
+}
+fn explicit() -> Option<Paths> {
+    crate::runtime::get().data_root.as_ref().map(Paths::under)
+}
+
 /// The user's home folder.
 pub fn home() -> Option<PathBuf> {
     #[cfg(unix)]
@@ -37,6 +60,9 @@ fn known(var: &str, fallback: &str) -> Option<PathBuf> {
 /// Settings: `~/.config/nodeplayer`, `~/Library/Application Support/nodeplayer`,
 /// `%APPDATA%\nodeplayer`.
 pub fn config() -> Option<PathBuf> {
+    if let Some(paths) = explicit() {
+        return Some(paths.config);
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     return xdg("XDG_CONFIG_HOME", ".config");
     #[cfg(target_os = "macos")]
@@ -48,6 +74,9 @@ pub fn config() -> Option<PathBuf> {
 /// Throwaway files: `~/.cache/nodeplayer`, `~/Library/Caches/nodeplayer`,
 /// `%LOCALAPPDATA%\nodeplayer\cache`.
 pub fn cache() -> Option<PathBuf> {
+    if let Some(paths) = explicit() {
+        return Some(paths.cache);
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     return xdg("XDG_CACHE_HOME", ".cache");
     #[cfg(target_os = "macos")]
@@ -59,6 +88,9 @@ pub fn cache() -> Option<PathBuf> {
 /// State worth keeping but not configuration, like play counts: `~/.local/state/nodeplayer`,
 /// `~/Library/Application Support/nodeplayer/state`, `%APPDATA%\nodeplayer\state`.
 pub fn state() -> Option<PathBuf> {
+    if let Some(paths) = explicit() {
+        return Some(paths.state);
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     return xdg("XDG_STATE_HOME", ".local/state");
     #[cfg(not(all(unix, not(target_os = "macos"))))]
@@ -69,6 +101,9 @@ pub fn state() -> Option<PathBuf> {
 /// `~/.local/share/nodeplayer`, `~/Library/Application Support/nodeplayer`,
 /// `%LOCALAPPDATA%\nodeplayer`.
 pub fn data() -> Option<PathBuf> {
+    if let Some(paths) = explicit() {
+        return Some(paths.data);
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     return xdg("XDG_DATA_HOME", ".local/share");
     #[cfg(target_os = "macos")]
@@ -151,6 +186,18 @@ mod tests {
             assert!(d.starts_with(&home), "{} isn't under {}", d.display(), home.display());
             assert!(d.to_string_lossy().contains("nodeplayer"));
         }
+    }
+
+    #[test]
+    fn explicit_folders_are_separate_and_pure() {
+        let root = Path::new("fixture profile/日本語");
+        let paths = Paths::under(root);
+        assert_eq!(paths.config, root.join("config"));
+        assert_eq!(paths.cache, root.join("cache"));
+        assert_eq!(paths.state, root.join("state"));
+        assert_eq!(paths.data, root.join("data"));
+        assert_ne!(paths.config, paths.state);
+        assert_ne!(paths.cache, paths.data);
     }
 
     #[test]
