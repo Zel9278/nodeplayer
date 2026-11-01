@@ -105,7 +105,7 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
                     Duration::from_secs(35)
                 };
                 if watch.lock().map_or(true, |t| t.elapsed() > timeout) {
-                    std::process::exit(74);
+                    unsafe { libc::_exit(74) };
                 }
             }
         })?;
@@ -144,6 +144,7 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
     let mut editor: Option<Box<dyn Editor>> = None;
     let mut editor_id = 0;
     let initial_metadata = metadata(instance.as_ref(), &editor, editor_id)?;
+    let mut metadata_cache = initial_metadata.clone();
     protocol::send(
         &mut socket,
         &Reply {
@@ -186,8 +187,18 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
             display: None,
             error: None,
         };
+        let command = req.command.clone();
+        let refresh_metadata = matches!(
+            &command,
+            Command::SetParam(_, _)
+                | Command::Load(_)
+                | Command::Open { .. }
+                | Command::Place(_, _)
+                | Command::Zoom(_, _)
+                | Command::Close(_)
+        );
         let result: Result<()> = (|| {
-            match req.command {
+            match command {
                 Command::Poll => {}
                 Command::SetParam(id, v) => {
                     if !v.is_finite() {
@@ -218,15 +229,13 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
                     loaded?;
                 }
                 Command::Checkpoint => {
-                    park(&ctl, true)?;
-                    map.invalidate();
-                    // save_state may hang: supervisor will kill/reap, UI uses previous cache.
-                    reply.state = instance.save_state().filter(|b| b.len() <= MAX_STATE);
-                    let proc = instance.restart(init.sr as f64, crate::engine::MAX_BLOCK)?;
-                    audio_tx
-                        .send_timeout(AudioMessage::Replace(proc), Duration::from_secs(1))
-                        .map_err(|_| anyhow::anyhow!("child audio replacement queue timeout"))?;
-                    resume(&ctl)?;
+                    // The command loop is the plugin main thread; CLAP/VST3 state APIs
+                    // are main-thread interfaces and do not require taking DSP offline.
+                    reply.state = instance.save_state();
+                    if reply.state.as_ref().is_some_and(|b| b.len() > MAX_STATE) {
+                        reply.state = None;
+                        bail!("state exceeds limit")
+                    }
                 }
                 Command::Open { token, placement } => {
                     if token == 0 || token <= editor_id {
@@ -267,7 +276,8 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
                     return Ok(());
                 }
             }
-            if instance.wants_restart() {
+            let restart = instance.wants_restart();
+            if restart {
                 park(&ctl, true)?;
                 map.invalidate();
                 let proc = instance.restart(init.sr as f64, crate::engine::MAX_BLOCK)?;
@@ -276,7 +286,22 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
                     .map_err(|_| anyhow::anyhow!("child audio replacement queue timeout"))?;
                 resume(&ctl)?;
             }
-            reply.metadata = Some(metadata(instance.as_ref(), &editor, editor_id)?);
+            // Poll replies reuse the last snapshot. Commands that can change
+            // parameter displays, latency, or editor state refresh it once.
+            if restart || refresh_metadata || matches!(&req.command, Command::Poll) {
+                let changed = if matches!(&req.command, Command::Poll) {
+                    metadata_changed(instance.as_ref(), &editor, editor_id, &metadata_cache)
+                } else {
+                    true
+                };
+                if changed {
+                    let next_metadata = metadata(instance.as_ref(), &editor, editor_id)?;
+                    if serde_json::to_vec(&next_metadata)? != serde_json::to_vec(&metadata_cache)? {
+                        metadata_cache = next_metadata;
+                        reply.metadata = Some(metadata_cache.clone());
+                    }
+                }
+            }
             Ok(())
         })();
         if let Err(e) = result {
@@ -290,6 +315,27 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
             bail!("child audio thread failed")
         }
     }
+}
+fn metadata_changed(
+    i: &dyn Instance,
+    e: &Option<Box<dyn Editor>>,
+    editor_id: u64,
+    cached: &Metadata,
+) -> bool {
+    if i.params().len() != cached.values.len()
+        || i.latency() != cached.latency
+        || i.midi_ports() != cached.midi
+        || i.has_editor() != cached.editor
+        || e.is_some() != cached.editor_open
+        || e.as_ref().map(|e| e.size()).unwrap_or((640, 480)) != cached.editor_size
+        || editor_id != cached.editor_id
+    {
+        return true;
+    }
+    i.params()
+        .iter()
+        .zip(&cached.values)
+        .any(|(p, (id, value, _))| p.id != *id || i.param_value(p.id) != *value)
 }
 fn metadata(i: &dyn Instance, e: &Option<Box<dyn Editor>>, editor_id: u64) -> Result<Metadata> {
     if i.params().len() > MAX_PARAMS {
