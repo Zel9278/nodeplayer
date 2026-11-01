@@ -601,7 +601,7 @@ fn gfx_thread(fx: Arc<Fx>, shared: Arc<GfxShared>) {
         drop(_running);
         if changed || fresh {
             rgba.clear();
-            rgba.extend(pixels.chunks_exact(4).flat_map(|px| [px[2], px[1], px[0], 255]));
+            rgba.extend(pixels.as_chunks::<4>().0.iter().flat_map(|px| [px[2], px[1], px[0], 255]));
             let mut st = shared.lock();
             std::mem::swap(&mut st.frame, &mut rgba);
             st.frame_size = size;

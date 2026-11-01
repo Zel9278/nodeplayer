@@ -601,8 +601,8 @@ mod tests {
     fn csynth_dense_load() {
         let shared = Arc::new(Shared::default());
         let mut set: SampleSet = vec![None; 128];
-        for k in 21..109 {
-            set[k] = Some(Arc::new(csynth::Sample::new(vec![vec![0.3; 96_000], vec![0.3; 96_000]])));
+        for sample in &mut set[21..109] {
+            *sample = Some(Arc::new(csynth::Sample::new(vec![vec![0.3; 96_000], vec![0.3; 96_000]])));
         }
         *shared.next.lock().unwrap() = Some(Box::new(PianoProcessor::new(set, 48_000)));
         let node = CSynthNode { settings: CSynthSettings::default(), shared, rate: 48_000 };

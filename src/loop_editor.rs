@@ -184,7 +184,7 @@ impl Peaks {
     }
 
     fn push(&mut self, stereo: &[f32]) {
-        for fr in stereo.chunks_exact(2) {
+        for fr in stereo.as_chunks::<2>().0 {
             self.partial.add(fr[0], fr[1]);
             self.partial_len += 1;
             if self.partial_len == self.bucket {
