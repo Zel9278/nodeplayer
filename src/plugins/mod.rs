@@ -492,6 +492,20 @@ pub fn scan_isolated(format: Format, path: &Path) -> Result<Vec<PluginInfo>> {
     if format == Format::Jsfx {
         return crate::jsfx::classes(path);
     }
+    let isolation = crate::runtime::get().experimental_plugin_isolation;
+    if !isolation {
+        let out = std::process::Command::new(std::env::current_exe()?)
+            .arg("--scan-plugin")
+            .arg(format.label())
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()?;
+        if !out.status.success() {
+            bail!("scanner exited with {}", out.status);
+        }
+        return Ok(String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| PluginInfo::from_line(l, path)).collect());
+    }
     use std::io::Read;
     use std::time::{Duration, Instant};
     // File-backed capture avoids both pipe backpressure and an orphaned reader thread
@@ -528,12 +542,12 @@ pub fn scan_isolated(format: Format, path: &Path) -> Result<Vec<PluginInfo>> {
         .stdout(std::process::Stdio::from(output.try_clone()?))
         .stderr(std::process::Stdio::null())
         .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = isolation.then(|| Instant::now() + Duration::from_secs(30));
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if output.metadata()?.len() > 4 * 1024 * 1024 || Instant::now() >= deadline {
+        if (isolation && output.metadata()?.len() > 4 * 1024 * 1024) || deadline.is_some_and(|d| Instant::now() >= d) {
             let _ = child.kill();
             let _ = child.wait();
             drop(output);
@@ -551,9 +565,11 @@ pub fn scan_isolated(format: Format, path: &Path) -> Result<Vec<PluginInfo>> {
     use std::io::{Seek, SeekFrom};
     output.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
-    (&mut output)
-        .take(4 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
+    if isolation {
+        (&mut output).take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    } else {
+        output.read_to_end(&mut bytes)?;
+    }
     drop(output);
     drop(capture);
     if bytes.len() > 4 * 1024 * 1024 {

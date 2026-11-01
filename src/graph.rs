@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::engine::timing::{self, EdgeKey, EdgeKind, NodeSpec, NodeTiming, TimingLimits};
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use std::sync::Arc;
 
 use egui_snarl::{NodeId, Snarl};
@@ -406,12 +406,12 @@ impl Flat {
         }
         for (o, i) in snarl.wires() {
             let (from, to) = (&snarl[o.node], &snarl[i.node]);
-            ensure!(
-                o.output < from.kind.outputs() && i.input < to.kind.inputs(),
-                "invalid graph pin on {} -> {}",
-                from.eid,
-                to.eid
-            );
+            if o.output >= from.kind.outputs() || i.input >= to.kind.inputs() {
+                if enabled {
+                    anyhow::bail!("invalid graph pin on {} -> {}", from.eid, to.eid);
+                }
+                continue;
+            }
             // What leaves a group comes from the output node inside it.
             let src = match &from.kind {
                 NodeKind::Group(g) => match g.eid_of(|k| matches!(k, NodeKind::GroupOut)) {
@@ -424,7 +424,8 @@ impl Flat {
                 (false, false) => self.audio.push(((src, o.output as u32), (to.eid, i.input))),
                 (true, true) => self.midi.push((src, to.eid)),
                 // A plugin port change must fail compilation, not silently change the plan.
-                _ => anyhow::bail!("audio/MIDI port mismatch on {} -> {}", from.eid, to.eid),
+                _ if enabled => anyhow::bail!("audio/MIDI port mismatch on {} -> {}", from.eid, to.eid),
+                _ => continue,
             }
         }
         Ok(())
@@ -460,10 +461,38 @@ impl Flat {
             });
             *occurrence += 1;
         }
-        let analysis = timing::analyze(&self.nodes, &edges, enabled, limits)?;
+        let analysis = if enabled {
+            Some(timing::analyze(&self.nodes, &edges, true, limits)?)
+        } else {
+            None
+        };
+        let order = if let Some(analysis) = &analysis {
+            analysis.order.clone()
+        } else {
+            // Match the pre-PDC compiler: Kahn's sort simply leaves cyclic nodes out.
+            let mut indegree: HashMap<u32, usize> = self.nodes.iter().map(|n| (n.id, 0)).collect();
+            let mut outgoing: HashMap<u32, Vec<u32>> = HashMap::new();
+            for edge in &edges {
+                if indegree.contains_key(&edge.from) && indegree.contains_key(&edge.to) {
+                    *indegree.get_mut(&edge.to).unwrap() += 1;
+                    outgoing.entry(edge.from).or_default().push(edge.to);
+                }
+            }
+            let mut queue: std::collections::VecDeque<u32> = self.nodes.iter().map(|n| n.id).filter(|id| indegree[id] == 0).collect();
+            let mut order = Vec::with_capacity(self.nodes.len());
+            while let Some(id) = queue.pop_front() {
+                order.push(id);
+                for to in outgoing.get(&id).into_iter().flatten() {
+                    let count = indegree.get_mut(to).unwrap();
+                    *count -= 1;
+                    if *count == 0 { queue.push_back(*to); }
+                }
+            }
+            order
+        };
         let info: HashMap<u32, &NodeSpec> = self.nodes.iter().map(|node| (node.id, node)).collect();
         let mut schedule = Schedule::default();
-        for &eid in &analysis.order {
+        for &eid in &order {
             let node = info[&eid];
             let mut inputs = vec![Vec::new(); node.audio_inputs];
             for (src, (_, port)) in self.audio.iter().filter(|(_, (to, _))| *to == eid) {
@@ -486,7 +515,7 @@ impl Flat {
         }
         if enabled {
             schedule.timing = Some(crate::engine::compensation::TimingPlan::prepare(
-                &analysis,
+                analysis.as_ref().unwrap(),
                 limits,
                 &schedule.steps,
             )?);
@@ -599,15 +628,8 @@ mod tests {
         );
         wire(&mut snarl, a, 0, b, 0);
         wire(&mut snarl, b, 0, a, 0);
-        for enabled in [false, true] {
-            assert!(
-                compile_with_timing(&snarl, enabled)
-                    .err()
-                    .unwrap()
-                    .to_string()
-                    .contains("cycle")
-            );
-        }
+        assert!(compile_with_timing(&snarl, false).is_ok());
+        assert!(compile_with_timing(&snarl, true).err().unwrap().to_string().contains("cycle"));
         snarl.disconnect(
             OutPinId { node: b, output: 0 },
             InPinId { node: a, input: 0 },
