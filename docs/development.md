@@ -18,7 +18,9 @@ cargo run --release -- ~/Music   # starts with that folder listed
 - **Linux**: CMake, a C++ compiler, pkg-config, and the development files of ALSA, fontconfig,
   freetype, X11, xkbcommon and D-Bus. On Debian and Ubuntu:
   `sudo apt install cmake g++ pkg-config libasound2-dev libfontconfig1-dev libfreetype-dev libx11-dev libxkbcommon-dev libdbus-1-dev`.
-- **Windows**: cross-built from Linux with MinGW, as the release builds are: install
+- **Windows (MSVC)**: install the Visual Studio C++ build tools and CMake, use the
+  `x86_64-pc-windows-msvc` Rust toolchain, and run `cargo build` or `cargo run`.
+- **Windows (MinGW cross-build)**: release builds are cross-built from Linux: install
   `gcc-mingw-w64-x86-64` and `g++-mingw-w64-x86-64` (the posix-thread flavour, which ysfx needs),
   add the target with `rustup target add x86_64-pc-windows-gnu`, and run
   `cargo build --release --target x86_64-pc-windows-gnu`. The C++ runtime is linked in

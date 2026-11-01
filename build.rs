@@ -14,11 +14,28 @@ fn main() {
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
         .build_target("ysfx")
         .build();
-    println!("cargo:rustc-link-search=native={}/build", dst.display());
-    println!("cargo:rustc-link-lib=static=ysfx");
-    // What ysfx's graphics (LICE, and SWELL outside Windows) need from the system.
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let build_dir = dst.join("build");
+    let link_dir = if env == "msvc" {
+        let release_dir = build_dir.join("Release");
+        if release_dir.join("ysfx.lib").is_file() {
+            release_dir
+        } else if build_dir.join("ysfx.lib").is_file() {
+            build_dir
+        } else {
+            panic!(
+                "ysfx.lib was not found in {} or {}",
+                release_dir.display(),
+                build_dir.display()
+            );
+        }
+    } else {
+        build_dir
+    };
+    println!("cargo:rustc-link-search=native={}", link_dir.display());
+    println!("cargo:rustc-link-lib=static=ysfx");
+    // What ysfx's graphics (LICE, and SWELL outside Windows) need from the system.
     let libs: &[&str] = match (os.as_str(), env.as_str()) {
         ("windows", "msvc") => &["gdi32", "user32", "shell32", "comdlg32"],
         ("windows", _) => &["gdi32", "user32", "shell32", "comdlg32"],
