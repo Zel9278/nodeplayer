@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "name": "gui-null-output-smoke",
+  "mode": "gui",
+  "audio_output": "null",
+  "steps": [
+    { "action": "wait-event", "event": "app-ready", "timeout_ms": 10000 },
+    { "action": "finish" }
+  ],
+  "expected_events": ["run-started", "app-ready"]
+}

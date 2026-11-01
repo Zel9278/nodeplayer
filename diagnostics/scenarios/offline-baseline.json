@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "name": "offline-baseline",
+  "mode": "offline",
+  "audio_output": "null",
+  "offline": {
+    "sample_rate": 48000,
+    "block_sizes": [1, 127, 256, 511, 512, 1024],
+    "frames": 48000,
+    "delay_frames": 512,
+    "gain": 0.5,
+    "amplitude": 0.01,
+    "expected_impulse_frame": 512
+  },
+  "expected_events": ["run-started", "offline-ready", "offline-complete"]
+}
