@@ -45,6 +45,80 @@ pub struct PxRect {
     pub h: u32,
 }
 
+impl PxRect {
+    fn right(&self) -> i32 {
+        self.x + self.w as i32
+    }
+
+    fn bottom(&self) -> i32 {
+        self.y + self.h as i32
+    }
+
+    fn from_edges(x0: i32, y0: i32, x1: i32, y1: i32) -> Option<PxRect> {
+        (x1 > x0 && y1 > y0).then(|| PxRect { x: x0, y: y0, w: (x1 - x0) as u32, h: (y1 - y0) as u32 })
+    }
+
+    pub fn intersect(&self, o: &PxRect) -> Option<PxRect> {
+        Self::from_edges(self.x.max(o.x), self.y.max(o.y), self.right().min(o.right()), self.bottom().min(o.bottom()))
+    }
+
+    /// What is left of `self` outside `cut`: up to four rects (a band above, one below, and
+    /// the two sides between them).
+    pub fn minus(&self, cut: &PxRect) -> Vec<PxRect> {
+        let Some(c) = self.intersect(cut) else { return vec![*self] };
+        [
+            Self::from_edges(self.x, self.y, self.right(), c.y),
+            Self::from_edges(self.x, c.bottom(), self.right(), self.bottom()),
+            Self::from_edges(self.x, c.y, c.x, c.bottom()),
+            Self::from_edges(c.right(), c.y, self.right(), c.bottom()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+/// The parts of `area` that none of `covers` hide. A single rect can't describe an editor
+/// with a small dialog over its middle: that leaves four.
+pub fn uncovered(area: PxRect, covers: &[PxRect]) -> Vec<PxRect> {
+    let mut parts = vec![area];
+    for c in covers {
+        parts = parts.iter().flat_map(|p| p.minus(c)).collect();
+        if parts.is_empty() {
+            break;
+        }
+    }
+    parts
+}
+
+/// Where an embedded editor goes, in the parent window's coordinates: the rect its container
+/// takes (the editor cut to what the layout shows of it), where the editor's top-left corner
+/// is (outside `clip` when scrolled), and the parts of `clip` that nothing drawn above the
+/// editor covers. The container shows, and takes clicks, only there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spot {
+    pub clip: PxRect,
+    pub origin: (i32, i32),
+    pub visible: Vec<PxRect>,
+}
+
+impl Spot {
+    /// The editor's offset inside the container.
+    pub fn offset(&self) -> (i32, i32) {
+        (self.origin.0 - self.clip.x, self.origin.1 - self.clip.y)
+    }
+
+    /// Nothing covers any of it.
+    pub fn whole(&self) -> bool {
+        self.visible == [self.clip]
+    }
+
+    /// The visible parts relative to the container's top-left corner.
+    pub fn local(&self) -> impl Iterator<Item = PxRect> + '_ {
+        self.visible.iter().map(|r| PxRect { x: r.x - self.clip.x, y: r.y - self.clip.y, ..*r })
+    }
+}
+
 /// What happened to an editor's window since the last `HostWindow::poll`.
 pub enum WinEvent {
     /// The user closed a top-level editor window.
@@ -202,8 +276,8 @@ pub trait Editor {
     fn size(&self) -> (u32, u32);
     /// Asks the editor to draw at `factor` (graph zoom × display scale), if it can.
     fn set_zoom(&mut self, _factor: f32) {}
-    /// See [`window::HostWindow::place`].
-    fn place(&mut self, clip: Option<PxRect>, origin: (i32, i32));
+    /// Shows an embedded editor at `spot`, or hides it; see [`window::HostWindow::place`].
+    fn place(&mut self, spot: Option<&Spot>);
     /// Pumps the editor; returns `false` once the user closed its window.
     fn idle(&mut self) -> bool;
 }
@@ -432,6 +506,52 @@ pub fn save_cache(plugins: &[PluginInfo]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn r(x: i32, y: i32, w: u32, h: u32) -> PxRect {
+        PxRect { x, y, w, h }
+    }
+
+    fn area(parts: &[PxRect]) -> u64 {
+        parts.iter().map(|p| p.w as u64 * p.h as u64).sum()
+    }
+
+    #[test]
+    fn a_dialog_in_the_middle_leaves_four_parts() {
+        let editor = r(100, 100, 400, 300);
+        let parts = uncovered(editor, &[r(200, 150, 100, 50)]);
+        assert_eq!(parts.len(), 4);
+        assert_eq!(area(&parts), 400 * 300 - 100 * 50);
+        // None overlaps another or the dialog, and all lie inside the editor.
+        for (i, a) in parts.iter().enumerate() {
+            assert_eq!(a.intersect(&editor), Some(*a));
+            assert!(a.intersect(&r(200, 150, 100, 50)).is_none());
+            assert!(parts[i + 1..].iter().all(|b| a.intersect(b).is_none()));
+        }
+    }
+
+    #[test]
+    fn covers_cut_what_they_overlap() {
+        let editor = r(0, 0, 100, 100);
+        assert_eq!(uncovered(editor, &[]), vec![editor]);
+        assert_eq!(uncovered(editor, &[r(200, 0, 10, 10)]), vec![editor], "one beside it");
+        assert!(uncovered(editor, &[r(-10, -10, 200, 200)]).is_empty(), "one over all of it");
+        // A menu over the right edge leaves the left.
+        assert_eq!(uncovered(editor, &[r(60, -20, 100, 300)]), vec![r(0, 0, 60, 100)]);
+        // Two overlapping covers.
+        let parts = uncovered(editor, &[r(0, 0, 50, 50), r(25, 25, 50, 50)]);
+        assert_eq!(area(&parts), 100 * 100 - 50 * 50 - 50 * 50 + 25 * 25);
+    }
+
+    #[test]
+    fn spots_know_when_nothing_covers_them() {
+        let clip = r(10, 20, 100, 50);
+        let spot = Spot { clip, origin: (0, 20), visible: vec![clip] };
+        assert!(spot.whole());
+        assert_eq!(spot.offset(), (-10, 0));
+        let spot = Spot { clip, origin: (10, 20), visible: uncovered(clip, &[r(10, 20, 30, 50)]) };
+        assert!(!spot.whole());
+        assert_eq!(spot.local().collect::<Vec<_>>(), vec![r(30, 0, 70, 50)]);
+    }
 
     #[test]
     fn info_lines_round_trip() {

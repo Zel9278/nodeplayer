@@ -9,7 +9,7 @@ use clap_sys::plugin::clap_plugin;
 
 use super::HostShared;
 use crate::plugins::window::HostWindow;
-use crate::plugins::{Placement, PluginInfo, PxRect, WinEvent};
+use crate::plugins::{Placement, PluginInfo, Spot, WinEvent};
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 const API: &std::ffi::CStr = CLAP_WINDOW_API_X11;
@@ -153,8 +153,8 @@ impl crate::plugins::Editor for ClapEditor {
         }
     }
 
-    fn place(&mut self, clip: Option<PxRect>, origin: (i32, i32)) {
-        self.window.place(clip, origin);
+    fn place(&mut self, spot: Option<&Spot>) {
+        self.window.place(spot);
     }
 
     fn idle(&mut self) -> bool {

@@ -5,17 +5,18 @@
 //! main window. Embedded editors live in a clipping "container" window so they can be
 //! scrolled and partially covered by the host's layout.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
+use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-use super::{Placement, PxRect, WinEvent, WindowId};
+use super::{Placement, Spot, WinEvent, WindowId};
 
 pub struct HostWindow {
     pub conn: RustConnection,
@@ -29,8 +30,8 @@ pub struct HostWindow {
     pub scale: Cell<f32>,
     pub base: Cell<(f32, f32)>,
     wm_delete: u32,
-    /// Last applied embedded geometry: (container rect, plugin offset inside it); None = hidden.
-    shown: Cell<Option<(PxRect, (i32, i32))>>,
+    /// Where the embedded editor was last put; None = hidden.
+    shown: RefCell<Option<Spot>>,
     /// Keep the plugin's windows told where they are (needed for Wine/yabridge editors).
     announce: bool,
     announced: Cell<Option<((i16, i16), Instant)>>,
@@ -93,7 +94,7 @@ impl HostWindow {
             scale: Cell::new(1.0),
             base: Cell::new((w as f32, h as f32)),
             wm_delete,
-            shown: Cell::new(None),
+            shown: RefCell::new(None),
             announce,
             announced: Cell::new(None),
         })
@@ -139,24 +140,29 @@ impl HostWindow {
         );
     }
 
-    /// Positions an embedded editor. `clip` is the visible area in the parent window and
-    /// `origin` where the editor's top-left corner would be (it may lie outside `clip` when
-    /// scrolled). `None` hides the editor.
-    pub fn place(&self, clip: Option<PxRect>, origin: (i32, i32)) {
+    /// Moves an embedded editor to `spot`, cut to its visible parts, or hides it (`None`).
+    pub fn place(&self, spot: Option<&Spot>) {
         let Some(container) = self.container else { return };
         let conn = &self.conn;
-        let next = clip.filter(|c| c.w > 0 && c.h > 0).map(|c| (c, (origin.0 - c.x, origin.1 - c.y)));
-        if next == self.shown.get() {
+        let next = spot.filter(|s| !s.visible.is_empty());
+        let mut shown = self.shown.borrow_mut();
+        if next == shown.as_ref() {
             return;
         }
         match next {
-            Some((c, (ox, oy))) => {
-                let _ = conn.configure_window(
-                    container,
-                    &ConfigureWindowAux::new().x(c.x).y(c.y).width(c.w).height(c.h).stack_mode(StackMode::ABOVE),
-                );
-                let _ = conn.configure_window(self.id, &ConfigureWindowAux::new().x(ox).y(oy));
-                if self.shown.get().is_none() {
+            Some(s) => {
+                let (c, (ox, oy)) = (s.clip, s.offset());
+                if shown.as_ref().is_none_or(|o| (o.clip, o.offset()) != (c, (ox, oy))) {
+                    let _ = conn.configure_window(
+                        container,
+                        &ConfigureWindowAux::new().x(c.x).y(c.y).width(c.w).height(c.h).stack_mode(StackMode::ABOVE),
+                    );
+                    let _ = conn.configure_window(self.id, &ConfigureWindowAux::new().x(ox).y(oy));
+                }
+                if shown.as_ref().is_none_or(|o| o.local().ne(s.local())) {
+                    self.shape(container, s);
+                }
+                if shown.is_none() {
                     let _ = conn.map_window(container);
                 }
             }
@@ -165,7 +171,24 @@ impl HostWindow {
             }
         }
         let _ = conn.flush();
-        self.shown.set(next);
+        *shown = next.cloned();
+    }
+
+    /// Cuts the container to the parts of it nothing covers, for drawing (which clips the
+    /// plugin's windows inside too) and for the pointer, which reaches the app's window
+    /// through the holes.
+    fn shape(&self, container: u32, spot: &Spot) {
+        for kind in [shape::SK::BOUNDING, shape::SK::INPUT] {
+            let _ = if spot.whole() {
+                self.conn.shape_mask(shape::SO::SET, kind, container, 0, 0, x11rb::NONE)
+            } else {
+                let rects: Vec<Rectangle> = spot
+                    .local()
+                    .map(|r| Rectangle { x: r.x as i16, y: r.y as i16, width: r.w as u16, height: r.h as u16 })
+                    .collect();
+                self.conn.shape_rectangles(shape::SO::SET, kind, ClipOrdering::UNSORTED, container, 0, 0, &rects)
+            };
+        }
     }
 
     /// Tells every window the plugin put inside ours where it really is on screen, the way a

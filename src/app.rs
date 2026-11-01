@@ -218,8 +218,10 @@ pub struct App {
     debug_done: bool,
     library: Library,
     dock: egui_dock::DockState<Tab>,
-    /// Where embedded plugin editors go this frame, from the graph tab.
-    placements: HashMap<u32, (PxRect, (i32, i32))>,
+    /// Where embedded plugin editors go this frame, from the graph tab, and the screen rects
+    /// of the graph's nodes in the order they were drawn.
+    placements: HashMap<u32, Placed>,
+    node_rects: Vec<(u32, egui::Rect)>,
     /// Scroll the track list to the current track on the next frame.
     reveal_current: bool,
     mpris: Option<Mpris>,
@@ -318,6 +320,7 @@ impl App {
             library: Library::default(),
             dock: default_dock(false),
             placements: HashMap::new(),
+            node_rects: Vec::new(),
             reveal_current: false,
             // On Windows it needs the window, so it's made with the first frame.
             mpris: if cfg!(windows) { None } else { Mpris::new(ctx.clone(), None) },
@@ -1741,6 +1744,7 @@ impl App {
             sample_rate: self.sample_rate,
             ppp: ui.ctx().pixels_per_point(),
             placements: HashMap::new(),
+            node_rects: Vec::new(),
             scroll,
             wants_scroll: false,
             selected: self.selected.len(),
@@ -1777,6 +1781,7 @@ impl App {
                 }
             });
         self.placements = std::mem::take(&mut viewer.placements);
+        self.node_rects = std::mem::take(&mut viewer.node_rects);
         self.capture_scroll = viewer.wants_scroll;
         let errors = std::mem::take(&mut viewer.errors);
         for e in errors {
@@ -2301,6 +2306,7 @@ impl eframe::App for App {
             .filter(|t| *t != Tab::Extensions || !self.extensions.panels().is_empty())
             .collect();
         self.placements.clear();
+        self.node_rects.clear();
         let mut tabs = Tabs { app: self, actions: &mut actions, closed, reopen: None };
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             egui_dock::DockArea::new(&mut dock)
@@ -2320,16 +2326,18 @@ impl eframe::App for App {
         }
         self.dock = dock;
         // Move embedded editors over the space their nodes reserved this frame (none when the
-        // graph tab is behind another).
+        // graph tab is behind another), less what egui draws over them: native views sit
+        // above everything the app draws, so they are cut out where they should be covered.
         for (_, node) in self.snarl.nodes_ids_mut() {
             let eid = node.eid;
             let NodeKind::Plugin(p) = &mut node.kind else { continue };
             let Some(ed) = &mut p.editor else { continue };
+            let spot = self.placements.get(&eid).map(|at| {
+                let covers = editor_covers(&ctx, eid, at, &self.node_rects);
+                plugins::Spot { clip: at.clip, origin: at.origin, visible: plugins::uncovered(at.clip, &covers) }
+            });
             let _g = guard::enter(&p.tag);
-            match self.placements.get(&eid) {
-                Some(&(clip, origin)) => ed.place(Some(clip), origin),
-                None => ed.place(None, (0, 0)),
-            }
+            ed.place(spot.as_ref());
         }
         for node in self.snarl.nodes_mut() {
             if let NodeKind::Video(v) = &mut node.kind {
@@ -2376,6 +2384,62 @@ impl eframe::App for App {
 // ---------------------------------------------------------------------------
 // Node graph viewer
 
+/// Where an embedded editor goes this frame, before what covers it is cut out: its
+/// container's rect and the editor's corner in pixels (points on macOS, see `ppp`), the shown
+/// part in egui's screen points, and the layer it is drawn in.
+struct Placed {
+    clip: PxRect,
+    origin: (i32, i32),
+    shown: egui::Rect,
+    layer: egui::LayerId,
+    /// Window units per egui point.
+    ppp: f32,
+}
+
+/// What hides part of an embedded editor, in window units: nodes drawn after its own, and
+/// egui layers above the graph's (windows, menus, popups, tooltips).
+fn editor_covers(ctx: &egui::Context, eid: u32, at: &Placed, nodes: &[(u32, egui::Rect)]) -> Vec<PxRect> {
+    let mut covers: Vec<egui::Rect> = nodes.iter().skip_while(|(e, _)| *e != eid).skip(1).map(|(_, r)| *r).collect();
+    let (layers, parent) = ctx.memory(|m| {
+        let areas = m.areas();
+        let parent = areas.parent_layer(at.layer).unwrap_or(at.layer);
+        let layers: Vec<_> = areas
+            .visible_layer_ids()
+            .into_iter()
+            .filter(|l| *l != at.layer && *l != parent && areas.parent_layer(*l) != Some(parent))
+            .filter_map(|l| Some((l, m.area_rect(l.id)?, areas.parent_layer(l))))
+            .collect();
+        (layers, parent)
+    });
+    for (layer, rect, layer_parent) in layers {
+        let rect = ctx.layer_transform_to_global(layer).map_or(rect, |xf| xf * rect);
+        let shared = rect.intersect(at.shown);
+        if !shared.is_positive() {
+            continue;
+        }
+        let above = match layer.order.cmp(&parent.order) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            // Two windows: the one on top where they overlap.
+            std::cmp::Ordering::Equal => ctx.layer_id_at(shared.center()).is_some_and(|top| {
+                let top_parent = ctx.memory(|m| m.areas().parent_layer(top));
+                top == layer || top_parent == Some(layer) || layer_parent == Some(top)
+            }),
+        };
+        if above {
+            covers.push(rect);
+        }
+    }
+    covers
+        .into_iter()
+        .filter_map(|r| {
+            let (x0, y0) = ((r.min.x * at.ppp).floor() as i32, (r.min.y * at.ppp).floor() as i32);
+            let (x1, y1) = ((r.max.x * at.ppp).ceil() as i32, (r.max.y * at.ppp).ceil() as i32);
+            (x1 > x0 && y1 > y0).then(|| PxRect { x: x0, y: y0, w: (x1 - x0) as u32, h: (y1 - y0) as u32 })
+        })
+        .collect()
+}
+
 struct Viewer<'a> {
     engine: Option<&'a mut Engine>,
     player: &'a Player,
@@ -2386,8 +2450,10 @@ struct Viewer<'a> {
     embed_parent: Option<crate::plugins::WindowId>,
     sample_rate: f32,
     ppp: f32,
-    /// Screen placement of embedded editors, filled while drawing node bodies.
-    placements: HashMap<u32, (PxRect, (i32, i32))>,
+    /// Screen placement of embedded editors, filled while drawing node bodies, and the
+    /// nodes' screen rects in drawing order.
+    placements: HashMap<u32, Placed>,
+    node_rects: Vec<(u32, egui::Rect)>,
     /// Mouse wheel taken from the graph view for an EQ point or a plugin body.
     scroll: egui::Vec2,
     wants_scroll: bool,
@@ -2420,6 +2486,11 @@ fn midi_pin() -> PinInfo {
 }
 
 impl SnarlViewer<GraphNode> for Viewer<'_> {
+    fn final_node_rect(&mut self, node: NodeId, rect: egui::Rect, ui: &mut egui::Ui, snarl: &mut Snarl<GraphNode>) {
+        let xf = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or_default();
+        self.node_rects.push((snarl[node].eid, xf * rect));
+    }
+
     fn title(&mut self, node: &GraphNode) -> String {
         node.kind.title()
     }
@@ -2675,7 +2746,8 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                             w: px(clip.width()).max(0) as u32,
                             h: px(clip.height()).max(0) as u32,
                         };
-                        self.placements.insert(eid, (r, (px(screen.min.x), px(screen.min.y))));
+                        let at = Placed { clip: r, origin: (px(screen.min.x), px(screen.min.y)), shown: clip, layer: ui.layer_id(), ppp };
+                        self.placements.insert(eid, at);
                     }
                 }
             }

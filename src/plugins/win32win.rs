@@ -11,14 +11,36 @@ use std::sync::Once;
 
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject, HBRUSH, HRGN, RDW_ALLCHILDREN, RDW_UPDATENOW, RedrawWindow};
+use windows::Win32::Graphics::Gdi::{
+    BLACK_BRUSH, CombineRgn, CreateRectRgn, DeleteObject, GetStockObject, HBRUSH, HRGN, RDW_ALLCHILDREN, RDW_UPDATENOW, RGN_OR,
+    RedrawWindow, SetWindowRgn,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, w};
 
-use super::{Placement, PxRect, WinEvent, WindowId};
+use super::{Placement, Spot, WinEvent, WindowId};
 
 const CLASS: PCWSTR = w!("nodeplayer-plugin-editor");
+
+/// Cuts `container` to the parts of it nothing covers. A window region clips drawing, the
+/// plugin's child windows included, and hit testing, so clicks in the holes reach the app.
+unsafe fn set_region(container: HWND, spot: &Spot) {
+    unsafe {
+        if spot.whole() {
+            SetWindowRgn(container, HRGN::default(), true);
+            return;
+        }
+        let rgn = CreateRectRgn(0, 0, 0, 0);
+        for r in spot.local() {
+            let part = CreateRectRgn(r.x, r.y, r.x + r.w as i32, r.y + r.h as i32);
+            CombineRgn(rgn, rgn, part, RGN_OR);
+            let _ = DeleteObject(part);
+        }
+        // The window owns the region from here on.
+        SetWindowRgn(container, rgn, true);
+    }
+}
 
 /// What the window procedure shares with its [`HostWindow`].
 struct State {
@@ -38,8 +60,8 @@ pub struct HostWindow {
     /// Content scale the plugin currently draws at, and its size at scale 1.
     pub scale: Cell<f32>,
     pub base: Cell<(f32, f32)>,
-    /// Last applied embedded geometry: (container rect, plugin offset inside it); None = hidden.
-    shown: Cell<Option<(PxRect, (i32, i32))>>,
+    /// Where the embedded editor was last put; None = hidden.
+    shown: RefCell<Option<Spot>>,
     state: Box<State>,
 }
 
@@ -153,7 +175,7 @@ impl HostWindow {
             placement,
             scale: Cell::new(1.0),
             base: Cell::new((w as f32, h as f32)),
-            shown: Cell::new(None),
+            shown: RefCell::new(None),
             state,
         };
         if container.is_none() {
@@ -207,18 +229,21 @@ impl HostWindow {
         }
     }
 
-    /// Positions an embedded editor. `clip` is the visible area in the parent window and
-    /// `origin` where the editor's top-left corner would be (it may lie outside `clip` when
-    /// scrolled). `None` hides the editor.
-    pub fn place(&self, clip: Option<PxRect>, origin: (i32, i32)) {
+    /// Moves an embedded editor to `spot`, cut to its visible parts, or hides it (`None`).
+    pub fn place(&self, spot: Option<&Spot>) {
         let Some(container) = self.container else { return };
-        let next = clip.filter(|c| c.w > 0 && c.h > 0).map(|c| (c, (origin.0 - c.x, origin.1 - c.y)));
-        if next == self.shown.get() {
+        let next = spot.filter(|s| !s.visible.is_empty());
+        let mut shown = self.shown.borrow_mut();
+        if next == shown.as_ref() {
             return;
         }
         unsafe {
             match next {
-                Some((c, (ox, oy))) => {
+                Some(s) => {
+                    let (c, (ox, oy)) = (s.clip, s.offset());
+                    if shown.as_ref().is_none_or(|o| o.local().ne(s.local())) {
+                        set_region(container, s);
+                    }
                     let flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
                     let _ = SetWindowPos(container, HWND_TOP, c.x, c.y, c.w as i32, c.h as i32, flags);
                     let _ = SetWindowPos(self.id, None, ox, oy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -228,7 +253,7 @@ impl HostWindow {
                 }
             }
         }
-        self.shown.set(next);
+        *shown = next.cloned();
     }
 
     /// What happened since the last call. The messages themselves are dispatched by the UI

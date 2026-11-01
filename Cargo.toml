@@ -48,7 +48,7 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2-zli
 alsa = "0.11"
 souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
 winit = { version = "0.30", default-features = false, features = ["x11"] }
-x11rb = "0.14"
+x11rb = { version = "0.14", features = ["shape"] }
 
 # Windows: WASAPI through cpal, WinMM for MIDI, HWND for plugin editors, SMTC for the
 # media session.

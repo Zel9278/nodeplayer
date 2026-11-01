@@ -32,8 +32,9 @@ The data folder is listed in [Files and troubleshooting](files-and-troubleshooti
 - **Bypass** lets the audio through untouched.
 
 The graph zoom is passed on to editors that can scale (LSP plugins, among others); editors
-that can only be resized get the zoomed size, and the rest keep their own size. An editor
-always sits on top of the graph's drawing, so menus and nodes behind it are hidden.
+that can only be resized get the zoomed size, and the rest keep their own size. Menus,
+windows, tooltips and nodes in front of an editor show over it, and clicks there go to them,
+not to the plugin.
 
 JSFX nodes show the effect's visible sliders, and effects with graphics (`@gfx`) draw them in
 the node, with the mouse, wheel, keys and `gfx_showmenu` menus working. Hidden sliders are under
