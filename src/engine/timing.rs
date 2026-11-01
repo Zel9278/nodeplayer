@@ -75,7 +75,7 @@ impl Default for TimingLimits {
         Self {
             max_latency_frames: 1 << 22,
             max_delay_bytes: 64 * 1024 * 1024,
-            midi_capacity: 4096,
+            midi_capacity: 1 << 14,
         }
     }
 }
@@ -432,6 +432,12 @@ mod tests {
         assert_eq!(result.delay_bytes, 0);
         assert!(result.edges.iter().all(|e| e.delay_frames == 0));
     }
+    #[test]
+    fn default_midi_capacity_matches_port_buffer() {
+        assert_eq!(TimingLimits::default().midi_capacity, 1 << 14);
+        assert_eq!(TimingLimits::default().midi_capacity, crate::engine::MidiBuf::CAPACITY);
+    }
+
     #[test]
     fn parallel_wires_are_independent_and_sorted() {
         let a = audio(0, 1, 0);

@@ -90,6 +90,9 @@ pub struct MidiDelay {
     future: Vec<TimedMidi>,
     capacity: usize,
     cleanup: bool,
+    // Per-channel note bitmaps are exact and fixed-size (2048 bits), so tracking cannot
+    // overflow; cleanup is scoped to channels with notes that passed this edge.
+    live_notes: [u128; 16],
     pub overflow_count: u64,
 }
 
@@ -108,6 +111,7 @@ impl MidiDelay {
             future: Vec::with_capacity(capacity),
             capacity,
             cleanup: false,
+            live_notes: [0; 16],
             overflow_count: 0,
         })
     }
@@ -126,6 +130,37 @@ impl MidiDelay {
         self.cleanup = true;
     }
 
+    fn track(&mut self, data: [u8; 3]) {
+        let status = data[0];
+        if !(0x80..=0x9f).contains(&status) || data[1] >= 128 {
+            return;
+        }
+        let channel = (status & 0x0f) as usize;
+        let note = data[1] as u32;
+        let bit = 1u128 << (note % 128);
+        match status & 0xf0 {
+            0x90 if data[2] != 0 => self.live_notes[channel] |= bit,
+            0x80 | 0x90 => self.live_notes[channel] &= !bit,
+            _ => {}
+        }
+    }
+
+    fn enqueue_cleanup(&mut self, output: &mut MidiBuf) -> bool {
+        self.future.clear();
+        let mut complete = true;
+        for (channel, notes) in self.live_notes.iter().enumerate() {
+            if *notes != 0 {
+                for cc in [64, 123, 120] {
+                    complete &= output.push_sorted(MidiEvent {
+                        time: 0,
+                        data: [0xb0 | channel as u8, cc, 0],
+                    });
+                }
+            }
+        }
+        complete
+    }
+
     /// Absolute timestamps survive arbitrary callback partitioning. Out-of-block events are
     /// retained, not clamped to this block's last sample. Equal-time arrival order is stable.
     pub fn process(
@@ -142,20 +177,24 @@ impl MidiDelay {
         if self.cleanup && n > 0 {
             // Losing note-off or sustain is unsafe: discard stale events and send bounded
             // channel-wide sustain-off, all-notes-off, all-sound-off before accepting notes.
-            self.future.clear();
-            let mut complete = true;
-            for channel in 0..16 {
-                for cc in [64, 123, 120] {
-                    complete &= output.push_sorted(MidiEvent {
-                        time: 0,
-                        data: [0xb0 | channel, cc, 0],
-                    });
-                }
+            let complete = self.enqueue_cleanup(output);
+            if complete {
+                self.live_notes = [0; 16];
             }
             self.cleanup = !complete;
             if !complete {
                 return;
             }
+        }
+        if self.delay == 0 {
+            for event in input {
+                if output.push_sorted(*event) {
+                    self.track(event.data);
+                } else {
+                    self.overflow();
+                }
+            }
+            return;
         }
         for event in input {
             let sample = first_sample
@@ -189,6 +228,8 @@ impl MidiDelay {
                 })
             {
                 self.overflow();
+            } else {
+                self.track(event.data);
             }
         }
         self.future.drain(..due);
@@ -443,6 +484,21 @@ mod tests {
         assert_eq!(out.events(), &[event(0, 3)]);
     }
     #[test]
+    fn zero_delay_midi_passthrough_is_ordered_and_tracks_notes() {
+        let mut d = MidiDelay::new(0, 2).unwrap();
+        let mut out = MidiBuf::new();
+        let events = [MidiEvent { time: 1, data: [0x90, 60, 1] }, MidiEvent { time: 3, data: [0x90, 61, 1] }];
+        d.process(&events, &mut out, 0, 8);
+        assert_eq!(out.events(), &events);
+        assert!(d.future.is_empty());
+        d.invalidate();
+        out.clear();
+        d.process(&[], &mut out, 8, 8);
+        assert_eq!(out.events().len(), 3);
+        assert!(out.events().iter().all(|event| event.data[0] == 0xb0));
+    }
+
+    #[test]
     fn midi_queue_overflow_schedules_bounded_cleanup() {
         let mut d = MidiDelay::new(1024, 1).unwrap();
         let mut out = MidiBuf::new();
@@ -463,8 +519,9 @@ mod tests {
         );
         assert_eq!(d.overflow_count, 1);
         d.process(&[], &mut out, 128, 128);
-        assert_eq!(out.events().len(), 48);
-        assert_eq!(out.events()[0].data, [0xb0, 64, 0]);
+        // Nothing was ever delivered through this edge, so no destination state is live
+        // and the scoped cleanup emits nothing.
+        assert_eq!(out.events().len(), 0);
         assert!(d.future.is_empty());
     }
     #[test]
@@ -509,12 +566,7 @@ mod tests {
         );
         midi.invalidate();
         midi.process(&[], &mut out, 1, 256);
-        assert_eq!(out.events().len(), 48);
-        assert!(
-            out.events()
-                .iter()
-                .all(|event| event.data[0] & 0xf0 == 0xb0)
-        );
+        assert_eq!(out.events().len(), 0);
     }
 
     #[test]
