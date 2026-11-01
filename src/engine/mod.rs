@@ -846,6 +846,7 @@ mod tests {
             midi_input: id != 0,
             midi_output: true,
             sink,
+            midi_sink: false,
             timing: timing::NodeTiming {
                 algorithm_latency_frames: latency,
                 ..Default::default()
@@ -987,7 +988,10 @@ mod tests {
         }
         // The impulse emits at block 0. Node 2 is hardware-bound (no engine edge leaves it)
         // and must emit aligned to the device reference set by the sink, not immediately.
-        let nodes = [spec(0, 0, false), spec(1, 1024, true), spec(2, 0, false)];
+        let mut device = spec(2, 0, false);
+        device.midi_sink = true;
+        device.midi_output = false;
+        let nodes = [spec(0, 0, false), spec(1, 1024, true), device];
         let edges = [
             edge(0, 1),
             timing::EdgeKey {

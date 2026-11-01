@@ -44,6 +44,7 @@ pub struct NodeSpec {
     pub midi_input: bool,
     pub midi_output: bool,
     pub sink: bool,
+    pub midi_sink: bool,
     pub timing: NodeTiming,
 }
 
@@ -234,17 +235,11 @@ pub fn analyze(
             analysis.total_latency_frames - analysis.output_audio[&node.id],
         ));
     }
-    // MIDI emitted to hardware is not represented by an engine edge; align its node output
-    // to the same device reference as audio sinks. Outputs carried by an engine edge keep
-    // their alignment in the edge delay and must not be padded here as well.
-    let wired: std::collections::BTreeSet<u32> = edges
-        .iter()
-        .filter(|edge| matches!(edge.kind, EdgeKind::Midi))
-        .map(|edge| edge.from)
-        .collect();
+    // Pad MIDI arriving at device-output nodes to the audio device reference. MIDI carried
+    // by an engine edge keeps alignment through edge delays and is not padded here.
     analysis.midi_outputs = nodes
         .iter()
-        .filter(|node| node.midi_output && !wired.contains(&node.id))
+        .filter(|node| node.midi_sink)
         .map(|node| (node.id, analysis.total_latency_frames.saturating_sub(analysis.output_midi[&node.id])))
         .collect();
     analysis.edges.sort_by_key(|edge| edge.key);
@@ -296,6 +291,7 @@ mod tests {
             midi_input: true,
             midi_output: true,
             sink,
+            midi_sink: false,
             timing: NodeTiming {
                 algorithm_latency_frames: latency,
                 ..Default::default()
@@ -463,18 +459,18 @@ mod tests {
 
     #[test]
     fn hardware_midi_output_is_aligned_to_total_latency() {
-        // Node 0 emits MIDI to node 2 (no engine edge leaves node 2: its emissions are
-        // hardware-bound). The audio path through sink node 1 sets the device reference.
-        // Edge delays keep their alignment; the pad carries the alignment for the hardware
-        // output only, and the runtime applies it before the node processes its input.
+        // Node 2 sends MIDI to hardware; node 1 sets the audio device reference.
         let midi = EdgeKey {
             from: 0,
             to: 2,
             kind: EdgeKind::Midi,
             occurrence: 0,
         };
+        let mut device = node(2, 0, false);
+        device.midi_sink = true;
+        device.midi_output = false;
         let result = run(
-            &[node(0, 32, false), node(1, 0, true), node(2, 0, false)],
+            &[node(0, 32, false), node(1, 0, true), device],
             &[audio(0, 1, 0), midi],
         )
         .unwrap();
@@ -482,7 +478,23 @@ mod tests {
         assert!(result.edges.iter().all(|edge| edge.delay_frames == 0));
         assert_eq!(result.sinks, [(1, 0)]);
         // Node 0's MIDI output is carried by an engine edge and must not be padded here.
-        assert_eq!(result.midi_outputs, [(1, 0), (2, 32)]);
+        assert_eq!(result.midi_outputs, [(2, 32)]);
+    }
+
+    #[test]
+    fn unwired_plugin_midi_output_is_not_a_device_sink() {
+        let mut device = node(3, 0, false);
+        device.midi_sink = true;
+        device.midi_output = false;
+        let midi_to_plugin = EdgeKey { from: 0, to: 1, kind: EdgeKind::Midi, occurrence: 0 };
+        let midi_to_device = EdgeKey { from: 0, to: 3, kind: EdgeKind::Midi, occurrence: 0 };
+        let result = run(
+            &[node(0, 0, false), node(1, 1024, false), node(2, 0, true), device],
+            &[midi_to_plugin, audio(1, 2, 0), midi_to_device],
+        ).unwrap();
+        assert_eq!(result.total_latency_frames, 1024);
+        assert_eq!(result.sinks, [(2, 0)]);
+        assert_eq!(result.midi_outputs, [(3, 1024)]);
     }
 
     #[test]
