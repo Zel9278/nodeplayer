@@ -238,7 +238,7 @@ impl MidiDelay {
 
 pub enum EdgeDelay {
     Audio(AudioDelay),
-    Midi(MidiDelay),
+    Midi(Box<MidiDelay>),
 }
 
 pub struct PreparedEdge {
@@ -291,7 +291,7 @@ impl TimingPlan {
             let delay = match edge.key.kind {
                 EdgeKind::Audio { .. } => EdgeDelay::Audio(AudioDelay::new(edge.delay_frames)?),
                 EdgeKind::Midi => {
-                    EdgeDelay::Midi(MidiDelay::new(edge.delay_frames, limits.midi_capacity)?)
+                    EdgeDelay::Midi(Box::new(MidiDelay::new(edge.delay_frames, limits.midi_capacity)?))
                 }
             };
             edges.push(PreparedEdge {
