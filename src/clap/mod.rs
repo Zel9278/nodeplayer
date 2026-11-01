@@ -1062,17 +1062,24 @@ impl ClapProcessor {
                 },
                 Dialect::Clap => {
                     let on = s & 0xf0 == 0x90 && vel > 0;
-                    if !on && !matches!(s & 0xf0, 0x80 | 0x90) {
+                    let panic = s & 0xf0 == 0xb0 && matches!(key, 120 | 123);
+                    if !on && !panic && !matches!(s & 0xf0, 0x80 | 0x90) {
                         continue;
                     }
-                    let type_ = if on { CLAP_EVENT_NOTE_ON } else { CLAP_EVENT_NOTE_OFF };
+                    let type_ = if panic {
+                        CLAP_EVENT_NOTE_CHOKE
+                    } else if on {
+                        CLAP_EVENT_NOTE_ON
+                    } else {
+                        CLAP_EVENT_NOTE_OFF
+                    };
                     AnyEvent {
                         note: clap_event_note {
                             header: header::<clap_event_note>(type_, m.time),
                             note_id: -1,
                             port_index: 0,
                             channel: m.channel() as i16,
-                            key: key as i16,
+                            key: if panic { -1 } else { key as i16 },
                             velocity: vel as f64 / 127.0,
                         },
                     }

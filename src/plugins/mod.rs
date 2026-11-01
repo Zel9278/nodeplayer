@@ -4,6 +4,7 @@
 
 pub mod dylib;
 pub mod guard;
+pub mod remote;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub mod x11win;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -28,7 +29,7 @@ use crate::engine::Processor;
 pub type WindowId = usize;
 
 /// Where an editor is shown.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Placement {
     /// Its own top-level window.
     Window,
@@ -37,7 +38,7 @@ pub enum Placement {
 }
 
 /// Pixel rectangle in the parent window's coordinates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PxRect {
     pub x: i32,
     pub y: i32,
@@ -95,7 +96,7 @@ pub fn uncovered(area: PxRect, covers: &[PxRect]) -> Vec<PxRect> {
 /// takes (the editor cut to what the layout shows of it), where the editor's top-left corner
 /// is (outside `clip` when scrolled), and the parts of `clip` that nothing drawn above the
 /// editor covers. The container shows, and takes clicks, only there.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spot {
     pub clip: PxRect,
     pub origin: (i32, i32),
@@ -152,7 +153,7 @@ impl Format {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PluginInfo {
     pub format: Format,
     pub name: String,
@@ -198,7 +199,7 @@ impl PluginInfo {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ParamDesc {
     pub id: u32,
     pub title: String,
@@ -224,6 +225,18 @@ pub trait Instance {
     /// Fixed process-bridge latency included in `latency`, if any.
     fn bridge_latency(&self) -> u32 {
         0
+    }
+    /// Human-readable state of an external host; local plugins return `None`.
+    fn remote_status(&self) -> Option<&str> {
+        None
+    }
+    /// Diagnostic-only cumulative (underrun blocks, bounded-queue overflows).
+    fn remote_counters(&self) -> Option<(u64, u64)> {
+        None
+    }
+    /// Queues an explicit external-host restart without blocking the UI thread.
+    fn request_remote_restart(&mut self) -> bool {
+        false
     }
     /// Whether the plugin takes MIDI in and sends MIDI out.
     fn midi_ports(&self) -> (bool, bool) {
@@ -275,6 +288,10 @@ pub struct BodyIo {
 
 /// A native editor window, embedded or on its own.
 pub trait Editor {
+    /// True once an asynchronous editor has actually been opened in its owner process.
+    fn ready(&self) -> bool {
+        true
+    }
     fn placement(&self) -> Placement;
     /// Size in physical pixels.
     fn size(&self) -> (u32, u32);
@@ -306,7 +323,30 @@ impl Host {
         self.disabled.iter().any(|(f, p)| *f == format && p == path)
     }
 
-    pub fn create(&mut self, info: &PluginInfo, sample_rate: f32, max_block: usize) -> Result<Created> {
+    pub fn create(
+        &mut self,
+        info: &PluginInfo,
+        sample_rate: f32,
+        max_block: usize,
+    ) -> Result<Created> {
+        if crate::runtime::get().experimental_plugin_isolation
+            && matches!(info.format, Format::Vst3 | Format::Clap)
+        {
+            if self.is_disabled(info.format, &info.path) {
+                bail!("disabled because it crashed nodeplayer; enable it again in the Plugins tab");
+            }
+            return remote::create(info, sample_rate, max_block);
+        }
+        self.create_local(info, sample_rate, max_block)
+    }
+
+    /// Only the worker (or the explicitly in-process host) loads plugin code here.
+    pub fn create_local(
+        &mut self,
+        info: &PluginInfo,
+        sample_rate: f32,
+        max_block: usize,
+    ) -> Result<Created> {
         if self.is_disabled(info.format, &info.path) {
             bail!("disabled because it crashed nodeplayer; enable it again in the Plugins tab");
         }
@@ -336,6 +376,11 @@ impl Host {
 
     /// Classes in a plugin file, loading it in this process (the scanner subprocess uses this).
     pub fn classes(&mut self, format: Format, path: &Path) -> Result<Vec<PluginInfo>> {
+        if crate::runtime::get().experimental_plugin_isolation
+            && matches!(format, Format::Vst3 | Format::Clap)
+        {
+            return scan_isolated(format, path);
+        }
         match format {
             Format::Vst3 => Ok(self.vst3.get(path)?.classes(path)),
             Format::Clap => Ok(self.clap.get(path)?.classes(path)),
@@ -447,18 +492,77 @@ pub fn scan_isolated(format: Format, path: &Path) -> Result<Vec<PluginInfo>> {
     if format == Format::Jsfx {
         return crate::jsfx::classes(path);
     }
-    let exe = std::env::current_exe()?;
-    let out = std::process::Command::new(exe)
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    // File-backed capture avoids both pipe backpressure and an orphaned reader thread
+    // when a hostile plugin spawns a process inheriting stdout.
+    let mut random = [0u8; 16];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random)
+        .map_err(|_| anyhow!("OS random source unavailable"))?;
+    let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let output_path = std::env::temp_dir().join(format!("nodeplayer-scan-{suffix}.out"));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(&output_path)?;
+    struct Capture(std::path::PathBuf);
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let capture = Capture(output_path);
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    if let Some(root) = &crate::runtime::get().data_root {
+        command.arg("--data-root").arg(root);
+    }
+    let mut child = command
         .arg("--scan-plugin")
         .arg(format.label())
         .arg(path)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(output.try_clone()?))
         .stderr(std::process::Stdio::null())
-        .output()?;
-    if !out.status.success() {
-        bail!("scanner exited with {}", out.status);
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if output.metadata()?.len() > 4 * 1024 * 1024 || Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(output);
+            drop(capture);
+            bail!("scanner exceeded its deadline or output limit");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if !status.success() {
+        drop(output);
+        drop(capture);
+        bail!("scanner exited with {status}");
     }
-    Ok(String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| PluginInfo::from_line(l, path)).collect())
+    // Cloned handles share the file position: rewind before consuming the bounded output.
+    use std::io::{Seek, SeekFrom};
+    output.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    (&mut output)
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    drop(output);
+    drop(capture);
+    if bytes.len() > 4 * 1024 * 1024 {
+        bail!("scanner output exceeds 4 MiB");
+    }
+    Ok(String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|l| PluginInfo::from_line(l, path))
+        .collect())
 }
 
 /// Entry point for `--scan-plugin <format> <path>`: one line per class on stdout.

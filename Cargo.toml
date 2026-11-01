@@ -58,11 +58,14 @@ souvlaki = "0.8"
 winit = "0.30"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_Media_Multimedia",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
+    "Win32_System_JobObjects",
+    "Win32_System_Com",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
@@ -86,6 +89,12 @@ cmake = "0.1"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# Release-equivalent code with symbols for WPR, perf and Instruments.
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = false
 
 # winit 0.30.13 with one fix: on X11 a window that already has the focus got no IME input
 # once a text field asked for it (see `ImeRequest::Allow` in its x11/event_processor.rs).
