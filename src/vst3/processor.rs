@@ -261,8 +261,8 @@ impl Vst3Processor {
         };
 
         let mut data = ProcessData {
-            processMode: ProcessModes_::kRealtime,
-            symbolicSampleSize: SymbolicSampleSizes_::kSample32,
+            processMode: ProcessModes_::kRealtime as i32,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
             numSamples: n as i32,
             numInputs: self.ins.abb.len() as i32,
             numOutputs: self.outs.abb.len() as i32,
