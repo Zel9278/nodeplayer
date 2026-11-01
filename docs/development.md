@@ -30,6 +30,27 @@ cargo run --release -- ~/Music   # starts with that folder listed
 FFmpeg isn't needed to build; it's used at run time as programs. See
 [`.github/workflows/build.yml`](../.github/workflows/build.yml) for the exact steps CI takes.
 
+## Formatting and linting
+
+Run these checks before committing Rust changes:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+Apply workspace formatting with `cargo fmt --all`. Vendored dependencies and submodules
+are not part of this formatting pass. If another process is using the normal Windows debug
+executable, use `--target-dir target/isolation` with build, Clippy and test commands instead
+of stopping unrelated processes.
+
+Experimental VST3/CLAP process isolation is enabled with
+`--experimental-plugin-isolation` (which also enables PDC); `--experimental-pdc`
+enables only delay compensation. See the [remote backend](<../src/plugins/remote/README.md>)
+for architecture and limitations. Machine-specific plugins, diagnostic scenarios and
+private notes can be kept under the ignored `.local/` directory.
+
 ## Releases
 
 Pushing a `v*` tag builds every platform and publishes a GitHub release with the archives
