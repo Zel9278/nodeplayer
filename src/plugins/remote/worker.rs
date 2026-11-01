@@ -3,10 +3,11 @@ use super::{
         self, Command, Hello, Init, MAX_PARAMS, MAX_STATE, Metadata, Reply, Request, VERSION,
     },
     shared::{self, INPUT, MAX_LATENCY, OUTPUT, Q, SLOTS, Shared, WORKING},
+    surface::FrameMap,
 };
 use crate::{
     engine::{MidiBuf, MidiEvent, Processor, StereoBuf},
-    plugins::{Editor, Host, Instance},
+    plugins::{Editor, Host, Instance, Placement},
 };
 use anyhow::{Context, Result, bail};
 use std::{
@@ -48,6 +49,20 @@ impl Drop for AudioOwner {
 /// Internal CLI args: <loopback-address> <mmap-path> <generation>; token is first stdin line.
 /// This entry must execute before the normal app creates windows/audio/extensions.
 pub fn worker_main(args: &[OsString]) -> Result<()> {
+    // This entry bypasses winit's event loop and its autorelease pool management.
+    with_native_pool(|| worker_main_inner(args))
+}
+fn with_native_pool<T>(operation: impl FnOnce() -> T) -> T {
+    #[cfg(target_os = "macos")]
+    {
+        objc2::rc::autoreleasepool(|_| operation())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        operation()
+    }
+}
+fn worker_main_inner(args: &[OsString]) -> Result<()> {
     if args.len() != 3 {
         bail!("invalid plugin worker arguments")
     }
@@ -59,7 +74,10 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
         bail!("worker control endpoint must be loopback")
     }
     let mut token = String::new();
-    std::io::stdin().lock().read_line(&mut token).context("read worker credential")?;
+    std::io::stdin()
+        .lock()
+        .read_line(&mut token)
+        .context("read worker credential")?;
     let token = token.trim_end_matches(['\r', '\n']).to_owned();
     if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("invalid worker credential")
@@ -113,6 +131,8 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
         })?;
     #[cfg(windows)]
     let _com = ComInit::new();
+    #[cfg(target_os = "macos")]
+    crate::plugins::surface::initialize_worker_app()?;
     let mut host = Host::default();
     // Resolve scan-cache-missing identity only inside child, never in the parent.
     let mut info = init.info;
@@ -143,6 +163,8 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
         ctl: ctl.clone(),
     };
     let mut editor: Option<Box<dyn Editor>> = None;
+    // Drop the image mapping before its native source editor on every exit path.
+    let mut surface: Option<FrameMap> = None;
     let mut editor_id = 0;
     let initial_metadata = metadata(instance.as_ref(), &editor, editor_id)?;
     let mut metadata_cache = initial_metadata.clone();
@@ -162,159 +184,246 @@ pub fn worker_main(args: &[OsString]) -> Result<()> {
     *heartbeat.lock().unwrap() = Instant::now();
     startup_done.store(true, Ordering::Release);
     loop {
-        pump_native();
-        instance.idle();
-        if editor.as_mut().is_some_and(|e| !e.idle()) {
-            editor = None;
-        }
-        let req: Request = match protocol::receive(&mut socket) {
-            Ok(r) => r,
-            Err(e) => {
-                ctl.stop.store(true, Ordering::Release);
-                return Err(e);
+        // Drain native temporaries on quiet polls, command replies, and error paths.
+        if with_native_pool(|| -> Result<bool> {
+            pump_native()?;
+            instance.idle();
+            if editor.as_mut().is_some_and(|e| !e.idle()) {
+                surface = None;
+                editor = None;
             }
-        };
-        *heartbeat.lock().unwrap() = Instant::now();
-        if req.version != VERSION || req.generation != generation || req.id <= last_id {
-            bail!("invalid worker request generation/sequence")
-        }
-        last_id = req.id;
-        let mut reply = Reply {
-            version: VERSION,
-            generation,
-            id: req.id,
-            metadata: None,
-            state: None,
-            display: None,
-            error: None,
-        };
-        let command = req.command.clone();
-        let refresh_metadata = matches!(
-            &command,
-            Command::SetParam(_, _)
-                | Command::Load(_)
-                | Command::Open { .. }
-                | Command::Place(_, _)
-                | Command::Zoom(_, _)
-                | Command::Close(_)
-        );
-        let result: Result<()> = (|| {
-            match command {
-                Command::Poll => {}
-                Command::SetParam(id, v) => {
-                    if !v.is_finite() {
-                        bail!("invalid parameter value")
-                    }
-                    instance.set_param(id, v.clamp(0.0, 1.0));
+            if let (Some(editor), Some(surface)) = (editor.as_mut(), surface.as_ref())
+                && let Some(frame) = editor.take_frame()
+            {
+                surface.publish(&frame)?;
+            }
+            // Poll only for the start of a control frame. A quiet parent must not stop the
+            // worker's AppKit/native event pump or its independently paced capture updates.
+            if !request_pending(&mut socket)? {
+                return Ok(false);
+            }
+            let req: Request = match protocol::receive(&mut socket) {
+                Ok(r) => r,
+                Err(e) => {
+                    ctl.stop.store(true, Ordering::Release);
+                    return Err(e);
                 }
-                Command::Display(id, v) => {
-                    if !v.is_finite() {
-                        bail!("invalid display value")
+            };
+            *heartbeat.lock().unwrap() = Instant::now();
+            if req.version != VERSION || req.generation != generation || req.id <= last_id {
+                bail!("invalid worker request generation/sequence")
+            }
+            last_id = req.id;
+            let mut reply = Reply {
+                version: VERSION,
+                generation,
+                id: req.id,
+                metadata: None,
+                state: None,
+                display: None,
+                error: None,
+            };
+            let command = req.command.clone();
+            let refresh_metadata = matches!(
+                &command,
+                Command::SetParam(_, _)
+                    | Command::Load(_)
+                    | Command::Open { .. }
+                    | Command::Place(_, _)
+                    | Command::Zoom(_, _)
+                    | Command::Close(_)
+            );
+            let result: Result<()> = (|| {
+                match command {
+                    Command::Poll => {}
+                    Command::SetParam(id, v) => {
+                        if !v.is_finite() {
+                            bail!("invalid parameter value")
+                        }
+                        instance.set_param(id, v.clamp(0.0, 1.0));
                     }
-                    let mut s = instance.param_display(id, v);
-                    truncate(&mut s, 4096);
-                    reply.display = Some((id, v, s));
+                    Command::Display(id, v) => {
+                        if !v.is_finite() {
+                            bail!("invalid display value")
+                        }
+                        let mut s = instance.param_display(id, v);
+                        truncate(&mut s, 4096);
+                        reply.display = Some((id, v, s));
+                    }
+                    Command::Load(data) => {
+                        if data.len() > MAX_STATE {
+                            bail!("state exceeds limit")
+                        }
+                        park(&ctl, false)?;
+                        map.invalidate();
+                        let loaded = instance.load_state(&data);
+                        let proc = instance.restart(init.sr as f64, crate::engine::MAX_BLOCK)?;
+                        audio_tx
+                            .send_timeout(AudioMessage::Replace(proc), Duration::from_secs(1))
+                            .map_err(|_| {
+                                anyhow::anyhow!("child audio replacement queue timeout")
+                            })?;
+                        resume(&ctl)?;
+                        loaded?;
+                    }
+                    Command::Checkpoint => {
+                        // The command loop is the plugin main thread; CLAP/VST3 state APIs
+                        // are main-thread interfaces and do not require taking DSP offline.
+                        reply.state = instance.save_state();
+                        if reply.state.as_ref().is_some_and(|b| b.len() > MAX_STATE) {
+                            reply.state = None;
+                            bail!("state exceeds limit")
+                        }
+                    }
+                    Command::Open {
+                        token,
+                        placement,
+                        captured,
+                    } => {
+                        if token == 0 || token <= editor_id {
+                            bail!("invalid editor token")
+                        }
+                        if captured && !matches!(placement, Placement::Embedded(_)) {
+                            bail!("captured editor must be presented inside the graph")
+                        }
+                        surface = None;
+                        editor = None;
+                        let source = instance.open_editor(if captured {
+                            Placement::Window
+                        } else {
+                            placement
+                        })?;
+                        editor = Some(if captured {
+                            crate::plugins::surface::capture(source, placement)?
+                        } else {
+                            source
+                        });
+                        editor_id = token;
+                    }
+                    Command::SetSurface(token, descriptor) => {
+                        if token != editor_id
+                            || descriptor.token != token
+                            || descriptor.generation != generation
+                        {
+                            bail!("invalid editor surface generation/token")
+                        }
+                        if !editor.as_ref().is_some_and(|editor| editor.is_captured()) {
+                            bail!("editor does not support captured presentation")
+                        }
+                        surface = Some(FrameMap::open(&descriptor)?);
+                    }
+                    Command::Pointer {
+                        generation: input_generation,
+                        token,
+                        event,
+                    } => {
+                        event.validate()?;
+                        if input_generation == generation
+                            && token == editor_id
+                            && let Some(editor) =
+                                editor.as_mut().filter(|editor| editor.is_captured())
+                        {
+                            editor.pointer(event)?;
+                        }
+                    }
+                    Command::Place(token, spot) => {
+                        if spot.as_ref().is_some_and(|s| s.visible.len() > 256) {
+                            bail!("too many clipping rectangles")
+                        }
+                        if token == editor_id
+                            && let Some(e) = editor.as_mut()
+                        {
+                            e.place(spot.as_ref());
+                        }
+                    }
+                    Command::Zoom(token, f) => {
+                        if !f.is_finite() {
+                            bail!("invalid editor zoom")
+                        }
+                        if token == editor_id
+                            && let Some(e) = editor.as_mut()
+                            && !e.is_captured()
+                        {
+                            e.set_zoom(f.clamp(0.1, 8.0));
+                        }
+                    }
+                    Command::Close(token) => {
+                        if token == editor_id {
+                            surface = None;
+                            editor = None;
+                        }
+                    }
+                    Command::Shutdown => {
+                        ctl.stop.store(true, Ordering::Release);
+                        let _ = audio_tx.try_send(AudioMessage::Stop);
+                        return Ok(());
+                    }
                 }
-                Command::Load(data) => {
-                    if data.len() > MAX_STATE {
-                        bail!("state exceeds limit")
-                    }
-                    park(&ctl, false)?;
+                let restart = instance.wants_restart();
+                if restart {
+                    park(&ctl, true)?;
                     map.invalidate();
-                    let loaded = instance.load_state(&data);
                     let proc = instance.restart(init.sr as f64, crate::engine::MAX_BLOCK)?;
                     audio_tx
                         .send_timeout(AudioMessage::Replace(proc), Duration::from_secs(1))
                         .map_err(|_| anyhow::anyhow!("child audio replacement queue timeout"))?;
                     resume(&ctl)?;
-                    loaded?;
                 }
-                Command::Checkpoint => {
-                    // The command loop is the plugin main thread; CLAP/VST3 state APIs
-                    // are main-thread interfaces and do not require taking DSP offline.
-                    reply.state = instance.save_state();
-                    if reply.state.as_ref().is_some_and(|b| b.len() > MAX_STATE) {
-                        reply.state = None;
-                        bail!("state exceeds limit")
+                // Poll replies reuse the last snapshot. Commands that can change
+                // parameter displays, latency, or editor state refresh it once.
+                if restart || refresh_metadata || matches!(&req.command, Command::Poll) {
+                    let changed = if matches!(&req.command, Command::Poll) {
+                        metadata_changed(instance.as_ref(), &editor, editor_id, &metadata_cache)
+                    } else {
+                        true
+                    };
+                    if changed {
+                        let next_metadata = metadata(instance.as_ref(), &editor, editor_id)?;
+                        if serde_json::to_vec(&next_metadata)?
+                            != serde_json::to_vec(&metadata_cache)?
+                        {
+                            metadata_cache = next_metadata;
+                            reply.metadata = Some(metadata_cache.clone());
+                        }
                     }
                 }
-                Command::Open { token, placement } => {
-                    if token == 0 || token <= editor_id {
-                        bail!("invalid editor token")
-                    }
-                    editor = None;
-                    editor = Some(instance.open_editor(placement)?);
-                    editor_id = token;
-                }
-                Command::Place(token, spot) => {
-                    if spot.as_ref().is_some_and(|s| s.visible.len() > 256) {
-                        bail!("too many clipping rectangles")
-                    }
-                    if token == editor_id
-                        && let Some(e) = editor.as_mut()
-                    {
-                        e.place(spot.as_ref());
-                    }
-                }
-                Command::Zoom(token, f) => {
-                    if !f.is_finite() {
-                        bail!("invalid editor zoom")
-                    }
-                    if token == editor_id
-                        && let Some(e) = editor.as_mut()
-                    {
-                        e.set_zoom(f.clamp(0.1, 8.0));
-                    }
-                }
-                Command::Close(token) => {
-                    if token == editor_id {
-                        editor = None;
-                    }
-                }
-                Command::Shutdown => {
-                    ctl.stop.store(true, Ordering::Release);
-                    let _ = audio_tx.try_send(AudioMessage::Stop);
-                    return Ok(());
-                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                reply.error = Some(format!("{e:#}"));
             }
-            let restart = instance.wants_restart();
-            if restart {
-                park(&ctl, true)?;
-                map.invalidate();
-                let proc = instance.restart(init.sr as f64, crate::engine::MAX_BLOCK)?;
-                audio_tx
-                    .send_timeout(AudioMessage::Replace(proc), Duration::from_secs(1))
-                    .map_err(|_| anyhow::anyhow!("child audio replacement queue timeout"))?;
-                resume(&ctl)?;
+            protocol::send(&mut socket, &reply)?;
+            if ctl.stop.load(Ordering::Acquire) {
+                return Ok(true);
             }
-            // Poll replies reuse the last snapshot. Commands that can change
-            // parameter displays, latency, or editor state refresh it once.
-            if restart || refresh_metadata || matches!(&req.command, Command::Poll) {
-                let changed = if matches!(&req.command, Command::Poll) {
-                    metadata_changed(instance.as_ref(), &editor, editor_id, &metadata_cache)
-                } else {
-                    true
-                };
-                if changed {
-                    let next_metadata = metadata(instance.as_ref(), &editor, editor_id)?;
-                    if serde_json::to_vec(&next_metadata)? != serde_json::to_vec(&metadata_cache)? {
-                        metadata_cache = next_metadata;
-                        reply.metadata = Some(metadata_cache.clone());
-                    }
-                }
+            if ctl.failed.load(Ordering::Acquire) {
+                bail!("child audio thread failed")
             }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            reply.error = Some(format!("{e:#}"));
-        }
-        protocol::send(&mut socket, &reply)?;
-        if ctl.stop.load(Ordering::Acquire) {
+            Ok(false)
+        })? {
             return Ok(());
         }
-        if ctl.failed.load(Ordering::Acquire) {
-            bail!("child audio thread failed")
+    }
+}
+fn request_pending(socket: &mut TcpStream) -> Result<bool> {
+    let timeout = socket.read_timeout()?;
+    socket.set_read_timeout(Some(Duration::from_millis(8)))?;
+    let result = socket.peek(&mut [0]);
+    socket.set_read_timeout(timeout)?;
+    match result {
+        Ok(0) => bail!("control connection closed"),
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(false)
         }
+        Err(error) => Err(error.into()),
     }
 }
 fn metadata_changed(
@@ -330,6 +439,7 @@ fn metadata_changed(
         || e.is_some() != cached.editor_open
         || e.as_ref().map(|e| e.size()).unwrap_or((640, 480)) != cached.editor_size
         || editor_id != cached.editor_id
+        || e.as_ref().and_then(|e| e.capture_error()) != cached.editor_error.as_deref()
     {
         return true;
     }
@@ -359,6 +469,13 @@ fn metadata(i: &dyn Instance, e: &Option<Box<dyn Editor>>, editor_id: u64) -> Re
             (p.id, v, d)
         })
         .collect();
+    let mut editor_error = e
+        .as_ref()
+        .and_then(|e| e.capture_error())
+        .map(str::to_owned);
+    if let Some(error) = editor_error.as_mut() {
+        truncate(error, 4096);
+    }
     Ok(Metadata {
         params,
         values,
@@ -369,6 +486,7 @@ fn metadata(i: &dyn Instance, e: &Option<Box<dyn Editor>>, editor_id: u64) -> Re
         editor_size: e.as_ref().map(|e| e.size()).unwrap_or((640, 480)),
         editor_open: e.is_some(),
         editor_id,
+        editor_error,
     })
 }
 fn truncate(s: &mut String, max: usize) {
@@ -523,7 +641,7 @@ fn audio_loop(
     }
 }
 #[cfg(windows)]
-fn pump_native() {
+fn pump_native() -> Result<()> {
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
     };
@@ -537,9 +655,16 @@ fn pump_native() {
             DispatchMessageW(&msg);
         }
     }
+    Ok(())
 }
-#[cfg(not(windows))]
-fn pump_native() {}
+#[cfg(target_os = "macos")]
+fn pump_native() -> Result<()> {
+    crate::plugins::surface::pump_worker_app()
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn pump_native() -> Result<()> {
+    Ok(())
+}
 #[cfg(windows)]
 struct ComInit(bool);
 #[cfg(windows)]
@@ -564,5 +689,39 @@ impl Drop for ComInit {
                 windows::Win32::System::Com::CoUninitialize();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_poll_keeps_native_pump_live_without_consuming_control_bytes() {
+        use std::net::{Ipv4Addr, TcpListener};
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut parent = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut worker, _) = listener.accept().unwrap();
+        let timeout = Some(Duration::from_secs(3));
+        worker.set_read_timeout(timeout).unwrap();
+        assert!(!request_pending(&mut worker).unwrap());
+        assert_eq!(worker.read_timeout().unwrap(), timeout);
+        protocol::send(
+            &mut parent,
+            &Request {
+                version: VERSION,
+                generation: 1,
+                id: 1,
+                command: Command::Poll,
+            },
+        )
+        .unwrap();
+        assert!(request_pending(&mut worker).unwrap());
+        let request: Request = protocol::receive(&mut worker).unwrap();
+        assert!(matches!(request.command, Command::Poll));
+        assert_eq!(request.id, 1);
+        assert!(!request_pending(&mut worker).unwrap());
+        drop(parent);
+        assert!(request_pending(&mut worker).is_err());
     }
 }

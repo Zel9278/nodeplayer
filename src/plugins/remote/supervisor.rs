@@ -3,17 +3,22 @@ use super::{
     Core,
     protocol::{self, Command, Hello, Init, Reply, Request, VERSION},
     shared::{self, DELAY, Q, SLOTS, Shared},
+    surface::FrameMap,
 };
+use crate::plugins::surface::PointerKind;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::Receiver;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
-
     collections::HashMap,
     io::Write,
     net::{Ipv4Addr, TcpListener, TcpStream},
+    path::PathBuf,
     process::{Child, Command as ProcessCommand, Stdio},
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -34,8 +39,10 @@ pub(super) fn run(core: Arc<Core>, rx: Receiver<Command>, info: PluginInfo, sr: 
             journal.retain(|id, _| *id < 100);
         }
         status(&core, "starting");
+        clear_surface(&core, None);
         let result = session(&core, &rx, &info, sr, generation, &mut journal);
         core.ready.store(false, Ordering::Release);
+        clear_surface(&core, None);
         if core.stop.load(Ordering::Acquire) {
             break;
         }
@@ -103,6 +110,23 @@ impl Drop for OwnedChild {
         let _ = self.child.wait();
     }
 }
+/// Retain cleanup paths until the worker has been reaped, including failed surface setup.
+/// FrameMap still retries on its own Drop if a parent reader outlives that worker.
+#[derive(Default)]
+struct SurfaceFiles(Vec<PathBuf>);
+impl SurfaceFiles {
+    fn reclaim(&mut self) {
+        self.0.retain(|path| match std::fs::remove_file(path) {
+            Ok(()) => false,
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        });
+    }
+}
+impl Drop for SurfaceFiles {
+    fn drop(&mut self) {
+        self.reclaim();
+    }
+}
 fn session(
     core: &Arc<Core>,
     rx: &Receiver<Command>,
@@ -119,7 +143,8 @@ fn session(
         .map_err(|_| anyhow::anyhow!("OS random source unavailable"))?;
     let token: String = entropy.iter().map(|b| format!("{b:02x}")).collect();
     let serial = MAP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("nodeplayer-{}-{serial}.mmap", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("nodeplayer-{}-{serial}.mmap", std::process::id()));
     let map = Arc::new(Shared::create(path.clone(), generation)?);
     // Every mapping remains supervisor-owned through processor retirement. Old proxies may
     // be pending in the engine garbage queue; they cannot unmap on the audio thread.
@@ -137,7 +162,9 @@ fn session(
         .arg(&path)
         .arg(generation.to_string());
     if crate::runtime::get().data_root.is_some() {
-        command.arg("--data-root").arg(crate::runtime::get().data_root.as_ref().unwrap());
+        command
+            .arg("--data-root")
+            .arg(crate::runtime::get().data_root.as_ref().unwrap());
     }
     if crate::diagnostics::active().is_some() {
         command.env("NODEPLAYER_DIAGNOSTIC_WORKER", "1");
@@ -147,6 +174,8 @@ fn session(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // No inherited stdout/stderr pipes: a log-flooding plugin cannot deadlock the worker.
+    // Declared before child so cleanup runs after kill/reap on every exit path.
+    let mut surface_files = SurfaceFiles::default();
     let mut child = OwnedChild::new(command.spawn().context("spawn isolated plugin worker")?);
     if let Some(mut stdin) = child.child.stdin.take() {
         writeln!(stdin, "{token}")?;
@@ -237,7 +266,15 @@ fn session(
                 Ok(c) => {
                     // Even an identical Load is an ordering barrier: replayed journal writes or
                     // earlier queued parameter commands may have modified the restored state.
-                    transact_recorded(&mut stream, core, generation, &mut id, journal, c)?;
+                    transact_recorded(
+                        &mut stream,
+                        core,
+                        generation,
+                        &mut id,
+                        journal,
+                        &mut surface_files,
+                        c,
+                    )?;
                 }
                 Err(_) => break,
             }
@@ -250,12 +287,33 @@ fn session(
         let mut checkpoint_at = Instant::now();
         loop {
             reclaim(core);
+            surface_files.reclaim();
+            let close = core.close_editor.swap(0, Ordering::AcqRel);
+            if close != 0 {
+                transact_recorded(
+                    &mut stream,
+                    core,
+                    generation,
+                    &mut id,
+                    journal,
+                    &mut surface_files,
+                    Command::Close(close),
+                )?;
+            }
             if core.stop.load(Ordering::Acquire) {
                 // Drain the finite bounded queue before shutdown so the final checkpoint and
                 // other already-enqueued UI commands land before the worker is closed.
                 for _ in 0..128 {
                     match rx.try_recv() {
-                        Ok(c) => transact_recorded(&mut stream, core, generation, &mut id, journal, c)?,
+                        Ok(c) => transact_recorded(
+                            &mut stream,
+                            core,
+                            generation,
+                            &mut id,
+                            journal,
+                            &mut surface_files,
+                            c,
+                        )?,
                         Err(_) => break,
                     }
                 }
@@ -295,7 +353,15 @@ fn session(
                 compact.push(Command::Poll);
             }
             for c in compact {
-                transact_recorded(&mut stream, core, generation, &mut id, journal, c)?;
+                transact_recorded(
+                    &mut stream,
+                    core,
+                    generation,
+                    &mut id,
+                    journal,
+                    &mut surface_files,
+                    c,
+                )?;
             }
             if checkpoint_at.elapsed() > Duration::from_secs(30) {
                 transact_recorded(
@@ -304,6 +370,7 @@ fn session(
                     generation,
                     &mut id,
                     journal,
+                    &mut surface_files,
                     Command::Checkpoint,
                 )?;
                 checkpoint_at = Instant::now();
@@ -311,6 +378,7 @@ fn session(
         }
     })();
     core.ready.store(false, Ordering::Release);
+    clear_surface(core, None);
     drop(child); // kill + reap here, never on parent UI/audio thread
     // Shared::Drop unmaps then removes its file; reclaim() retains busy generations until
     // all transient processors have retired. No per-generation cleanup thread is needed.
@@ -343,8 +411,22 @@ fn transact_recorded(
     generation: u64,
     id: &mut u64,
     journal: &mut HashMap<u32, f64>,
+    surface_files: &mut SurfaceFiles,
     c: Command,
 ) -> Result<()> {
+    let captured_open = match &c {
+        Command::Open {
+            token, captured, ..
+        } => {
+            clear_surface(core, None);
+            (*captured).then_some(*token)
+        }
+        Command::Close(token) => {
+            clear_surface(core, Some(*token));
+            None
+        }
+        _ => None,
+    };
     let checkpoint = matches!(&c, Command::Checkpoint);
     let long_timeout = checkpoint || matches!(&c, Command::Load(_));
     remember(core, journal, &c);
@@ -352,11 +434,35 @@ fn transact_recorded(
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     }
     let cached_state = transact(stream, core, generation, id, c)?;
+    if let Some(token) = captured_open {
+        // Native attachment already succeeded. Create image storage away from the UI and
+        // RT threads, then publish it only after the matching worker has opened it.
+        let surface = Arc::new(FrameMap::create(generation, token)?);
+        surface_files.0.push(surface.descriptor().path);
+        transact(
+            stream,
+            core,
+            generation,
+            id,
+            Command::SetSurface(token, surface.descriptor()),
+        )?;
+        let _ = surface.unlink(); // Windows may retain the pathname until final unmapping.
+        *core.surface.lock().unwrap() = Some(surface);
+    }
     if long_timeout {
         stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     }
     checkpoint_journal(journal, checkpoint && cached_state);
     Ok(())
+}
+fn clear_surface(core: &Core, token: Option<u64>) {
+    if let Ok(mut surface) = core.surface.lock()
+        && surface
+            .as_ref()
+            .is_some_and(|map| token.is_none_or(|token| map.token() == token))
+    {
+        *surface = None;
+    }
 }
 fn checkpoint_journal(journal: &mut HashMap<u32, f64>, cached_state: bool) {
     // Without a new blob, the old cached state still needs its parameter overlay.
@@ -370,10 +476,11 @@ fn coalesce(commands: Vec<Command>) -> Vec<Command> {
     for c in commands {
         // Never move a write across state/editor lifecycle operations. In particular,
         // SetParam(A), Load(state), SetParam(B) must apply B after the state restore.
-        if !matches!(
+        let mergeable = matches!(
             &c,
             Command::SetParam(..) | Command::Display(..) | Command::Place(..) | Command::Zoom(..)
-        ) {
+        ) || matches!(&c, Command::Pointer { event, .. } if matches!(event.kind, PointerKind::Move));
+        if !mergeable {
             compact.push(c);
             segment = compact.len();
             continue;
@@ -392,6 +499,23 @@ fn same_key(a: &Command, b: &Command) -> bool {
         | (Command::Zoom(a, _), Command::Zoom(b, _)) => a == b,
         (Command::Display(a, _), Command::Display(b, _))
         | (Command::SetParam(a, _), Command::SetParam(b, _)) => a == b,
+        (
+            Command::Pointer {
+                generation: ga,
+                token: a,
+                event: ea,
+            },
+            Command::Pointer {
+                generation: gb,
+                token: b,
+                event: eb,
+            },
+        ) => {
+            ga == gb
+                && a == b
+                && matches!(ea.kind, PointerKind::Move)
+                && matches!(eb.kind, PointerKind::Move)
+        }
         _ => false,
     }
 }
@@ -444,6 +568,9 @@ fn validate(r: &Reply, generation: u64, id: u64) -> Result<()> {
         m.params.len() > protocol::MAX_PARAMS
             || m.values.len() > protocol::MAX_PARAMS
             || m.latency as usize > shared::MAX_LATENCY
+            || m.editor_error
+                .as_ref()
+                .is_some_and(|error| error.len() > 4096)
     }) {
         bail!("invalid worker metadata")
     }
@@ -526,13 +653,67 @@ impl Drop for WinJob {
 mod tests {
     use super::*;
 
+    #[test]
+    fn killed_surface_worker_retries_cleanup_after_reaping() -> Result<()> {
+        let map = FrameMap::create(99, 88)?;
+        let descriptor = map.descriptor();
+        let mut files = SurfaceFiles(vec![descriptor.path.clone()]);
+        let mut child = OwnedChild::new(
+            ProcessCommand::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "plugins::remote::supervisor::tests::surface_worker_holds_mapping_until_killed",
+                ])
+                .env("NODEPLAYER_KILLED_SURFACE_TEST_PATH", &descriptor.path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while map.take_latest()?.is_none() {
+            if child.child.try_wait()?.is_some() || Instant::now() >= deadline {
+                bail!("surface worker did not open its mapping");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // On Windows this early cleanup is denied while the worker retains the mapping.
+        // Termination skips the child's Rust destructors; the supervisor must retry.
+        drop(map);
+        drop(child);
+        files.reclaim();
+        assert!(files.0.is_empty());
+        assert!(!descriptor.path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn surface_worker_holds_mapping_until_killed() -> Result<()> {
+        let Some(path) = std::env::var_os("NODEPLAYER_KILLED_SURFACE_TEST_PATH") else {
+            return Ok(());
+        };
+        let map = FrameMap::open(&super::super::surface::SurfaceDescriptor {
+            path: path.into(),
+            generation: 99,
+            token: 88,
+        })?;
+        map.publish(&crate::plugins::surface::EditorFrame {
+            width: 1,
+            height: 1,
+            native_size: (1, 1),
+            rgba: vec![1, 2, 3, 255],
+        })?;
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
     fn encoded(commands: Vec<Command>) -> serde_json::Value {
         serde_json::to_value(commands).unwrap()
     }
 
     #[test]
     fn unchanged_checkpoint_advances_wait_sequence() {
-        use super::super::{Snapshot, AtomicBool, AtomicU32, Mutex};
+        use super::super::{AtomicBool, AtomicU32, Mutex, Snapshot};
 
         let (tx, _rx) = crossbeam_channel::bounded(1);
         let blob = vec![1, 2, 3];
@@ -541,6 +722,8 @@ mod tests {
             recover: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             map: Mutex::new(None),
+            surface: Mutex::new(None),
+            close_editor: AtomicU64::new(0),
             retired: Mutex::new(Vec::new()),
             cursor: AtomicU64::new(0),
             algorithm_latency: AtomicU32::new(0),
@@ -559,15 +742,19 @@ mod tests {
             tx,
         };
         let seq_before = core.snapshot.lock().unwrap().checkpoint_seq;
-        apply(&core, Reply {
-            version: VERSION,
-            generation: 0,
-            id: 0,
-            metadata: None,
-            state: Some(blob.clone()),
-            display: None,
-            error: None,
-        }).unwrap();
+        apply(
+            &core,
+            Reply {
+                version: VERSION,
+                generation: 0,
+                id: 0,
+                metadata: None,
+                state: Some(blob.clone()),
+                display: None,
+                error: None,
+            },
+        )
+        .unwrap();
         let snapshot = core.snapshot.lock().unwrap();
         assert!(snapshot.checkpoint_seq > seq_before);
         assert_eq!(snapshot.state, Some(blob));
@@ -580,7 +767,9 @@ mod tests {
             tx.try_send(Command::SetParam(i, i as f64 / 127.0)).unwrap();
         }
         tx.try_send(Command::Checkpoint).unwrap();
-        let drained = (0..128).filter_map(|_| rx.try_recv().ok()).collect::<Vec<_>>();
+        let drained = (0..128)
+            .filter_map(|_| rx.try_recv().ok())
+            .collect::<Vec<_>>();
         assert_eq!(drained.len(), 128);
         assert!(matches!(drained.last(), Some(Command::Checkpoint)));
         assert!(rx.try_recv().is_err());
@@ -601,6 +790,7 @@ mod tests {
             Command::Open {
                 token: 2,
                 placement: Placement::Window,
+                captured: false,
             },
             Command::Zoom(2, 2.0),
             Command::Zoom(2, 3.0),
@@ -616,6 +806,7 @@ mod tests {
             Command::Open {
                 token: 2,
                 placement: Placement::Window,
+                captured: false,
             },
             Command::Zoom(2, 3.0),
         ];
@@ -663,6 +854,43 @@ mod tests {
             Command::SetParam(1, 0.3),
         ];
         let expected = vec![Command::SetParam(1, 0.3), Command::SetParam(2, 0.2)];
+        assert_eq!(encoded(coalesce(commands)), encoded(expected));
+    }
+
+    #[test]
+    fn pointer_move_coalescing_preserves_buttons_wheel_and_generation() {
+        use crate::plugins::surface::EditorPointer;
+        let event = |generation, kind, x, buttons| Command::Pointer {
+            generation,
+            token: 3,
+            event: EditorPointer {
+                position: [x, 20.0],
+                kind,
+                buttons,
+            },
+        };
+        let commands = vec![
+            event(1, PointerKind::Move, 1.0, 0),
+            event(1, PointerKind::Move, 2.0, 0),
+            event(1, PointerKind::Down(1), 3.0, 1),
+            event(1, PointerKind::Move, 4.0, 1),
+            event(1, PointerKind::Move, 5.0, 1),
+            event(1, PointerKind::Wheel { dx: 0.0, dy: 12.0 }, 6.0, 1),
+            event(1, PointerKind::Move, 7.0, 1),
+            event(1, PointerKind::Up(1), 8.0, 0),
+            event(1, PointerKind::Move, 9.0, 0),
+            event(2, PointerKind::Move, 10.0, 0),
+        ];
+        let expected = vec![
+            event(1, PointerKind::Move, 2.0, 0),
+            event(1, PointerKind::Down(1), 3.0, 1),
+            event(1, PointerKind::Move, 5.0, 1),
+            event(1, PointerKind::Wheel { dx: 0.0, dy: 12.0 }, 6.0, 1),
+            event(1, PointerKind::Move, 7.0, 1),
+            event(1, PointerKind::Up(1), 8.0, 0),
+            event(1, PointerKind::Move, 9.0, 0),
+            event(2, PointerKind::Move, 10.0, 0),
+        ];
         assert_eq!(encoded(coalesce(commands)), encoded(expected));
     }
 }
