@@ -570,10 +570,14 @@ impl IBStreamTrait for MemoryStream {
     unsafe fn seek(&self, pos: int64, mode: int32, result: *mut int64) -> tresult {
         use IBStream_::IStreamSeekMode_::*;
         let len = self.data.borrow().len() as i64;
+        #[cfg(windows)]
+        let (seek_set, seek_cur, seek_end) = (kIBSeekSet as u32, kIBSeekCur as u32, kIBSeekEnd as u32);
+        #[cfg(not(windows))]
+        let (seek_set, seek_cur, seek_end) = (kIBSeekSet, kIBSeekCur, kIBSeekEnd);
         let base = match mode as u32 {
-            m if m == kIBSeekSet as u32 => 0,
-            m if m == kIBSeekCur as u32 => self.pos.get() as i64,
-            m if m == kIBSeekEnd as u32 => len,
+            m if m == seek_set => 0,
+            m if m == seek_cur => self.pos.get() as i64,
+            m if m == seek_end => len,
             _ => return kInvalidArgument,
         };
         let new = (base + pos).max(0);

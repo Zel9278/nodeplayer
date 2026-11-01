@@ -349,7 +349,7 @@ fn test_editor(bundle: &Path, name: &str, out: &Path) -> Result<()> {
     let geo = conn.get_geometry(win)?.reply()?;
     let img = conn.get_image(ImageFormat::Z_PIXMAP, win, 0, 0, geo.width, geo.height, !0)?.reply()?;
     let mut ppm = format!("P6 {} {} 255\n", geo.width, geo.height).into_bytes();
-    for px in img.data.chunks_exact(4) {
+    for px in img.data.as_chunks::<4>().0.iter() {
         ppm.extend_from_slice(&[px[2], px[1], px[0]]);
     }
     std::fs::write(out, ppm)?;
