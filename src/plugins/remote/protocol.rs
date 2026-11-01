@@ -1,11 +1,13 @@
 //! Versioned, length-bounded control plane. Never carried on plugin stdout.
 use super::super::{ParamDesc, Placement, PluginInfo, Spot};
+use super::surface::SurfaceDescriptor;
+use crate::plugins::surface::EditorPointer;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_STATE: usize = 1024 * 1024;
 pub const MAX_PARAMS: usize = 8192;
@@ -36,6 +38,7 @@ pub struct Metadata {
     pub editor_size: (u32, u32),
     pub editor_open: bool,
     pub editor_id: u64,
+    pub editor_error: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Command {
@@ -44,7 +47,17 @@ pub enum Command {
     Display(u32, f64),
     Load(Vec<u8>),
     Checkpoint,
-    Open { token: u64, placement: Placement },
+    Open {
+        token: u64,
+        placement: Placement,
+        captured: bool,
+    },
+    SetSurface(u64, SurfaceDescriptor),
+    Pointer {
+        generation: u64,
+        token: u64,
+        event: EditorPointer,
+    },
     Place(u64, Option<Spot>),
     Zoom(u64, f32),
     Close(u64),

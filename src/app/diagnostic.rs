@@ -6,7 +6,7 @@ use serde_json::json;
 
 pub(super) struct GuiDiagnostic {
     run: Arc<DiagnosticRun>,
-    node: Option<NodeId>,
+    pub(super) node: Option<NodeId>,
     next: usize,
     step_started: Instant,
     last_status: String,
@@ -16,6 +16,7 @@ pub(super) struct GuiDiagnostic {
     next_telemetry: Instant,
     step_requested: bool,
     restart_saw_down: bool,
+    pub(super) editor_zoom: Option<f32>,
 }
 
 impl App {
@@ -57,6 +58,7 @@ impl App {
             next_telemetry: Instant::now(),
             step_requested: false,
             restart_saw_down: false,
+            editor_zoom: None,
         });
     }
 
@@ -69,7 +71,7 @@ impl App {
             self.diagnostic = Some(diagnostic);
             return;
         }
-        let result = self.advance_diagnostic(&mut diagnostic);
+        let result = self.advance_diagnostic(&mut diagnostic, ctx);
         let outcome = if let Err(error) = result {
             log::error!("diagnostic scenario failed: {error:#}");
             Some((Outcome::Failed, "scenario operation failed"))
@@ -87,7 +89,7 @@ impl App {
         self.diagnostic = Some(diagnostic);
     }
 
-    fn advance_diagnostic(&mut self, diagnostic: &mut GuiDiagnostic) -> Result<()> {
+    fn advance_diagnostic(&mut self, diagnostic: &mut GuiDiagnostic, ctx: &egui::Context) -> Result<()> {
         let run = &diagnostic.run;
         if !diagnostic.started {
             diagnostic.started = true;
@@ -194,6 +196,34 @@ impl App {
         };
         let mut complete = true;
         match step {
+            Step::GraphZoom { factor } => {
+                diagnostic.editor_zoom = Some(factor);
+                run.event("graph-zoom", json!({"factor":factor}))?;
+            }
+            Step::Screenshot { name } => {
+                complete = false;
+                if !diagnostic.step_requested {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(name.clone())));
+                    diagnostic.step_requested = true;
+                }
+                for event in ctx.input(|input| input.events.clone()) {
+                    if let egui::Event::Screenshot { user_data, image, .. } = event
+                        && user_data.data.as_ref().and_then(|data| data.downcast_ref::<String>()) == Some(&name)
+                    {
+                        let bytes: Vec<u8> = image.pixels.iter().flat_map(|pixel| pixel.to_array()).collect();
+                        image::save_buffer(run.root.join(format!("{name}.png")), &bytes, image.width() as u32, image.height() as u32, image::ColorType::Rgba8)?;
+                        let dimensions = diagnostic.node.and_then(|id| match &self.snarl[id].kind {
+                            NodeKind::Plugin(plugin) => plugin.editor_view.dimensions(),
+                            _ => None,
+                        });
+                        run.event("screenshot", json!({"name":name,"graph_zoom":self.zoom,"editor_dimensions":dimensions}))?;
+                        complete = true;
+                    }
+                }
+                if !complete && diagnostic.step_started.elapsed() >= Duration::from_secs(5) {
+                    bail!("diagnostic screenshot deadline");
+                }
+            }
             Step::WaitEvent { event, timeout_ms } => {
                 complete = run.event_seen(&event);
                 if !complete

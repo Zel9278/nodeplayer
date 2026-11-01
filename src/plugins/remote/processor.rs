@@ -385,6 +385,8 @@ mod tests {
             ready: AtomicBool::new(true),
             map: Mutex::new(Some(map)),
             retired: Mutex::new(Vec::new()),
+            surface: Mutex::new(None),
+            close_editor: AtomicU64::new(0),
             cursor: AtomicU64::new(0),
             next_editor: AtomicU64::new(0),
             algorithm_latency: AtomicU32::new(0),
