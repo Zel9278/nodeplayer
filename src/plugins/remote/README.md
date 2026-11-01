@@ -45,6 +45,7 @@ Current **provisional**, not performance-qualified values:
 | Parameter count | 8192 |
 | Control frame | 8 MiB |
 | Parent control queue | 128 commands |
+| Captured editor image | 8192 per dimension, 16 Mi pixels / 64 MiB RGBA maximum |
 
 The adapter collects Q from arbitrary callback lengths. Output from input sample S
 is delivered only at S+D; plugin algorithm latency is reported separately and is
@@ -114,27 +115,24 @@ proxies retire. Retired generations are reclaimed on the supervisor thread once
 no processor references remain. Shared Drop unmaps before unlink (important on
 Windows). This favors safety over early cleanup if the engine leaks a proxy.
 
-Child DSP thread alone calls old Processor::deactivate. State load/save and plugin
-restart park DSP, invalidate the epoch, invoke main-thread instance operation,
-and send the replacement processor back to the same child audio thread. A
-child-only join guard ensures DSP exits before plugin Instance/module teardown;
-if a plugin hangs here parent supervisor kills/reaps it. Before checkpoint or
-plugin-requested restart, the child processes one silent Q-frame quantum and
-discards its outputs to drain queued parameter writes. This advances internal
-plugin state by Q and is not a transparent/seamless snapshot. State load skips
-that drain because the incoming state supersedes preceding parameter writes.
+Child DSP thread alone calls old Processor::deactivate. State load and plugin-requested
+restart park DSP, invalidate the epoch, invoke the main-thread instance operation,
+and send the replacement processor back to the same child audio thread. A child-only
+join guard ensures DSP exits before plugin Instance/module teardown; if a plugin hangs
+here the parent supervisor kills/reaps it. Before plugin-requested restart, a discarded
+silent Q-frame quantum drains queued parameter writes. State load skips that drain.
+Checkpoints save the live instance on the worker's main thread without restarting DSP.
 
-Parent parameter/state/editor operations only use caches and bounded enqueue.
-Queue-full `load_state` returns an error; parameter/editor writes may be dropped
-and retried by normal UI updates. Supervisor coalesces geometry/zoom and repeated
-parameter/display writes within bounded batches. Save returns last cached state
-and requests a new checkpoint; initial cache may be absent. Requested load blobs
-are preserved through faults. Automatic checkpoint interval is 30 s; checkpoint
-itself quiesces/restarts child DSP and may audibly interrupt processing. Parameter
-journal is replayed after cached state on manual restart. A requested state load
-clears preceding parameter writes; an acknowledged checkpoint clears the journal
-only when it supplies a new cached state. Coalescing never crosses state/editor
-lifecycle barriers. This is still not a transactional state/parameter version history.
+Parent parameter/editor operations use caches and bounded enqueue. Queue-full
+`load_state` returns an error; parameter/native-placement writes may be dropped and
+retried by normal UI updates. Captured button transitions have a separate bounded
+retry queue. Supervisor coalescing never crosses state/editor lifecycle barriers.
+Explicit saves wait up to 3 s for a checkpoint sequence acknowledgement, including an
+unchanged state blob; timeout falls back to the cache, which may initially be absent.
+Requested load blobs are preserved through faults. Automatic checkpoint interval is
+30 s. Parameter journal is replayed after cached state on manual restart; a requested
+load or acknowledged state checkpoint clears the preceding parameter overlay. This is
+still not a transactional state/parameter version history.
 The known diagnostic fixture's fault trigger params >=100 are not replayed on
 manual restart. This deterministic fixture-only behavior is enabled by the parent's
 `NODEPLAYER_DIAGNOSTIC_WORKER=1` marker (diagnostic scenario runs only); production
@@ -147,23 +145,53 @@ are required before considering this backend production-ready.
 
 ## Editors and supported displays
 
-Parent RemoteEditor performs **no native window operations**. It queues Open,
-Place(Spot), Zoom and Close; child opens existing Instance editor at Embedded
-parent HWND/XID or Window and owns every resize/reparent/clip/native call.
-Windows child pumps PeekMessageW/TranslateMessage/DispatchMessageW in bounded
-batches and initializes COM apartment. Linux relies on existing editor idle/run
-loop behavior. macOS and displays with no X11 DISPLAY (native Wayland) are rejected
-before isolation startup. XWayland is allowed but unverified.
+Parent RemoteEditor performs **no native window operations**. Without
+`--experimental-editor-capture`, it queues Open, Place(Spot), Zoom and Close; the
+child embeds its editor in a parent HWND/XID or owns a top-level window.
+Cross-process HWND embedding can still induce OS-level synchronous interactions in
+the parent toolkit; this native mode does not prove GUI-hang isolation.
 
-Cross-process HWND embedding can still induce OS-level synchronous interactions
-in the parent toolkit. Avoiding native calls in RemoteEditor is necessary but
-**does not prove GUI-hang isolation**. Required embed/zoom/clip/DPI/focus/modal/GUI
-hang tests must be measured. macOS remote NSView is not implemented.
+With capture enabled, an embedded editor request instead creates the source in its
+own visible worker window. AppKit/PrintWindow/XComposite capture and native pointer
+delivery stay on the worker main thread. The parent paints the image in the ordinary
+graph layer, checks coverage after all nodes/layers are known, and inverse-maps input.
+Graph movement and zoom do not move, mask, resize, or rescale the native source.
+Pop-out editors retain ordinary native behavior.
+
+Captured RGBA8 pixels use a separate bounded latest-frame mmap; they never enter the
+audio slots or the JSON control replies. Atomic slot ownership allows replacing an
+unread frame and prevents overwriting one the parent is copying. Header/format,
+dimensions, byte count, frame sequence, worker generation, and editor token are
+validated before pixels become an egui texture. A retired surface cannot feed a
+replacement editor. Supervisor creates/maps storage off the UI thread, and both
+peers retry file cleanup after unmapping. The supervisor also retains cleanup paths
+until the worker is reaped, covering forced termination and failed surface setup.
+
+Pointer messages carry the same worker generation and editor token. Adjacent moves
+may coalesce; button and wheel barriers preserve order. Transitions retry through
+queue pressure without blocking the parent. If even the bounded transition queue
+fills, a reserved close slot closes the editor rather than leaving a stuck drag.
+Keyboard/IME, drag-and-drop, and separate popup windows are not bridged. The source
+must stay visible/mapped, and GPU editor capture remains renderer-dependent.
+Capture uses CPU readback/upload at approximately 30 updates per second; this is not
+a production bandwidth/latency qualification.
+
+Windows pumps bounded native message batches and initializes COM. macOS requires
+captured mode for isolation, initializes AppKit in the worker, and pumps events even
+when no control request is pending; startup/teardown and every worker iteration use
+autorelease pools. No parent NSView pointer crosses the boundary.
+Linux relies on existing editor idle/run-loop behavior and requires X11/XWayland.
+Native Wayland is unsupported. Plugin modules remain mapped until process exit so
+deferred GUI cleanup can finish after editor destruction.
 
 ## Tests in this module
 
 - A second real mmap validates slot publication and generation checks.
 - An oversized control prefix is rejected before body allocation.
+- Image transport checks malformed headers, bounds, stale sequences, concurrent copies,
+  unread-frame replacement, cleanup, and publication from a real child process.
+- Captured input tests cover queue pressure, transition order, reserved close, stale
+  generations/tokens, and native placement/scale suppression.
 - A deterministic in-memory echo consumer exercises irregular 1/127/256/511/512/
   1024 callbacks, exact D audio/MIDI arrival, late result rejection, full slots,
   busy-slot ownership, full-output overwrite and processing-epoch invalidation.

@@ -36,6 +36,16 @@ that can only be resized get the zoomed size, and the rest keep their own size. 
 windows, tooltips and nodes in front of an editor show over it, and clicks there go to them,
 not to the plugin.
 
+`--experimental-editor-capture` displays VST3/CLAP editors as images in the graph.
+The editor image, frame, and overlapping UI zoom and move together without changing the
+plugin's own UI scale. The source editor remains in a separate visible window; closing it
+also closes its graph image. Clicks and drags are forwarded to the source, and Alt+wheel
+forwards wheel input. Keyboard/IME, drag-and-drop, and separate native popup windows are
+not forwarded; use the source window or **Pop out** for those interactions. Capture can
+fail for some GPU-rendered editors. The flag also works with
+`--experimental-plugin-isolation`, where capture and native input stay in the worker.
+On macOS, isolation requires this captured-editor mode. Linux requires X11/XWayland.
+
 JSFX nodes show the effect's visible sliders, and effects with graphics (`@gfx`) draw them in
 the node, with the mouse, wheel, keys and `gfx_showmenu` menus working. Hidden sliders are under
 "Params".

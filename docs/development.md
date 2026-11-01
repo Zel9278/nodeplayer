@@ -51,6 +51,17 @@ enables only delay compensation. See the [remote backend](<../src/plugins/remote
 for architecture and limitations. Machine-specific plugins, diagnostic scenarios and
 private notes can be kept under the ignored `.local/` directory.
 
+Captured editor presentation is independently enabled with `--experimental-editor-capture`.
+It works with local hosting or alongside `--experimental-plugin-isolation`; on macOS the
+latter requires capture, since native NSView parenting cannot cross a process boundary.
+The native source stays visible, and graph zoom never requests a plugin UI-scale change.
+See [plugins](plugins.md) for input and renderer limitations.
+
+Diagnostic GUI scenarios can wait for `editor-frame` to confirm that an actual captured
+image reached the parent renderer. Explicit `graph-zoom` steps accept a `factor` between
+0.2 and 3.0, and `screenshot` steps save a PNG named by their `name` in the run artifacts.
+Screenshot names contain only letters, digits, hyphens, or underscores.
+
 ## Releases
 
 Pushing a `v*` tag builds every platform and publishes a GitHub release with the archives

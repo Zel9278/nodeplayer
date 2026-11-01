@@ -89,7 +89,9 @@ fn main() -> Result<()> {
     }
     if runtime::get().experimental_plugin_isolation {
         #[cfg(target_os = "macos")]
-        anyhow::bail!("plugin isolation with embedded editors is not implemented on macOS yet");
+        if !runtime::get().experimental_editor_capture {
+            anyhow::bail!("macOS plugin isolation requires --experimental-editor-capture");
+        }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         if std::env::var_os("NODEPLAYER_WAYLAND").is_some() || std::env::var_os("DISPLAY").is_none()
         {

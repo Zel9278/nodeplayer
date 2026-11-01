@@ -5,6 +5,7 @@
 pub mod dylib;
 pub mod guard;
 pub mod remote;
+pub mod surface;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub mod x11win;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -295,6 +296,23 @@ pub trait Editor {
     fn placement(&self) -> Placement;
     /// Size in physical pixels.
     fn size(&self) -> (u32, u32);
+    /// Native handle used only by a capture adapter in the editor's owner process.
+    fn native_handle(&self) -> Option<WindowId> {
+        None
+    }
+    fn is_captured(&self) -> bool {
+        false
+    }
+    /// Takes the newest completed image; older images need not be queued.
+    fn take_frame(&mut self) -> Option<surface::EditorFrame> {
+        None
+    }
+    fn pointer(&mut self, _event: surface::EditorPointer) -> Result<()> {
+        Ok(())
+    }
+    fn capture_error(&self) -> Option<&str> {
+        None
+    }
     /// Asks the editor to draw at `factor` (graph zoom × display scale), if it can.
     fn set_zoom(&mut self, _factor: f32) {}
     /// Shows an embedded editor at `spot`, or hides it; see [`window::HostWindow::place`].

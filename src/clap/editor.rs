@@ -146,6 +146,10 @@ impl crate::plugins::Editor for ClapEditor {
         self.window.size()
     }
 
+    fn native_handle(&self) -> Option<crate::plugins::WindowId> {
+        Some(self.window.handle())
+    }
+
     fn set_zoom(&mut self, factor: f32) {
         let f = ((factor * 100.0).round() / 100.0).clamp(0.25, 4.0);
         if (f - self.want_zoom.0).abs() > 1e-3 {

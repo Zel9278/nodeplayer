@@ -237,6 +237,10 @@ impl crate::plugins::Editor for Editor {
         self.window.size()
     }
 
+    fn native_handle(&self) -> Option<crate::plugins::WindowId> {
+        Some(self.window.handle())
+    }
+
     /// Applied once the value has settled for a moment, since re-laying out a plugin GUI is slow.
     fn set_zoom(&mut self, factor: f32) {
         let f = ((factor * 100.0).round() / 100.0).clamp(0.25, 4.0);
