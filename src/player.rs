@@ -1338,6 +1338,29 @@ mod tests {
         (l, pos)
     }
 
+    /// Plays on until the player tells the end, as fast as the decoder goes: pacing it with
+    /// sleeps would make a slow machine's timer the limit.
+    fn play_to_end(src: &mut PlayerSource, player: &Player) {
+        let mut out = vec![StereoBuf::new()];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut played = 0usize;
+        while !player.take_ended() {
+            let eof = src.shared.eof.load(Ordering::Acquire);
+            assert!(
+                Instant::now() < deadline,
+                "no end after {played} frames: position {}, eof {eof}, playing {}",
+                player.position(),
+                player.is_playing(),
+            );
+            if !eof && src.ring.slots() < 1024 && !src.shared.flush.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            src.process(512, &mut [], &mut out);
+            played += 512;
+        }
+    }
+
     #[test]
     fn seeking_lands_on_the_exact_time() {
         let path = ramp_wav("seek", 1.0);
@@ -1402,11 +1425,7 @@ mod tests {
 
         // Off, it plays to the end.
         player.set_loop(None);
-        assert!(wait_for(|| {
-            let mut out = vec![StereoBuf::new()];
-            src.process(512, &mut [], &mut out);
-            player.take_ended()
-        }));
+        play_to_end(&mut src, &player);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
