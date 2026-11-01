@@ -566,7 +566,11 @@ pub struct Misskey {
 
 impl Misskey {
     pub fn new(ctx: egui::Context) -> Self {
-        let settings = Settings::load();
+        let settings = if crate::runtime::get().allow_network() {
+            Settings::load()
+        } else {
+            Settings::default()
+        };
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             saved: settings.clone(),

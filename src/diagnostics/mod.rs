@@ -1,5 +1,6 @@
 //! Explicit, dedicated diagnostic runs. All artifact I/O is control-thread only.
 //! This is a reproducibility harness, not a security boundary for third-party plugins.
+pub mod bridge;
 pub mod metrics;
 pub mod scenario;
 use crate::runtime::RuntimeOptions;

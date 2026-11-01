@@ -39,42 +39,66 @@ mod vst3;
 mod x11_errors;
 mod yabridge;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Result, anyhow};
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,nodeplayer=info")).init();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("--scan-plugin") => {
-            let (Some(format), Some(path)) = (args.get(1), args.get(2)) else {
-                return Err(anyhow!("usage: --scan-plugin <format> <path>"));
-            };
-            return plugins::scan_main(format, Path::new(path));
-        }
-        Some("--test-plugin") => {
-            let (Some(format), Some(path)) = (args.get(1), args.get(2)) else {
-                return Err(anyhow!("usage: --test-plugin <format> <path> [name filter]"));
-            };
-            return test_plugin(format, Path::new(path), args.get(3).map(String::as_str).unwrap_or(""));
-        }
-        Some("--test-vst3") => {
-            let bundle = args.get(1).ok_or_else(|| anyhow!("usage: --test-vst3 <bundle> [name]"))?;
-            return test_vst3(Path::new(bundle), args.get(2).map(String::as_str).unwrap_or(""));
-        }
-        Some("--test-editor") => {
-            let usage = "usage: --test-editor <bundle> <name> <out.ppm>";
-            let (Some(b), Some(n), Some(o)) = (args.get(1), args.get(2), args.get(3)) else {
-                return Err(anyhow!(usage));
-            };
-            return test_editor(Path::new(b), n, Path::new(o));
-        }
-        _ => {}
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,nodeplayer=info"),
+    )
+    .init();
+    let mut parsed = runtime::parse_args(std::env::args_os().skip(1))?;
+    if matches!(parsed.mode, runtime::Mode::Help) {
+        print!("{}", runtime::HELP);
+        return Ok(());
     }
-
+    let diagnostic = diagnostics::prepare(&mut parsed.options)?.map(std::sync::Arc::new);
+    if let Some(run) = &diagnostic {
+        diagnostics::set_active(run.clone())?;
+    }
+    runtime::install(parsed.options)?;
+    let initial_file = match parsed.mode {
+        runtime::Mode::Gui { initial_file } => initial_file,
+        runtime::Mode::ScanPlugin { format, path } => return plugins::scan_main(&format, &path),
+        runtime::Mode::TestPlugin {
+            format,
+            path,
+            filter,
+        } => return test_plugin(&format, &path, &filter),
+        runtime::Mode::TestVst3 { bundle, filter } => return test_vst3(&bundle, &filter),
+        runtime::Mode::TestIsolated { format, path } => {
+            return diagnostics::bridge::run(&format, &path);
+        }
+        runtime::Mode::TestEditor {
+            bundle,
+            name,
+            output,
+        } => return test_editor(&bundle, &name, &output),
+        runtime::Mode::PluginWorker { args } => return plugins::remote::worker_main(&args),
+        runtime::Mode::Help => unreachable!(),
+    };
+    if let Some(run) = &diagnostic
+        && run.scenario.mode == diagnostics::scenario::ScenarioMode::Offline
+    {
+        let outcome = run.run_offline()?;
+        if outcome != diagnostics::Outcome::Passed {
+            anyhow::bail!("diagnostic outcome: {outcome:?}");
+        }
+        return Ok(());
+    }
+    if runtime::get().experimental_plugin_isolation {
+        #[cfg(target_os = "macos")]
+        anyhow::bail!("plugin isolation with embedded editors is not implemented on macOS yet");
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        if std::env::var_os("NODEPLAYER_WAYLAND").is_some() || std::env::var_os("DISPLAY").is_none()
+        {
+            anyhow::bail!(
+                "experimental plugin isolation requires X11/XWayland for embedded editors"
+            );
+        }
+    }
     plugins::guard::install();
-    let initial_file = args.first().map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("nodeplayer")
@@ -85,15 +109,33 @@ fn main() -> Result<()> {
         event_loop_builder: x11_event_loop_hook(),
         ..Default::default()
     };
+    let final_diagnostic = diagnostic.clone();
     eframe::run_native(
         "nodeplayer",
         options,
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx);
-            Ok(Box::new(app::App::new(initial_file, &cc.egui_ctx)))
+            let mut app = app::App::new(initial_file, &cc.egui_ctx);
+            if let Some(run) = diagnostic.clone() {
+                app.attach_diagnostic(run);
+            }
+            Ok(Box::new(app))
         }),
     )
-    .map_err(|e| anyhow!("{e}"))
+    .map_err(|e| anyhow!("{e}"))?;
+    if let Some(run) = final_diagnostic {
+        let outcome = match run.outcome() {
+            Some(outcome) => outcome,
+            None => run.finish(
+                diagnostics::Outcome::Aborted,
+                "window closed before scenario completion",
+            )?,
+        };
+        if outcome != diagnostics::Outcome::Passed {
+            anyhow::bail!("diagnostic outcome: {outcome:?}");
+        }
+    }
+    Ok(())
 }
 
 /// Plugin editors are X11 windows and can only be embedded into an X11 parent, so the app
