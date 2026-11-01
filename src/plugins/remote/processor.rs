@@ -110,12 +110,24 @@ impl RemoteProcessor {
             if slot.state.load(Ordering::Acquire) != OUTPUT {
                 continue;
             }
-            let p = unsafe { slot.payload() };
-            if p.generation == self.epoch
-                && p.first_sample >= self.minimum_input
-                && p.frames as usize == Q
-                && p.midi_count as usize <= MIDI
-                && let Some(at) = p.first_sample.checked_add(DELAY as u64)
+            let payload = unsafe { slot.payload() as *const shared::Payload };
+            // The child may mutate payload memory even after publishing OUTPUT. Snapshot
+            // every field used below once; never create references into the shared payload.
+            let (generation, first_sample, frames, midi_count, sequence) = unsafe {
+                (
+                    std::ptr::read_volatile(std::ptr::addr_of!((*payload).generation)),
+                    std::ptr::read_volatile(std::ptr::addr_of!((*payload).first_sample)),
+                    std::ptr::read_volatile(std::ptr::addr_of!((*payload).frames)),
+                    std::ptr::read_volatile(std::ptr::addr_of!((*payload).midi_count)),
+                    std::ptr::read_volatile(std::ptr::addr_of!((*payload).sequence)),
+                )
+            };
+            let count = midi_count as usize;
+            if generation == self.epoch
+                && first_sample >= self.minimum_input
+                && frames as usize == Q
+                && count <= MIDI
+                && let Some(at) = first_sample.checked_add(DELAY as u64)
                 && at.saturating_add(Q as u64) > self.cursor
                 && at < self.cursor.saturating_add((HISTORY - Q) as u64)
             {
@@ -123,12 +135,21 @@ impl RemoteProcessor {
                     let t = at + j as u64;
                     if t >= self.cursor {
                         let k = t as usize & (HISTORY - 1);
-                        self.wet_l[k] = p.left[j];
-                        self.wet_r[k] = p.right[j];
+                        let (left, right) = unsafe {
+                            (
+                                std::ptr::read_volatile(std::ptr::addr_of!((*payload).left[j])),
+                                std::ptr::read_volatile(std::ptr::addr_of!((*payload).right[j])),
+                            )
+                        };
+                        self.wet_l[k] = left;
+                        self.wet_r[k] = right;
                         self.wet_tags[k] = t;
                     }
                 }
-                for (index, e) in p.midi[..p.midi_count as usize].iter().enumerate() {
+                for index in 0..count {
+                    let e = unsafe {
+                        std::ptr::read_volatile(std::ptr::addr_of!((*payload).midi[index]))
+                    };
                     if e.offset as usize >= Q {
                         continue;
                     }
@@ -136,12 +157,9 @@ impl RemoteProcessor {
                     if t >= self.cursor && self.future.len() < self.future.capacity() {
                         self.future.push(Timed {
                             at: t,
-                            sequence: p.sequence,
+                            sequence,
                             index: index as u32,
-                            event: MidiEvent {
-                                time: 0,
-                                data: e.data,
-                            },
+                            event: MidiEvent { time: 0, data: e.data },
                         });
                     }
                 }
@@ -453,6 +471,22 @@ mod tests {
         }
         assert_eq!(found, vec![(DELAY, 1.0)]);
         assert_eq!(found_midi, vec![DELAY]);
+    }
+    #[test]
+    fn bogus_child_midi_count_is_dropped_without_panicking() {
+        let (map, c) = fixture();
+        let mut p = RemoteProcessor::new(c);
+        p.attach();
+        let slot = map.slot(0);
+        let payload = unsafe { slot.payload() };
+        payload.generation = p.epoch;
+        payload.first_sample = 0;
+        payload.frames = Q as u32;
+        payload.midi_count = (MIDI as u32).saturating_add(1);
+        slot.state.store(OUTPUT, Ordering::Release);
+        p.collect();
+        assert_eq!(slot.state.load(Ordering::Acquire), FREE);
+        assert!(p.future.is_empty());
     }
     #[test]
     fn late_completion_never_replays_and_working_slot_never_reused() {
