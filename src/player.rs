@@ -770,7 +770,7 @@ impl Worker {
         if self.faded >= len {
             return;
         }
-        for fr in self.acc[from..].chunks_exact_mut(2) {
+        for fr in self.acc[from..].as_chunks_mut::<2>().0 {
             if self.faded >= len {
                 break;
             }
@@ -881,7 +881,7 @@ impl Worker {
                     // at the end of the file: the end fades out, and the start in.
                     let n = fade.min(self.acc.len() / 2);
                     let at = self.acc.len() - n * 2;
-                    for (i, fr) in self.acc[at..].chunks_exact_mut(2).enumerate() {
+                    for (i, fr) in self.acc[at..].as_chunks_mut::<2>().0.iter_mut().enumerate() {
                         let g = ((i as f32 + 0.5) / n as f32 * std::f32::consts::FRAC_PI_2).cos();
                         fr[0] *= g;
                         fr[1] *= g;
@@ -1158,7 +1158,13 @@ impl Processor for PlayerSource {
         let m = (self.ring.slots() / 2).min(n);
         if let Ok(chunk) = self.ring.read_chunk(m * 2) {
             let (a, b) = chunk.as_slices();
-            for (k, fr) in a.chunks_exact(2).chain(b.chunks_exact(2)).enumerate() {
+            for (k, fr) in a
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .chain(b.as_chunks::<2>().0)
+                .enumerate()
+            {
                 o.l[k] = fr[0];
                 o.r[k] = fr[1];
             }

@@ -330,7 +330,7 @@ fn row(ui: &mut egui::Ui, label: &str, value: impl Into<String>) -> egui::Respon
 }
 
 fn fmt_rate(hz: u32) -> String {
-    if hz % 1000 == 0 { format!("{} kHz", hz / 1000) } else { format!("{:.1} kHz", hz as f64 / 1000.0) }
+    if hz.is_multiple_of(1000) { format!("{} kHz", hz / 1000) } else { format!("{:.1} kHz", hz as f64 / 1000.0) }
 }
 
 fn fmt_time(secs: f64) -> String {

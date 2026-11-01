@@ -605,7 +605,7 @@ pub fn restart_flags_str(flags: i32) -> String {
     ];
     names
         .iter()
-        .filter(|(f, _)| flags & *f as i32 != 0)
+        .filter(|(f, _)| flags & *f != 0)
         .map(|(_, n)| *n)
         .collect::<Vec<_>>()
         .join("|")

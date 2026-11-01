@@ -542,12 +542,12 @@ impl Library {
     }
 
     pub fn previous(&mut self) -> Option<usize> {
-        if self.shuffle {
-            if let Some(i) = self.history.pop() {
-                // set_current would push the track we're leaving; going back shouldn't.
-                self.current = None;
-                return Some(i);
-            }
+        if self.shuffle
+            && let Some(i) = self.history.pop()
+        {
+            // set_current would push the track we're leaving; going back shouldn't.
+            self.current = None;
+            return Some(i);
         }
         let n = self.tracks.len();
         match self.current {
