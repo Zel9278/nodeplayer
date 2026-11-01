@@ -271,6 +271,7 @@ pub struct TimingPlan {
     pub allocated_delay_bytes: usize,
     pub edges: Vec<PreparedEdge>,
     pub sinks: Vec<PreparedSink>,
+    pub midi_outputs: Vec<(u32, MidiDelay, MidiBuf)>,
     pub steps: Vec<StepRoutes>,
 }
 
@@ -319,6 +320,12 @@ impl TimingPlan {
             }
             routes.push(route);
         }
+        let midi_outputs = analysis
+            .midi_outputs
+            .iter()
+            .filter(|(_, delay)| *delay > 0)
+            .map(|&(node, delay)| Ok((node, MidiDelay::new(delay, limits.midi_capacity)?, MidiBuf::new())))
+            .collect::<Result<_>>()?;
         let sinks = analysis
             .sinks
             .iter()
@@ -336,6 +343,7 @@ impl TimingPlan {
             allocated_delay_bytes: analysis.delay_bytes,
             edges,
             sinks,
+            midi_outputs,
             steps: routes,
         })
     }

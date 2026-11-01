@@ -93,6 +93,7 @@ pub struct TimingAnalysis {
     pub sinks: Vec<(u32, u64)>,
     pub output_audio: BTreeMap<u32, u64>,
     pub output_midi: BTreeMap<u32, u64>,
+    pub midi_outputs: Vec<(u32, u64)>,
     pub total_latency_frames: u64,
     pub delay_bytes: usize,
 }
@@ -233,6 +234,19 @@ pub fn analyze(
             analysis.total_latency_frames - analysis.output_audio[&node.id],
         ));
     }
+    // MIDI emitted to hardware is not represented by an engine edge; align its node output
+    // to the same device reference as audio sinks. Outputs carried by an engine edge keep
+    // their alignment in the edge delay and must not be padded here as well.
+    let wired: std::collections::BTreeSet<u32> = edges
+        .iter()
+        .filter(|edge| matches!(edge.kind, EdgeKind::Midi))
+        .map(|edge| edge.from)
+        .collect();
+    analysis.midi_outputs = nodes
+        .iter()
+        .filter(|node| node.midi_output && !wired.contains(&node.id))
+        .map(|node| (node.id, analysis.total_latency_frames.saturating_sub(analysis.output_midi[&node.id])))
+        .collect();
     analysis.edges.sort_by_key(|edge| edge.key);
     if enabled {
         ensure!(
@@ -256,6 +270,15 @@ pub fn analyze(
                 .checked_mul(2 * size_of::<f32>())
                 .ok_or_else(|| anyhow::anyhow!("sink delay size overflow"))?;
             charge(&mut analysis.delay_bytes, bytes, limits)?;
+        }
+        for &(_, delay) in &analysis.midi_outputs {
+            let bytes = limits
+                .midi_capacity
+                .checked_mul(size_of::<super::compensation::TimedMidi>())
+                .ok_or_else(|| anyhow::anyhow!("MIDI delay size overflow"))?;
+            if delay > 0 {
+                charge(&mut analysis.delay_bytes, bytes, limits)?;
+            }
         }
     }
     Ok(analysis)
@@ -436,6 +459,30 @@ mod tests {
     fn default_midi_capacity_matches_port_buffer() {
         assert_eq!(TimingLimits::default().midi_capacity, 1 << 14);
         assert_eq!(TimingLimits::default().midi_capacity, crate::engine::MidiBuf::CAPACITY);
+    }
+
+    #[test]
+    fn hardware_midi_output_is_aligned_to_total_latency() {
+        // Node 0 emits MIDI to node 2 (no engine edge leaves node 2: its emissions are
+        // hardware-bound). The audio path through sink node 1 sets the device reference.
+        // Edge delays keep their alignment; the pad carries the alignment for the hardware
+        // output only, and the runtime applies it before the node processes its input.
+        let midi = EdgeKey {
+            from: 0,
+            to: 2,
+            kind: EdgeKind::Midi,
+            occurrence: 0,
+        };
+        let result = run(
+            &[node(0, 32, false), node(1, 0, true), node(2, 0, false)],
+            &[audio(0, 1, 0), midi],
+        )
+        .unwrap();
+        assert_eq!(result.total_latency_frames, 32);
+        assert!(result.edges.iter().all(|edge| edge.delay_frames == 0));
+        assert_eq!(result.sinks, [(1, 0)]);
+        // Node 0's MIDI output is carried by an engine edge and must not be padded here.
+        assert_eq!(result.midi_outputs, [(1, 0), (2, 32)]);
     }
 
     #[test]

@@ -426,8 +426,19 @@ impl AudioState {
             }
             let NodeSlot { proc, tag, ins, outs, midi_in, midi_out } = &mut *slot;
             midi_out.clear();
+            // Hardware-bound MIDI nodes emit what they receive; delaying the input aligns
+            // their emissions with the device reference, like audio sinks are.
+            let input = if let Some(plan) = &mut self.schedule.timing
+                && let Some((_, delay, aligned)) = plan.midi_outputs.iter_mut().find(|(node, _, _)| *node == step.node)
+            {
+                aligned.clear();
+                delay.process(midi_in.events(), aligned, self.sample_clock, n);
+                aligned.events()
+            } else {
+                midi_in.events()
+            };
             let _g = tag.as_deref().map(crate::plugins::guard::enter_borrowed);
-            proc.process_timed(self.sample_clock, n, ins, outs, midi_in.events(), midi_out);
+            proc.process_timed(self.sample_clock, n, ins, outs, input, midi_out);
             self.slots[step.node as usize] = Some(slot);
         }
     }
@@ -952,6 +963,53 @@ mod tests {
             state.render(&mut vec![0.0; n * 2], 2);
         }
         assert_eq!(*capture.lock().unwrap(), [(512, 60)]);
+    }
+
+    #[test]
+    fn hardware_midi_output_is_delayed_to_the_device_reference() {
+        struct Seen(Arc<std::sync::Mutex<Vec<(u64, u8)>>>);
+        impl Processor for Seen {
+            fn process(&mut self, _: usize, _: &mut [StereoBuf], _: &mut [StereoBuf]) {}
+            fn process_timed(
+                &mut self,
+                first: u64,
+                _: usize,
+                _: &mut [StereoBuf],
+                _: &mut [StereoBuf],
+                input: &[MidiEvent],
+                _: &mut MidiBuf,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .extend(input.iter().map(|e| (first + e.time as u64, e.data[1])));
+            }
+        }
+        // The impulse emits at block 0. Node 2 is hardware-bound (no engine edge leaves it)
+        // and must emit aligned to the device reference set by the sink, not immediately.
+        let nodes = [spec(0, 0, false), spec(1, 1024, true), spec(2, 0, false)];
+        let edges = [
+            edge(0, 1),
+            timing::EdgeKey {
+                from: 0,
+                to: 2,
+                kind: timing::EdgeKind::Midi,
+                occurrence: 0,
+            },
+        ];
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = offline_state(
+            timing_schedule(&nodes, &edges),
+            vec![
+                (0, NodeSlot::new(Box::new(Impulse), 0, 1)),
+                (1, NodeSlot::new(Box::new(nodes::Output::new(0.0, Arc::default())), 1, 0)),
+                (2, NodeSlot::new(Box::new(Seen(capture.clone())), 1, 0)),
+            ],
+        );
+        for n in [512, 512, 1] {
+            state.render(&mut vec![0.0; n * 2], 2);
+        }
+        assert_eq!(*capture.lock().unwrap(), [(1024, 60)]);
     }
 
     #[test]
