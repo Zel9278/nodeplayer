@@ -393,6 +393,7 @@ impl Flat {
                 midi_input: node.kind.midi_input() || matches!(node.kind, NodeKind::GroupIn),
                 midi_output: node.kind.midi_output() || matches!(node.kind, NodeKind::GroupOut),
                 sink: matches!(node.kind, NodeKind::Output { .. }),
+                midi_sink: matches!(node.kind, NodeKind::MidiOut(_)),
                 timing,
             });
             if let NodeKind::Group(g) = &node.kind {
