@@ -1,6 +1,9 @@
 //! UI-side graph model and its compilation into an engine [`Schedule`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
+
+use crate::engine::timing::{self, EdgeKey, EdgeKind, NodeSpec, NodeTiming, TimingLimits};
+use anyhow::{Result, ensure};
 use std::sync::Arc;
 
 use egui_snarl::{NodeId, Snarl};
@@ -40,6 +43,8 @@ pub struct PluginNode {
     // Declared before the instance: an editor must close before its plugin goes away.
     pub editor: Option<Box<dyn Editor>>,
     pub instance: Box<dyn Instance>,
+    /// Last control-side timing accepted for the prepared bypass/graph plan.
+    pub timing: (u32, u32),
     pub bypass: bool,
     pub show_params: bool,
     pub param_filter: String,
@@ -48,7 +53,16 @@ pub struct PluginNode {
 impl PluginNode {
     pub fn new(instance: Box<dyn Instance>) -> Self {
         let tag = Tag::of(instance.info());
-        Self { tag, editor: None, instance, bypass: false, show_params: false, param_filter: String::new() }
+        let timing = (instance.latency(), instance.bridge_latency());
+        Self {
+            tag,
+            editor: None,
+            instance,
+            timing,
+            bypass: false,
+            show_params: false,
+            param_filter: String::new(),
+        }
     }
 
     pub fn info(&self) -> &PluginInfo {
@@ -348,8 +362,7 @@ pub fn path_to(snarl: &Snarl<GraphNode>, eid: u32) -> Option<(Vec<NodeId>, NodeI
 /// The graph with its groups opened up: engine slots and what connects them.
 #[derive(Default)]
 struct Flat {
-    /// Engine slot, its stereo inputs, and whether it goes to the device.
-    nodes: Vec<(u32, usize, bool)>,
+    nodes: Vec<NodeSpec>,
     /// `(from slot, output) -> (to slot, input)`.
     audio: Vec<((u32, u32), (u32, usize))>,
     /// MIDI from one slot to another.
@@ -357,11 +370,33 @@ struct Flat {
 }
 
 impl Flat {
-    fn add(&mut self, snarl: &Snarl<GraphNode>) {
+    fn add(&mut self, snarl: &Snarl<GraphNode>, enabled: bool) -> Result<()> {
         for node in snarl.nodes() {
-            self.nodes.push((node.eid, node.kind.engine_ports().0, matches!(node.kind, NodeKind::Output { .. })));
+            let (audio_inputs, audio_outputs) = node.kind.engine_ports();
+            let timing = if enabled {
+                if let NodeKind::Plugin(plugin) = &node.kind {
+                    // Control-side getter only. latency() is TOTAL, including future bridges.
+                    NodeTiming::from_total(
+                        plugin.instance.latency(),
+                        plugin.instance.bridge_latency(),
+                    )?
+                } else {
+                    NodeTiming::default()
+                }
+            } else {
+                NodeTiming::default()
+            };
+            self.nodes.push(NodeSpec {
+                id: node.eid,
+                audio_inputs,
+                audio_outputs,
+                midi_input: node.kind.midi_input() || matches!(node.kind, NodeKind::GroupIn),
+                midi_output: node.kind.midi_output() || matches!(node.kind, NodeKind::GroupOut),
+                sink: matches!(node.kind, NodeKind::Output { .. }),
+                timing,
+            });
             if let NodeKind::Group(g) = &node.kind {
-                self.add(&g.snarl);
+                self.add(&g.snarl, enabled)?;
                 // The group's slot takes what comes in and hands it to the input node inside.
                 if let Some(input) = g.eid_of(|k| matches!(k, NodeKind::GroupIn)) {
                     self.audio.push(((node.eid, 0), (input, 0)));
@@ -371,6 +406,12 @@ impl Flat {
         }
         for (o, i) in snarl.wires() {
             let (from, to) = (&snarl[o.node], &snarl[i.node]);
+            ensure!(
+                o.output < from.kind.outputs() && i.input < to.kind.inputs(),
+                "invalid graph pin on {} -> {}",
+                from.eid,
+                to.eid
+            );
             // What leaves a group comes from the output node inside it.
             let src = match &from.kind {
                 NodeKind::Group(g) => match g.eid_of(|k| matches!(k, NodeKind::GroupOut)) {
@@ -382,59 +423,103 @@ impl Flat {
             match (from.kind.is_midi_output(o.output), to.kind.is_midi_input(i.input)) {
                 (false, false) => self.audio.push(((src, o.output as u32), (to.eid, i.input))),
                 (true, true) => self.midi.push((src, to.eid)),
-                // Mismatched wires are refused when made; one could only survive a plugin
-                // changing its ports.
-                _ => {}
+                // A plugin port change must fail compilation, not silently change the plan.
+                _ => anyhow::bail!("audio/MIDI port mismatch on {} -> {}", from.eid, to.eid),
             }
         }
+        Ok(())
     }
 
-    /// Topologically sorts every slot. Unconnected nodes are still scheduled so sources keep
-    /// draining their queues.
-    fn schedule(self) -> Schedule {
-        let mut indeg: HashMap<u32, usize> = self.nodes.iter().map(|n| (n.0, 0)).collect();
-        let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (from, to) in self.audio.iter().map(|(a, b)| (a.0, b.0)).chain(self.midi.iter().copied()) {
-            if indeg.contains_key(&from) && let Some(d) = indeg.get_mut(&to) {
-                *d += 1;
-                adj.entry(from).or_default().push(to);
-            }
+    /// Topologically sorts every slot, including the latest upstream group expansion.
+    /// Unconnected nodes still run so sources continue draining queues.
+    fn schedule(self, enabled: bool, limits: TimingLimits) -> Result<Schedule> {
+        let mut counts = BTreeMap::new();
+        let mut edges = Vec::new();
+        for ((from, output), (to, input)) in &self.audio {
+            let kind = EdgeKind::Audio {
+                output: *output,
+                input: *input,
+            };
+            let occurrence = counts.entry((*from, *to, kind)).or_insert(0);
+            edges.push(EdgeKey {
+                from: *from,
+                to: *to,
+                kind,
+                occurrence: *occurrence,
+            });
+            *occurrence += 1;
         }
-        let mut queue: VecDeque<u32> = self.nodes.iter().map(|n| n.0).filter(|e| indeg[e] == 0).collect();
-        let mut order = Vec::with_capacity(self.nodes.len());
-        while let Some(n) = queue.pop_front() {
-            order.push(n);
-            for m in adj.get(&n).into_iter().flatten() {
-                let d = indeg.get_mut(m).unwrap();
-                *d -= 1;
-                if *d == 0 {
-                    queue.push_back(*m);
-                }
-            }
+        for &(from, to) in &self.midi {
+            let kind = EdgeKind::Midi;
+            let occurrence = counts.entry((from, to, kind)).or_insert(0);
+            edges.push(EdgeKey {
+                from,
+                to,
+                kind,
+                occurrence: *occurrence,
+            });
+            *occurrence += 1;
         }
-        let info: HashMap<u32, (usize, bool)> = self.nodes.iter().map(|n| (n.0, (n.1, n.2))).collect();
+        let analysis = timing::analyze(&self.nodes, &edges, enabled, limits)?;
+        let info: HashMap<u32, &NodeSpec> = self.nodes.iter().map(|node| (node.id, node)).collect();
         let mut schedule = Schedule::default();
-        for eid in order {
-            let (ins, sink) = info[&eid];
-            let mut inputs = vec![Vec::new(); ins];
-            for (src, (_, k)) in self.audio.iter().filter(|(_, (to, k))| *to == eid && *k < ins) {
-                inputs[*k].push(*src);
+        for &eid in &analysis.order {
+            let node = info[&eid];
+            let mut inputs = vec![Vec::new(); node.audio_inputs];
+            for (src, (_, port)) in self.audio.iter().filter(|(_, (to, _))| *to == eid) {
+                inputs[*port].push(*src);
             }
-            let midi = self.midi.iter().filter(|(_, to)| *to == eid).map(|(from, _)| *from).collect();
-            schedule.steps.push(Step { node: eid, inputs, midi });
-            if sink {
+            let midi = self
+                .midi
+                .iter()
+                .filter(|(_, to)| *to == eid)
+                .map(|(from, _)| *from)
+                .collect();
+            schedule.steps.push(Step {
+                node: eid,
+                inputs,
+                midi,
+            });
+            if node.sink {
                 schedule.sinks.push(eid);
             }
         }
-        schedule
+        if enabled {
+            schedule.timing = Some(crate::engine::compensation::TimingPlan::prepare(
+                &analysis,
+                limits,
+                &schedule.steps,
+            )?);
+        }
+        Ok(schedule)
     }
 }
 
 /// The engine's schedule for the whole graph, groups included.
+#[cfg(test)]
 pub fn compile(snarl: &Snarl<GraphNode>) -> Schedule {
+    // Compatibility entry point. Existing callers cannot report a compile error; fail closed
+    // instead of returning the old compiler's dangerous partial cyclic schedule.
+    compile_with_timing(snarl, false).unwrap_or_else(|error| {
+        log::error!("graph compile: {error:#}");
+        Schedule::default()
+    })
+}
+
+/// Prepare an entire plan on the control thread. On Err callers MUST retain the last good
+/// schedule. Enabling PDC does not change the editing graph or session format.
+pub fn compile_with_timing(snarl: &Snarl<GraphNode>, enabled: bool) -> Result<Schedule> {
+    compile_with_timing_limits(snarl, enabled, TimingLimits::default())
+}
+
+pub fn compile_with_timing_limits(
+    snarl: &Snarl<GraphNode>,
+    enabled: bool,
+    limits: TimingLimits,
+) -> Result<Schedule> {
     let mut flat = Flat::default();
-    flat.add(snarl);
-    flat.schedule()
+    flat.add(snarl, enabled)?;
+    flat.schedule(enabled, limits)
 }
 
 #[cfg(test)]
@@ -492,6 +577,143 @@ mod tests {
             assert!(pos(a) < pos(b), "{a} before {b}");
         }
         assert_eq!(path_to(&snarl, 11), Some((vec![gr], g)));
+    }
+
+    #[test]
+    fn strict_compile_rejects_cycles_and_invalid_ports_even_with_pdc_off() {
+        let at = egui::pos2(0.0, 0.0);
+        let mut snarl = Snarl::new();
+        let a = snarl.insert_node(
+            at,
+            GraphNode {
+                eid: 0,
+                kind: NodeKind::Gain { db: 0.0 },
+            },
+        );
+        let b = snarl.insert_node(
+            at,
+            GraphNode {
+                eid: 1,
+                kind: NodeKind::Gain { db: 0.0 },
+            },
+        );
+        wire(&mut snarl, a, 0, b, 0);
+        wire(&mut snarl, b, 0, a, 0);
+        for enabled in [false, true] {
+            assert!(
+                compile_with_timing(&snarl, enabled)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("cycle")
+            );
+        }
+        snarl.disconnect(
+            OutPinId { node: b, output: 0 },
+            InPinId { node: a, input: 0 },
+        );
+        wire(&mut snarl, a, 9, b, 0);
+        assert!(compile_with_timing(&snarl, true).is_err());
+    }
+
+    #[test]
+    fn pdc_compile_preserves_latest_group_expansion() {
+        let at = egui::pos2(0.0, 0.0);
+        let mut inside = Snarl::new();
+        let i = inside.insert_node(
+            at,
+            GraphNode {
+                eid: 10,
+                kind: NodeKind::GroupIn,
+            },
+        );
+        let o = inside.insert_node(
+            at,
+            GraphNode {
+                eid: 11,
+                kind: NodeKind::GroupOut,
+            },
+        );
+        wire(&mut inside, i, 0, o, 0);
+        wire(&mut inside, i, 1, o, 1);
+        let mut snarl = Snarl::new();
+        let p = snarl.insert_node(
+            at,
+            GraphNode {
+                eid: 0,
+                kind: NodeKind::Player,
+            },
+        );
+        let group = snarl.insert_node(
+            at,
+            GraphNode {
+                eid: 1,
+                kind: NodeKind::Group(Box::new(GroupNode {
+                    name: "G".into(),
+                    snarl: inside,
+                })),
+            },
+        );
+        let out = snarl.insert_node(
+            at,
+            GraphNode {
+                eid: 2,
+                kind: NodeKind::output(),
+            },
+        );
+        wire(&mut snarl, p, 0, group, 0);
+        wire(&mut snarl, p, 1, group, 1);
+        wire(&mut snarl, group, 0, out, 0);
+        let legacy = compile(&snarl);
+        let pdc = compile_with_timing(&snarl, true).unwrap();
+        assert!(legacy.timing.is_none());
+        assert_eq!(
+            pdc.steps.iter().map(|s| s.node).collect::<Vec<_>>(),
+            legacy.steps.iter().map(|s| s.node).collect::<Vec<_>>()
+        );
+        for (a, b) in pdc.steps.iter().zip(&legacy.steps) {
+            assert_eq!(a.inputs, b.inputs);
+            assert_eq!(a.midi, b.midi);
+        }
+        assert_eq!(pdc.steps.len(), 5);
+        assert_eq!(pdc.sinks, legacy.sinks);
+        assert!(pdc.epoch() > 0);
+        assert_eq!(pdc.total_latency_frames(), 0);
+    }
+
+    #[test]
+    fn intentional_delay_is_not_compensated_away() {
+        let at = egui::pos2(0.0, 0.0);
+        let mut snarl = Snarl::new();
+        let p = snarl.insert_node(
+            at,
+            GraphNode {
+                eid: 0,
+                kind: NodeKind::Player,
+            },
+        );
+        let d = snarl.insert_node(
+            at,
+            GraphNode {
+                eid: 1,
+                kind: NodeKind::delay(),
+            },
+        );
+        let o = snarl.insert_node(
+            at,
+            GraphNode {
+                eid: 2,
+                kind: NodeKind::output(),
+            },
+        );
+        wire(&mut snarl, p, 0, d, 0);
+        wire(&mut snarl, d, 0, o, 0);
+        assert_eq!(
+            compile_with_timing(&snarl, true)
+                .unwrap()
+                .total_latency_frames(),
+            0
+        );
     }
 
     #[test]

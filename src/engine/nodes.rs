@@ -387,10 +387,14 @@ impl Processor for KazuLimiter {
         let mut block_min = 1f32;
         for k in 0..n {
             let x = [i.l[k], i.r[k]];
-            for ch in 0..2 {
+            for (ch, sample) in x.iter().enumerate() {
                 let env = &mut self.envelope[ch];
-                *env = (*env * self.lookahead_coef).max(x[ch].abs());
-                let target = if *env <= self.threshold { 1.0 } else { self.threshold / *env };
+                *env = (*env * self.lookahead_coef).max(sample.abs());
+                let target = if *env <= self.threshold {
+                    1.0
+                } else {
+                    self.threshold / *env
+                };
                 let g = &mut self.gain[ch];
                 *g = if target < *g { target } else { self.release_coef * *g + (1.0 - self.release_coef) * target };
             }
@@ -558,28 +562,89 @@ impl Processor for MidiBridge {
 
 // ---------------------------------------------------------------------------
 
-/// A hosted plugin's processor with a bypass switch (parameter 0); the plugin's own
-/// parameters travel through its own queues.
-pub struct PluginProc {
-    pub inner: Box<dyn Processor>,
-    bypass: bool,
+const BYPASS_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+const BYPASS_MIDI_CAPACITY: usize = 4096;
+static BYPASS_ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Shared by live, queued and retired bypasses, so control-side replacement cannot exceed
+/// the bound by keeping an old allocation alive until the audio thread acknowledges it.
+struct BypassReservation<'a> {
+    budget: &'a AtomicUsize,
+    bytes: usize,
 }
 
-impl PluginProc {
-    pub fn new(inner: Box<dyn Processor>) -> Self {
-        Self { inner, bypass: false }
+impl<'a> BypassReservation<'a> {
+    fn reserve_in(budget: &'a AtomicUsize, limit: usize, bytes: usize) -> anyhow::Result<Self> {
+        budget.try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(bytes).filter(|&next| next <= limit)
+        }).map_err(|_| anyhow::anyhow!("prepared plugin bypass memory budget exceeded ({bytes} bytes requested, {limit} byte limit)"))?;
+        Ok(Self { budget, bytes })
     }
 }
 
-impl Processor for PluginProc {
+impl Drop for BypassReservation<'_> {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+fn bypass_allocation_bytes(total_latency: u32) -> anyhow::Result<usize> {
+    // Include the warmed output and MidiBuf owned by PluginProc as well as delay storage.
+    // Standalone restart fallbacks conservatively reserve the same overhead.
+    let fixed = BYPASS_MIDI_CAPACITY
+        .checked_mul(size_of::<super::compensation::TimedMidi>())
+        .and_then(|n| n.checked_add(super::MAX_BLOCK * 2 * size_of::<f32>()))
+        .and_then(|n| n.checked_add(MidiBuf::CAPACITY * size_of::<MidiEvent>()))
+        .and_then(|n| n.checked_add(4096))
+        .ok_or_else(|| anyhow::anyhow!("prepared bypass allocation size overflow"))?;
+    usize::try_from(total_latency)?
+        .checked_mul(2 * size_of::<f32>())
+        .and_then(|n| n.checked_add(fixed))
+        .ok_or_else(|| anyhow::anyhow!("prepared bypass allocation size overflow"))
+}
+
+/// Prepared fixed-timeline replacement while a plugin restarts/faults. FX emits delayed dry,
+/// instruments emit silence, MIDI passes with bridge latency only. No plugin calls are made.
+pub struct LatencyBypass {
+    audio: super::compensation::AudioDelay,
+    midi: super::compensation::MidiDelay,
+    instrument: bool,
+    cursor: u64,
+    // Declared last: release the reservation only after delay storage has been destroyed.
+    _reservation: BypassReservation<'static>,
+}
+
+impl LatencyBypass {
+    pub fn new(total_latency: u32, bridge_latency: u32, instrument: bool) -> anyhow::Result<Self> {
+        super::timing::NodeTiming::from_total(total_latency, bridge_latency)?;
+        let reservation = BypassReservation::reserve_in(
+            &BYPASS_ALLOCATED_BYTES,
+            BYPASS_BUDGET_BYTES,
+            bypass_allocation_bytes(total_latency)?,
+        )?;
+        Ok(Self {
+            audio: super::compensation::AudioDelay::new(total_latency as u64)?,
+            midi: super::compensation::MidiDelay::new(bridge_latency as u64, BYPASS_MIDI_CAPACITY)?,
+            instrument,
+            cursor: 0,
+            _reservation: reservation,
+        })
+    }
+}
+
+impl Processor for LatencyBypass {
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
-        if self.bypass {
-            let (i, o) = (&inputs[0], &mut outputs[0]);
-            o.l[..n].copy_from_slice(&i.l[..n]);
-            o.r[..n].copy_from_slice(&i.r[..n]);
-            return;
+        let source = if self.instrument {
+            None
+        } else {
+            inputs.first()
+        };
+        if let Some(out) = outputs.first_mut() {
+            self.audio.write(source, out, n);
         }
-        self.inner.process(n, inputs, outputs);
+        for out in outputs.iter_mut().skip(1) {
+            out.clear(n);
+        }
     }
 
     fn process_midi(
@@ -590,20 +655,178 @@ impl Processor for PluginProc {
         midi_in: &[MidiEvent],
         midi_out: &mut MidiBuf,
     ) {
-        if self.bypass {
-            self.process(n, inputs, outputs);
-            for e in midi_in {
-                midi_out.push(*e);
-            }
-            return;
+        self.process_timed(self.cursor, n, inputs, outputs, midi_in, midi_out);
+    }
+
+    fn process_timed(
+        &mut self,
+        first_sample: u64,
+        n: usize,
+        inputs: &mut [StereoBuf],
+        outputs: &mut [StereoBuf],
+        midi_in: &[MidiEvent],
+        midi_out: &mut MidiBuf,
+    ) {
+        self.process(n, inputs, outputs);
+        self.midi.process(midi_in, midi_out, first_sample, n);
+        self.cursor = first_sample.saturating_add(n as u64);
+    }
+}
+
+struct PreparedBypass {
+    fallback: Box<LatencyBypass>,
+    audio: Vec<StereoBuf>,
+    midi: MidiBuf,
+}
+
+/// A hosted plugin's processor with a bypass switch (parameter 0). `new` retains legacy
+/// immediate bypass; `with_latency` opts into prepared, constantly warmed delayed dry.
+pub struct PluginProc {
+    pub inner: Box<dyn Processor>,
+    bypass: bool,
+    delayed: Option<PreparedBypass>,
+    cursor: u64,
+}
+
+impl PluginProc {
+    pub fn new(inner: Box<dyn Processor>) -> Self {
+        Self {
+            inner,
+            bypass: false,
+            delayed: None,
+            cursor: 0,
         }
-        self.inner.process_midi(n, inputs, outputs, midi_in, midi_out);
+    }
+
+    /// Control-thread construction only. total includes algorithm + bridge; MIDI inherits
+    /// bridge only. Instrument bypass is silent. The inner processor keeps running while
+    /// bypassed so remote FIFOs and plugin timelines do not become stale.
+    pub fn with_latency(
+        inner: Box<dyn Processor>,
+        total_latency: u32,
+        bridge_latency: u32,
+        instrument: bool,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner,
+            bypass: false,
+            cursor: 0,
+            delayed: Some(PreparedBypass {
+                fallback: Box::new(LatencyBypass::new(
+                    total_latency,
+                    bridge_latency,
+                    instrument,
+                )?),
+                audio: vec![StereoBuf::new()],
+                midi: MidiBuf::new(),
+            }),
+        })
+    }
+}
+
+impl Processor for PluginProc {
+    fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
+        if let Some(delayed) = &mut self.delayed {
+            delayed.fallback.process(n, inputs, &mut delayed.audio);
+            self.inner.process(n, inputs, outputs);
+            if self.bypass {
+                for (index, out) in outputs.iter_mut().enumerate() {
+                    if let Some(dry) = delayed.audio.get(index) {
+                        out.l[..n].copy_from_slice(&dry.l[..n]);
+                        out.r[..n].copy_from_slice(&dry.r[..n]);
+                    } else {
+                        out.clear(n);
+                    }
+                }
+            }
+        } else if self.bypass {
+            for (index, out) in outputs.iter_mut().enumerate() {
+                if let Some(input) = inputs.get(index) {
+                    out.l[..n].copy_from_slice(&input.l[..n]);
+                    out.r[..n].copy_from_slice(&input.r[..n]);
+                } else {
+                    out.clear(n);
+                }
+            }
+        } else {
+            self.inner.process(n, inputs, outputs);
+        }
+    }
+
+    fn process_midi(
+        &mut self,
+        n: usize,
+        inputs: &mut [StereoBuf],
+        outputs: &mut [StereoBuf],
+        midi_in: &[MidiEvent],
+        midi_out: &mut MidiBuf,
+    ) {
+        self.process_timed(self.cursor, n, inputs, outputs, midi_in, midi_out);
+    }
+
+    fn process_timed(
+        &mut self,
+        first_sample: u64,
+        n: usize,
+        inputs: &mut [StereoBuf],
+        outputs: &mut [StereoBuf],
+        midi_in: &[MidiEvent],
+        midi_out: &mut MidiBuf,
+    ) {
+        if let Some(delayed) = &mut self.delayed {
+            delayed.midi.clear();
+            delayed.fallback.process_timed(
+                first_sample,
+                n,
+                inputs,
+                &mut delayed.audio,
+                midi_in,
+                &mut delayed.midi,
+            );
+            self.inner
+                .process_timed(first_sample, n, inputs, outputs, midi_in, midi_out);
+            if self.bypass {
+                for (index, output) in outputs.iter_mut().enumerate() {
+                    if let Some(dry) = delayed.audio.get(index) {
+                        output.l[..n].copy_from_slice(&dry.l[..n]);
+                        output.r[..n].copy_from_slice(&dry.r[..n]);
+                    } else {
+                        output.clear(n);
+                    }
+                }
+                midi_out.clear();
+                for event in delayed.midi.events() {
+                    midi_out.push(*event);
+                }
+            }
+        } else if self.bypass {
+            for (index, output) in outputs.iter_mut().enumerate() {
+                if let Some(input) = inputs.get(index) {
+                    output.l[..n].copy_from_slice(&input.l[..n]);
+                    output.r[..n].copy_from_slice(&input.r[..n]);
+                } else {
+                    output.clear(n);
+                }
+            }
+            for event in midi_in {
+                midi_out.push(*event);
+            }
+        } else {
+            self.inner
+                .process_timed(first_sample, n, inputs, outputs, midi_in, midi_out);
+        }
+        self.cursor = first_sample.saturating_add(n as u64);
     }
 
     fn set_param(&mut self, _index: usize, value: f32) {
         self.bypass = value > 0.5;
     }
-
+    fn replace_latency_bypass(&mut self, bypass: Box<LatencyBypass>) -> Box<LatencyBypass> {
+        match &mut self.delayed {
+            Some(delayed) => std::mem::replace(&mut delayed.fallback, bypass),
+            None => bypass,
+        }
+    }
     fn deactivate(&mut self) {
         self.inner.deactivate();
     }
@@ -613,6 +836,137 @@ impl Processor for PluginProc {
 mod tests {
     use super::*;
     use crate::engine::MAX_BLOCK;
+
+    #[test]
+    fn delayed_bypass_is_warm_and_keeps_inner_pumping() {
+        struct Counter(Arc<AtomicUsize>);
+        impl Processor for Counter {
+            fn process(&mut self, n: usize, _: &mut [StereoBuf], out: &mut [StereoBuf]) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                out[0].clear(n);
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut proc =
+            PluginProc::with_latency(Box::new(Counter(count.clone())), 128, 64, false).unwrap();
+        let (mut input, mut output) = ([StereoBuf::new()], [StereoBuf::new()]);
+        let mut midi = MidiBuf::new();
+        input[0].l[0] = 1.0;
+        proc.process_timed(
+            0,
+            64,
+            &mut input,
+            &mut output,
+            &[MidiEvent {
+                time: 0,
+                data: [0x90, 60, 1],
+            }],
+            &mut midi,
+        );
+        assert_eq!(output[0].l[0], 0.0);
+        proc.set_param(0, 1.0);
+        input[0].clear(128);
+        midi.clear();
+        proc.process_timed(64, 128, &mut input, &mut output, &[], &mut midi);
+        assert_eq!(output[0].l[64], 1.0);
+        assert_eq!(
+            midi.events(),
+            &[MidiEvent {
+                time: 0,
+                data: [0x90, 60, 1]
+            }]
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn bypass_budget_counts_live_and_retired_reservations() {
+        let budget = AtomicUsize::new(0);
+        let live = BypassReservation::reserve_in(&budget, 100, 60).unwrap();
+        let retired = BypassReservation::reserve_in(&budget, 100, 40).unwrap();
+        assert!(BypassReservation::reserve_in(&budget, 100, 1).is_err());
+        assert_eq!(budget.load(Ordering::Relaxed), 100);
+        drop(retired);
+        let queued = BypassReservation::reserve_in(&budget, 100, 40).unwrap();
+        drop(live);
+        drop(queued);
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+        assert!(BypassReservation::reserve_in(&budget, 100, usize::MAX).is_err());
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+        budget.store(1, Ordering::Relaxed);
+        assert!(BypassReservation::reserve_in(&budget, usize::MAX, usize::MAX).is_err());
+        assert_eq!(budget.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn bypass_budget_charges_delay_and_warmed_storage_before_allocating() {
+        let fixed = BYPASS_MIDI_CAPACITY * size_of::<crate::engine::compensation::TimedMidi>()
+            + MAX_BLOCK * 2 * size_of::<f32>()
+            + MidiBuf::CAPACITY * size_of::<MidiEvent>()
+            + 4096;
+        assert_eq!(bypass_allocation_bytes(0).unwrap(), fixed);
+        assert_eq!(bypass_allocation_bytes(512).unwrap(), fixed + 512 * 8);
+        let budget = AtomicUsize::new(0);
+        let oversized = bypass_allocation_bytes(u32::MAX).unwrap();
+        assert!(BypassReservation::reserve_in(&budget, BYPASS_BUDGET_BYTES, oversized).is_err());
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn configured_bypass_uses_new_latency_without_restarting_inner() {
+        struct Counter(Arc<AtomicUsize>);
+        impl Processor for Counter {
+            fn process(&mut self, n: usize, _: &mut [StereoBuf], out: &mut [StereoBuf]) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                out[0].clear(n);
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut proc =
+            PluginProc::with_latency(Box::new(Counter(count.clone())), 128, 0, false).unwrap();
+        proc.set_param(0, 1.0);
+        let (mut input, mut output) = ([StereoBuf::new()], [StereoBuf::new()]);
+        let mut midi = MidiBuf::new();
+        proc.process_timed(1000, 128, &mut input, &mut output, &[], &mut midi);
+        let retired =
+            proc.replace_latency_bypass(Box::new(LatencyBypass::new(512, 0, false).unwrap()));
+        assert_eq!(retired.audio.frames(), 128);
+        input[0].l[0] = 1.0;
+        proc.process_timed(1128, 256, &mut input, &mut output, &[], &mut midi);
+        assert!(output[0].l[..256].iter().all(|&sample| sample == 0.0));
+        input[0].clear(256);
+        proc.process_timed(1384, 256, &mut input, &mut output, &[], &mut midi);
+        assert!(output[0].l[..256].iter().all(|&sample| sample == 0.0));
+        proc.process_timed(1640, 1, &mut input, &mut output, &[], &mut midi);
+        assert_eq!(output[0].l[0], 1.0);
+        assert_eq!(count.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn instrument_bypass_is_silent_and_handles_absent_inputs() {
+        let mut proc = LatencyBypass::new(128, 64, true).unwrap();
+        let mut output = [StereoBuf::new()];
+        output[0].l.fill(1.0);
+        proc.process(256, &mut [], &mut output);
+        assert!(output[0].l[..256].iter().all(|v| *v == 0.0));
+        assert!(PluginProc::with_latency(Box::new(Through), 1, 2, false).is_err());
+    }
+
+    #[test]
+    fn legacy_bypass_still_passes_audio_and_midi_immediately() {
+        let mut proc = PluginProc::new(Box::new(Through));
+        proc.set_param(0, 1.0);
+        let (mut input, mut output) = ([StereoBuf::new()], [StereoBuf::new()]);
+        input[0].l[0] = 0.5;
+        let event = MidiEvent {
+            time: 7,
+            data: [0x90, 60, 1],
+        };
+        let mut midi = MidiBuf::new();
+        proc.process_midi(127, &mut input, &mut output, &[event], &mut midi);
+        assert_eq!(output[0].l[0], 0.5);
+        assert_eq!(midi.events(), &[event]);
+    }
 
     #[test]
     fn limiter_holds_threshold_and_releases() {

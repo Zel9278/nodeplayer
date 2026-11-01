@@ -1213,7 +1213,15 @@ impl App {
 
     fn recompile(&mut self) {
         self.dirty = false;
-        let schedule = self.with_root(|app| graph::compile(&app.snarl));
+        // Folded from 943b895: compile is test-only since this commit, so call the
+        // timing entry point directly (PDC off keeps the legacy schedule).
+        let schedule = self.with_root(|app| {
+            graph::compile_with_timing(&app.snarl, crate::runtime::get().experimental_pdc)
+                .unwrap_or_else(|e| {
+                    log::error!("graph compile: {e:#}");
+                    crate::engine::Schedule::default()
+                })
+        });
         if let Some(e) = &mut self.engine {
             e.send(Command::SetSchedule(Box::new(schedule)));
         }
@@ -1238,7 +1246,7 @@ impl App {
                         self.finish_restart(eid);
                     }
                 }
-                Garbage::Schedule(_) => {}
+                Garbage::Schedule(_) | Garbage::Bypass(_) => {}
             }
         }
     }
