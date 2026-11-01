@@ -545,11 +545,15 @@ pub struct Discord {
 
 impl Discord {
     pub fn new(ctx: egui::Context) -> Self {
-        let settings = Settings::load();
+        let settings = if crate::runtime::get().allow_network() {
+            Settings::load()
+        } else {
+            Settings::default()
+        };
         let (tx, rx) = crossbeam_channel::unbounded();
         let link = Arc::new(Mutex::new(Link::Off));
         let cover_note = Arc::new(Mutex::new(None));
-        {
+        if crate::runtime::get().allow_network() {
             let (link, cover_note, ctx) = (link.clone(), cover_note.clone(), ctx.clone());
             std::thread::Builder::new().name("discord".into()).spawn(move || worker(rx, link, cover_note, ctx)).ok();
         }

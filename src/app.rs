@@ -1,3 +1,5 @@
+mod diagnostic;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -138,6 +140,10 @@ impl egui_dock::TabViewer for Tabs<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         let app = &mut *self.app;
+        if !crate::runtime::get().allow_network() && matches!(tab, Tab::Misskey | Tab::Discord) {
+            ui.label("External networking is disabled during diagnostics.");
+            return;
+        }
         match tab {
             Tab::Graph => app.graph_ui(ui, self.actions),
             Tab::Library => app.library_panel(ui),
@@ -230,6 +236,7 @@ enum Action {
 pub struct App {
     // Declared first so the audio stream stops before any plugin is torn down.
     engine: Option<Engine>,
+    diagnostic: Option<diagnostic::GuiDiagnostic>,
     sample_rate: f32,
     player: Player,
     /// The graph shown: the main one, or the inside of a group (see [`App::enter_group`]).
@@ -331,7 +338,11 @@ pub struct App {
 impl App {
     pub fn new(initial_file: Option<PathBuf>, ctx: &egui::Context) -> Self {
         let mut messages = Vec::new();
-        let engine = match Engine::start() {
+        let engine = match if crate::runtime::get().allow_audio_device() {
+            Engine::start()
+        } else {
+            Engine::start_null(48_000, 512)
+        } {
             Ok(e) => Some(e),
             Err(e) => {
                 messages.push(format!("audio output unavailable: {e:#}"));
@@ -342,6 +353,7 @@ impl App {
         let mut app = Self {
             player: Player::new(sample_rate),
             engine,
+            diagnostic: None,
             sample_rate: sample_rate as f32,
             snarl: Snarl::new(),
             outer: Vec::new(),
@@ -372,7 +384,11 @@ impl App {
             node_rects: Vec::new(),
             reveal_current: false,
             // On Windows it needs the window, so it's made with the first frame.
-            mpris: if cfg!(windows) { None } else { Mpris::new(ctx.clone(), None) },
+            mpris: if cfg!(windows) || !crate::runtime::get().allow_network() {
+                None
+            } else {
+                Mpris::new(ctx.clone(), None)
+            },
             misskey: Misskey::new(ctx.clone()),
             discord: crate::discord::Discord::new(ctx.clone()),
             info: crate::info::Info::new(),
@@ -411,7 +427,11 @@ impl App {
         };
         app.check_crash();
 
-        let saved = session::load_session().unwrap_or_default();
+        let saved = if crate::runtime::get().allow_normal_profile() {
+            session::load_session().unwrap_or_default()
+        } else {
+            Session::default()
+        };
         match saved.graph.as_ref().filter(|g| !g.nodes.is_empty()) {
             Some(g) => app.load_graph(g),
             None => app.default_graph(),
@@ -438,7 +458,9 @@ impl App {
             Some(f) if f.is_dir() => app.library.open(f),
             Some(f) => app.load_file(&f),
             None => {
-                if !saved.library_sources.is_empty() {
+                if !crate::runtime::get().allow_library_discovery() {
+                    // Diagnostic profiles never restore or discover ordinary media roots.
+                } else if !saved.library_sources.is_empty() {
                     app.library.set_sources(saved.library_sources.clone());
                 } else if let Some(dir) = saved.library_root.clone().filter(|d| d.is_dir()).or_else(library::load_last_folder) {
                     app.library.open(dir);
@@ -454,7 +476,11 @@ impl App {
                 }
             }
         }
-        let (extensions, errors) = Extensions::load(&mut app.host.native, &app.host.disabled);
+        let (extensions, errors) = if crate::runtime::get().allow_native_extensions() {
+            Extensions::load(&mut app.host.native, &app.host.disabled)
+        } else {
+            (Extensions::default(), Vec::new())
+        };
         app.extensions = extensions;
         app.dock = match saved.dock.clone() {
             Some(mut d) if d.find_tab(&Tab::Graph).is_some() => {
@@ -908,10 +934,44 @@ impl App {
     }
 
     fn restore_plugin(&mut self, kind: &SavedKind, pos: Pos2) -> Option<NodeId> {
-        let SavedKind::Plugin { format, path, id, name, bypass, editor, state } = kind else { return None };
-        let info = self.plugins.iter().find(|p| p.same(*format, path, id)).cloned().or_else(|| {
-            self.host.classes(*format, path).ok()?.into_iter().find(|c| &c.id == id)
-        });
+        let SavedKind::Plugin {
+            format,
+            path,
+            id,
+            name,
+            bypass,
+            editor,
+            state,
+        } = kind
+        else {
+            return None;
+        };
+        let isolated = crate::runtime::get().experimental_plugin_isolation
+            && matches!(format, Format::Vst3 | Format::Clap);
+        let info = self
+            .plugins
+            .iter()
+            .find(|p| p.same(*format, path, id))
+            .cloned()
+            .or_else(|| {
+                if isolated {
+                    // A cache miss must not load or enumerate plugin code on the UI thread.
+                    Some(PluginInfo {
+                        format: *format,
+                        path: path.clone(),
+                        id: id.clone(),
+                        name: name.clone(),
+                        vendor: String::new(),
+                        category: String::new(),
+                    })
+                } else {
+                    self.host
+                        .classes(*format, path)
+                        .ok()?
+                        .into_iter()
+                        .find(|c| &c.id == id)
+                }
+            });
         let Some(info) = info else {
             self.log(format!("plugin not found, skipped: {name} ({})", path.display()));
             return None;
@@ -1037,6 +1097,12 @@ impl App {
             }
             if let NodeKind::Plugin(p) = &mut n.kind {
                 let _g = guard::enter(&p.tag);
+                if let Some(status) = p.instance.remote_status()
+                    && status != "running"
+                {
+                    self.pending_editors.push(n.eid);
+                    continue;
+                }
                 if let Err(e) = p.open_editor(Placement::Embedded(xid)) {
                     log::warn!("{e:#}");
                 }
@@ -1108,8 +1174,24 @@ impl App {
                     i.params().len(),
                     i.latency()
                 ));
+                let proc = if crate::runtime::get().experimental_pdc {
+                    match PluginProc::with_latency(
+                        created.processor,
+                        i.latency(),
+                        i.bridge_latency(),
+                        i.info().is_instrument(),
+                    ) {
+                        Ok(proc) => proc,
+                        Err(error) => {
+                            self.log(format!("plugin timing rejected: {error:#}"));
+                            return None;
+                        }
+                    }
+                } else {
+                    PluginProc::new(created.processor)
+                };
                 let node = PluginNode::new(created.instance);
-                self.insert(NodeKind::Plugin(Box::new(node)), Box::new(PluginProc::new(created.processor)), pos)
+                self.insert(NodeKind::Plugin(Box::new(node)), Box::new(proc), pos)
             }
             Err(e) => {
                 self.log(format!("failed to load {}: {e:#}", info.name));
@@ -1172,7 +1254,14 @@ impl App {
     fn remove_node(&mut self, id: NodeId) {
         let node = self.snarl.remove_node(id);
         // Engine must stop scheduling the node before the slot is removed.
-        self.recompile();
+        if !self.recompile() {
+            // A rejected graph cannot keep scheduling a slot whose ID will be recycled.
+            // Fail closed for this destructive edit; ordinary rejected edits retain audio.
+            if let Some(engine) = &mut self.engine {
+                engine.send(Command::SetSchedule(Box::default()));
+            }
+            self.log("graph removal muted output because the remaining graph is invalid");
+        }
         self.retire(node);
     }
 
@@ -1188,6 +1277,7 @@ impl App {
     /// if it's a group.
     fn retire(&mut self, node: GraphNode) {
         let GraphNode { eid, kind } = node;
+        self.restarting.remove(&eid);
         let mut plugin = match kind {
             NodeKind::Plugin(mut p) => {
                 let _g = guard::enter(&p.tag);
@@ -1211,19 +1301,32 @@ impl App {
         }
     }
 
-    fn recompile(&mut self) {
+    fn recompile(&mut self) -> bool {
         self.dirty = false;
-        // Folded from 943b895: compile is test-only since this commit, so call the
-        // timing entry point directly (PDC off keeps the legacy schedule).
-        let schedule = self.with_root(|app| {
-            graph::compile_with_timing(&app.snarl, crate::runtime::get().experimental_pdc)
-                .unwrap_or_else(|e| {
-                    log::error!("graph compile: {e:#}");
-                    crate::engine::Schedule::default()
-                })
-        });
-        if let Some(e) = &mut self.engine {
-            e.send(Command::SetSchedule(Box::new(schedule)));
+        let pdc = crate::runtime::get().experimental_pdc;
+        match self.with_root(|app| graph::compile_with_timing(&app.snarl, pdc)) {
+            Ok(schedule) => {
+                if let Some(timing) = &schedule.timing {
+                    log::debug!(
+                        "prepared graph epoch {}: latency {} frames, delay storage {} bytes",
+                        timing.epoch,
+                        timing.total_latency_frames,
+                        timing.allocated_delay_bytes
+                    );
+                }
+                if let Some(e) = &mut self.engine {
+                    // Preserve FIFO ordering with lifecycle commands, especially the
+                    // RemoveNode queued after this schedule stops referencing a slot.
+                    e.send(Command::SetSchedule(Box::new(schedule)));
+                }
+                true
+            }
+            Err(error) => {
+                self.log(format!(
+                    "graph update rejected; keeping the previous plan: {error:#}"
+                ));
+                false
+            }
         }
     }
 
@@ -1239,10 +1342,14 @@ impl App {
                     self.ids.free(eid);
                 }
                 Garbage::Replaced(eid, slot) => {
+                    // Only retirement of the tagged plugin processor acknowledges a
+                    // restart. An older untagged fallback ACK may arrive while a newer
+                    // restart is pending; it does not prove that plugin has stopped.
+                    let plugin_retired = slot.tag().is_some();
                     let g = slot.tag().map(|t| guard::enter(&t));
                     drop(slot);
                     drop(g);
-                    if self.restarting.remove(&eid) {
+                    if plugin_retired && self.restarting.remove(&eid) {
                         self.finish_restart(eid);
                     }
                 }
@@ -1260,7 +1367,27 @@ impl App {
             return;
         }
         let (ins, outs) = node.kind.engine_ports();
-        let slot = NodeSlot::new(Box::new(MidiBridge::default()), ins, outs);
+        let fallback: Box<dyn crate::engine::Processor> = if crate::runtime::get().experimental_pdc
+        {
+            let NodeKind::Plugin(p) = &node.kind else {
+                return;
+            };
+            match crate::engine::nodes::LatencyBypass::new(
+                p.instance.latency(),
+                p.instance.bridge_latency(),
+                p.info().is_instrument(),
+            ) {
+                Ok(proc) => Box::new(proc),
+                Err(error) => {
+                    log::error!("can't prepare restart fallback: {error:#}");
+                    self.restarting.remove(&eid);
+                    return;
+                }
+            }
+        } else {
+            Box::new(MidiBridge::default())
+        };
+        let slot = NodeSlot::new(fallback, ins, outs);
         e.send(Command::ReplaceNode(eid, slot));
     }
 
@@ -1275,7 +1402,23 @@ impl App {
         let _g = guard::enter(&tag);
         match p.instance.restart(self.sample_rate as f64, MAX_BLOCK) {
             Ok(proc) => {
-                let mut proc = PluginProc::new(proc);
+                p.timing = (p.instance.latency(), p.instance.bridge_latency());
+                let mut proc = if crate::runtime::get().experimental_pdc {
+                    match PluginProc::with_latency(
+                        proc,
+                        p.instance.latency(),
+                        p.instance.bridge_latency(),
+                        p.info().is_instrument(),
+                    ) {
+                        Ok(proc) => proc,
+                        Err(error) => {
+                            self.log(format!("restart timing rejected: {error:#}"));
+                            return;
+                        }
+                    }
+                } else {
+                    PluginProc::new(proc)
+                };
                 if p.bypass {
                     crate::engine::Processor::set_param(&mut proc, 0, 1.0);
                 }
@@ -1285,6 +1428,7 @@ impl App {
                     e.send(Command::ReplaceNode(eid, slot));
                 }
                 self.drop_stale_wires(id);
+                self.dirty = true;
                 self.log(format!("restarted {name}"));
             }
             Err(e) => self.log(format!("{name} failed to restart: {e:#}")),
@@ -1309,6 +1453,10 @@ impl App {
     }
 
     fn start_scan(&mut self) {
+        if !crate::runtime::get().allow_plugin_discovery() {
+            self.log("broad plugin discovery is disabled during diagnostics");
+            return;
+        }
         let (tx, rx) = crossbeam_channel::unbounded();
         self.scan_rx = Some(rx);
         self.plugins.clear();
@@ -1465,6 +1613,24 @@ impl App {
                 NodeKind::Plugin(p) => {
                     let _g = guard::enter(&p.tag);
                     p.instance.idle();
+                    let timing = (p.instance.latency(), p.instance.bridge_latency());
+                    if crate::runtime::get().experimental_pdc && timing != p.timing {
+                        match crate::engine::nodes::LatencyBypass::new(
+                            timing.0,
+                            timing.1,
+                            p.info().is_instrument(),
+                        ) {
+                            Ok(bypass) => {
+                                if let Some(engine) = &mut self.engine {
+                                    engine
+                                        .send(Command::ConfigureBypass(node.eid, Box::new(bypass)));
+                                }
+                                p.timing = timing;
+                                self.dirty = true;
+                            }
+                            Err(error) => log::error!("plugin timing change rejected: {error:#}"),
+                        }
+                    }
                     if p.instance.wants_restart() {
                         restart.push(node.eid);
                     }
@@ -2203,10 +2369,13 @@ impl App {
                 }
             }
             // Bundles are folders, which a file dialog won't pick.
-            if ui.add_enabled(!scanning, egui::Button::new("Add bundle…")).on_hover_text("a .vst3 or .clap folder").clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    self.add_plugin_file(&path);
-                }
+            if ui
+                .add_enabled(!scanning, egui::Button::new("Add bundle…"))
+                .on_hover_text("a .vst3 or .clap folder")
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                self.add_plugin_file(&path);
             }
             if scanning {
                 ui.spinner();
@@ -2394,6 +2563,7 @@ impl eframe::App for App {
         if self.shut_down {
             return;
         }
+        self.tick_diagnostic(ctx);
         self.poll_background();
         self.keep_selection(false);
         self.sync_loop();
@@ -2445,10 +2615,12 @@ impl eframe::App for App {
             if self.host_xid.is_some() {
                 crate::x11_errors::install(xlib_display(frame));
             }
-            if cfg!(windows) && self.mpris.is_none() {
+            if cfg!(windows) && self.mpris.is_none() && crate::runtime::get().allow_network() {
                 self.mpris = Mpris::new(ui.ctx().clone(), self.host_xid);
             }
-            self.debug_autoload();
+            if !crate::runtime::get().is_diagnostic() {
+                self.debug_autoload();
+            }
         }
         if !self.pending_editors.is_empty() && self.host_xid.is_some() {
             self.reopen_editors();
@@ -3028,18 +3200,34 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                             }
                         }
                     }
-                    if p.is_embedded() && ui.button("Pop out").on_hover_text("open in its own window").clicked() {
-                        if let Err(e) = p.open_editor(Placement::Window) {
-                            self.errors.push(format!("{e:#}"));
-                        }
+                    if p.is_embedded()
+                        && ui
+                            .button("Pop out")
+                            .on_hover_text("open in its own window")
+                            .clicked()
+                        && let Err(e) = p.open_editor(Placement::Window)
+                    {
+                        self.errors.push(format!("{e:#}"));
                     }
                     ui.toggle_value(&mut p.show_params, "Params");
                     if ui.checkbox(&mut p.bypass, "Bypass").changed() {
                         sends.push((0, if p.bypass { 1.0 } else { 0.0 }));
                     }
                 });
+                if let Some(status) = p.instance.remote_status().map(str::to_owned) {
+                    ui.horizontal(|ui| {
+                        ui.small(format!("isolated · {status}"));
+                        if ui.small_button("Restart host").clicked() {
+                            p.instance.request_remote_restart();
+                        }
+                    });
+                }
                 if p.instance.latency() > 0 {
-                    ui.small(format!("latency {} smp", p.instance.latency()));
+                    let bridge = p.instance.bridge_latency();
+                    ui.small(format!(
+                        "latency {} smp (bridge {bridge})",
+                        p.instance.latency()
+                    ));
                 }
                 if p.instance.has_body() {
                     let mut io = plugins::BodyIo { scroll: self.scroll, wants_scroll: false };

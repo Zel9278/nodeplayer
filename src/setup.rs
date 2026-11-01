@@ -103,10 +103,14 @@ impl Setup {
     pub fn new() -> Self {
         let answers = Answers::load();
         let mut queue = Vec::new();
-        if !crate::av::available() && !answers.no_ffmpeg {
+        if crate::runtime::get().allow_auto_downloads()
+            && !crate::av::available()
+            && !answers.no_ffmpeg
+        {
             queue.push(Ask::Ffmpeg);
         }
         if let Some(image) = running_appimage()
+            && crate::runtime::get().allow_auto_downloads()
             && !answers.no_install
             && installed_appimage().is_some_and(|i| i != image)
         {
@@ -117,7 +121,7 @@ impl Setup {
 
     /// Offers the FFmpeg download again (from the status bar), even after "don't ask".
     pub fn ask_ffmpeg(&mut self) {
-        if !self.queue.contains(&Ask::Ffmpeg) {
+        if crate::runtime::get().allow_auto_downloads() && !self.queue.contains(&Ask::Ffmpeg) {
             self.queue.insert(0, Ask::Ffmpeg);
         }
     }
