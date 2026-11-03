@@ -56,6 +56,14 @@ It works with local hosting or alongside `--experimental-plugin-isolation`; on m
 latter requires capture, since native NSView parenting cannot cross a process boundary.
 Captured editors use a private native rendering host, and graph zoom never requests
 a plugin UI-scale change.
+Capture and graph repaint scheduling target 240 Hz. Actual delivery depends on the
+plugin's renderer, native capture cost and event loop; delivered frames do not measure
+compositor presentation. Workers poll control readiness without blocking their native
+event pump. Windows prints each native client once per editor capture, and X11 capture
+resolves the current named pixmap on every read so compositor backing-store replacement
+cannot leave it reading an abandoned image.
+Forwarded X11 pointer events obtain timestamps from a private unmapped helper window,
+so native click tracking and focus/grab requests use the display's clock.
 See [plugins](plugins.md) for input and renderer limitations.
 
 Diagnostic GUI scenarios can wait for `editor-frame` to confirm that an actual captured

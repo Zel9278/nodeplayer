@@ -45,6 +45,8 @@ Pointer events retain Shift, Control and Alt/Option state for modified and fine 
 On macOS and Windows, double-clicks follow the system's timing settings.
 On macOS and Windows, attached or owned popup windows appear over the graph and accept pointer input,
 including outside the editor image. Escape or a click outside closes the popup.
+Windows layered popup bitmaps cannot be read by this capture backend; an error directs
+you to **Pop out** when a plugin opens one.
 Keyboard/IME, drag-and-drop, blocking native menus, and unrelated popup windows are
 not forwarded; use **Pop out** for those interactions. Capture can
 fail for some GPU-rendered editors. The flag also works with

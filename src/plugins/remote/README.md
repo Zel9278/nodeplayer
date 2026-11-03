@@ -123,6 +123,15 @@ here the parent supervisor kills/reaps it. Before plugin-requested restart, a di
 silent Q-frame quantum drains queued parameter writes. State load skips that drain.
 Checkpoints save the live instance on the worker's main thread without restarting DSP.
 
+Local plugin restarts also retain the engine slot and processor wrapper while replacing
+only its suspended inner processor. The delayed dry path keeps 131072 frames of real
+input history, or the initial requested delay if larger, within a shared 128 MiB budget
+for live, queued and retired plugin bypass storage. A latency increase beyond the retained
+history needs new input to fill that additional span. Graph delay-plan changes transfer
+prepared history pages on the audio thread and retire unused storage on the control thread.
+Engine shutdown waits for an explicit audio-thread completion before plugin state save
+and teardown; a bounded shutdown timeout retains in-process plugin owners until exit.
+
 Parent parameter/editor operations use caches and bounded enqueue. Queue-full
 `load_state` returns an error; parameter/native-placement writes may be dropped and
 retried by normal UI updates. Captured button transitions have a separate bounded
@@ -153,11 +162,14 @@ the parent toolkit; this native mode does not prove GUI-hang isolation.
 
 With capture enabled, an embedded editor request instead creates the source in a
 private native host in the worker, without a second desktop window.
-AppKit/PrintWindow/XComposite capture and native pointer delivery stay on the worker
+AppKit/Win32 printing/XComposite capture and native pointer delivery stay on the worker
 main thread. The parent paints the image in the ordinary
 graph layer, checks coverage after all nodes/layers are known, and inverse-maps input.
 Graph movement and zoom do not move, mask, resize, or rescale the native source.
 Pop-out editors retain ordinary native behavior.
+Windows layered popup windows require compositor bitmap capture, which this Win32
+printing backend does not provide. They produce an explicit capture error directing
+the user to Pop out; a stock-window caption is not accepted as the popup image.
 
 Captured RGBA8 pixels use a separate bounded latest-frame mmap; they never enter the
 audio slots or the JSON control replies. Atomic slot ownership allows replacing an

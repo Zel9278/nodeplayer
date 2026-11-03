@@ -24,11 +24,6 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::plugins::window::CaptureInput;
 use super::{EditorFrame, EditorPointer, EditorPopup, PointerKind};
 
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn PrintWindow(hwnd: *mut c_void, dc: *mut c_void, flags: u32) -> i32;
-}
-
 const MAX_DIMENSION: u32 = 8192;
 const MAX_PIXELS: u64 = 16 * 1024 * 1024;
 
@@ -163,6 +158,13 @@ impl NativeCapture {
             let mut previous = std::mem::take(&mut self.popups);
             let mut remaining = MAX_PIXELS - u64::from(width) * u64::from(height);
             for (hwnd, logical_origin) in self.input.popups()? {
+                // UpdateLayeredWindow bitmaps are compositor-owned. WM_PRINT can
+                // succeed by drawing a stock class caption unrelated to those pixels;
+                // direct DC reads and PrintWindow do not recover the offscreen bitmap.
+                ensure!(
+                    GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0 == 0,
+                    "Layered native popup capture is unsupported; use Pop out"
+                );
                 let mut bounds = RECT::default();
                 GetWindowRect(hwnd, &mut bounds).context("read captured popup size")?;
                 let (width, height) = (
@@ -184,13 +186,16 @@ impl NativeCapture {
                     .map(|index| previous.swap_remove(index).1)
                     .map_or_else(|| Bitmap::new(hwnd, width, height), Ok)?;
                 std::ptr::write_bytes(bitmap.bits, 0, width as usize * height as usize * 4);
-                {
-                    let _saved = SavedDc::new(bitmap.memory_dc)?;
-                    ensure!(
-                        PrintWindow(hwnd.0, bitmap.memory_dc.0, 2) != 0,
-                        "native editor popup does not support capture"
-                    );
-                }
+                let mut popup_budget = 512;
+                print_tree(
+                    hwnd,
+                    bitmap.memory_dc,
+                    POINT { x: bounds.left, y: bounds.top },
+                    RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 },
+                    0,
+                    &mut popup_budget,
+                    false,
+                )?;
                 let _ = GdiFlush();
                 let pixels = std::slice::from_raw_parts(
                     bitmap.bits.cast::<u8>(),
@@ -725,6 +730,14 @@ mod tests {
                         state.last_move.set(Some(point));
                         return LRESULT(0);
                     }
+                    0x02a3 => {
+                        // A native control can ignore a queued leave during a captured
+                        // drag, while treating an ordinary leave as an outside move.
+                        if GetCapture() != hwnd {
+                            state.last_move.set(Some((-1, -1)));
+                        }
+                        return LRESULT(0);
+                    }
                     WM_LBUTTONUP => {
                         if state.down.replace(false) {
                             state.clicks.set(state.clicks.get() + 1);
@@ -812,7 +825,6 @@ mod tests {
             let _ = InvalidateRect(hwnd, None, false);
             let _ = UpdateWindow(hwnd);
             let window = TestWindow { hwnd, state };
-            if !IsWindowVisible(hwnd).as_bool() { let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE); }
             if !IsWindowVisible(hwnd).as_bool() { let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE); }
             ensure!(IsWindowVisible(hwnd).as_bool(), "native fixture did not map");
             Ok(window)
@@ -902,6 +914,14 @@ mod tests {
         );
         assert_eq!(grandchild.state.capture_changes.get(), 0);
         assert_eq!(grandchild.state.cancels.get(), 0);
+        unsafe {
+            SendMessageW(grandchild.hwnd, 0x02a3, WPARAM(0), LPARAM(0));
+        }
+        assert_eq!(
+            grandchild.state.last_move.get(),
+            None,
+            "a queued native leave must observe the retained drag capture"
+        );
         assert_eq!(
             unsafe { GetCapture() },
             HWND::default(),
@@ -992,6 +1012,20 @@ mod tests {
             assert!(child.state.down.get());
             assert_eq!(unsafe { GetCapture() }, graph.hwnd);
             assert_eq!(child.state.capture_changes.get(), 0);
+            // A popup can retain native capture after its opening button is released.
+            // Selecting a row may call SetCapture again on that same logical owner.
+            capture.pointer(EditorPointer {
+                modifiers: 0,
+                position: [40.0, 40.0],
+                kind: PointerKind::Down(1),
+                buttons: 1,
+                click_count: 1,
+            })?;
+            assert_eq!(
+                child.state.capture_changes.get(),
+                0,
+                "reacquiring the same logical owner must not cancel a popup"
+            );
             for x in [30.0, 50.0, -300.0, 600.0] {
                 capture.pointer(EditorPointer {
                     modifiers: 0,
