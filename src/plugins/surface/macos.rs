@@ -6,7 +6,7 @@
 //! Metal/OpenGL surfaces. Pointer delivery is experimental: plugin tracking loops,
 //! keyboard/IME, and separate popup windows require additional hosting support.
 
-use std::ffi::c_void;
+use std::{cell::Cell, ffi::c_void};
 
 use anyhow::{Context, Result, ensure};
 use objc2::rc::Retained;
@@ -21,6 +21,43 @@ use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSDictionary, NSPoint, NSRe
 use super::{EditorFrame, EditorPointer, PointerKind};
 
 const MAX_CAPTURE_PIXELS: u64 = 16 * 1024 * 1024;
+
+thread_local! {
+    // Runtime class identity changes when AppKit installs a KVO subclass. Explicit
+    // ownership also keeps the parent application's winit event loop untouched.
+    static WORKER_APP_INITIALIZED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[repr(C)]
+struct ImageBuffer {
+    data: *mut c_void,
+    height: usize,
+    width: usize,
+    row_bytes: usize,
+}
+
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn vImageHistogramCalculation_ARGB8888(
+        source: *const ImageBuffer,
+        histogram: *const *mut usize,
+        flags: u32,
+    ) -> isize;
+    fn vImagePermuteChannels_ARGB8888(
+        source: *const ImageBuffer,
+        destination: *const ImageBuffer,
+        map: *const u8,
+        flags: u32,
+    ) -> isize;
+    fn vImageUnpremultiplyData_RGBA8888(
+        source: *const ImageBuffer,
+        destination: *const ImageBuffer,
+        flags: u32,
+    ) -> isize;
+}
+
+// Multiple plugin workers already run concurrently. Keep image conversion on its caller.
+const IMAGE_DO_NOT_TILE: u32 = 1 << 4;
 
 #[link(name = "QuartzCore", kind = "framework")]
 unsafe extern "C" {
@@ -38,13 +75,14 @@ unsafe impl RefEncode for CGEvent {
 }
 
 /// Initialize AppKit on a standalone plugin worker's main thread, before opening an editor.
-/// A parent application using winit already owns its NSApplication subclass.
+/// A parent application using winit already owns its native event loop.
 pub fn initialize_worker_app() -> Result<()> {
     let mtm = MainThreadMarker::new().context("AppKit must run on the worker main thread")?;
     let app = NSApplication::sharedApplication(mtm);
-    if app.class().name().to_bytes() == b"NSApplication" {
+    if !WORKER_APP_INITIALIZED.get() {
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         app.finishLaunching();
+        WORKER_APP_INITIALIZED.set(true);
     }
     Ok(())
 }
@@ -52,10 +90,10 @@ pub fn initialize_worker_app() -> Result<()> {
 /// Drain a bounded batch of native events in a standalone worker, without taking winit's queue.
 pub fn pump_worker_app() -> Result<()> {
     let mtm = MainThreadMarker::new().context("AppKit must run on the worker main thread")?;
-    let app = NSApplication::sharedApplication(mtm);
-    if app.class().name().to_bytes() != b"NSApplication" {
+    if !WORKER_APP_INITIALIZED.get() {
         return Ok(());
     }
+    let app = NSApplication::sharedApplication(mtm);
     let mode = unsafe { NSDefaultRunLoopMode };
     let date = NSDate::distantPast();
     for _ in 0..128 {
@@ -341,34 +379,20 @@ fn rgba_frame(bitmap: &NSBitmapImageRep, native_size: (u32, u32)) -> Result<Edit
         let alpha_first = format.contains(NSBitmapFormat::AlphaFirst);
         let little = format.contains(NSBitmapFormat::ThirtyTwoBitLittleEndian);
         let premultiplied = !format.contains(NSBitmapFormat::AlphaNonpremultiplied);
-        let mut rgba = vec![0; width as usize * height as usize * 4];
-        for (y, row) in rgba.chunks_exact_mut(width as usize * 4).enumerate() {
-            for (pixel, source) in row.as_chunks_mut::<4>().0.iter_mut().zip(
-                data[y * stride..y * stride + width as usize * 4]
-                    .as_chunks::<4>()
-                    .0
-                    .iter(),
-            ) {
-                let samples = if little {
-                    [source[3], source[2], source[1], source[0]]
-                } else {
-                    [source[0], source[1], source[2], source[3]]
-                };
-                let (rgb, alpha) = if alpha_first {
-                    ([samples[1], samples[2], samples[3]], samples[0])
-                } else {
-                    ([samples[0], samples[1], samples[2]], samples[3])
-                };
-                for c in 0..3 {
-                    pixel[c] = if premultiplied && alpha > 0 {
-                        ((rgb[c] as u32 * 255 + alpha as u32 / 2) / alpha as u32).min(255) as u8
-                    } else {
-                        rgb[c]
-                    };
-                }
-                pixel[3] = alpha;
-            }
-        }
+        let map = match (little, alpha_first) {
+            (false, false) => [0, 1, 2, 3],
+            (false, true) => [1, 2, 3, 0],
+            (true, false) => [3, 2, 1, 0],
+            (true, true) => [2, 1, 0, 3],
+        };
+        let rgba = convert_rgba8(
+            data,
+            width as usize,
+            height as usize,
+            stride,
+            map,
+            premultiplied,
+        )?;
         return Ok(EditorFrame {
             width,
             height,
@@ -393,4 +417,192 @@ fn rgba_frame(bitmap: &NSBitmapImageRep, native_size: (u32, u32)) -> Result<Edit
         native_size,
         rgba: image.into_raw(),
     })
+}
+
+/// The AppKit bitmap is usually opaque RGBA. A per-channel Rust loop dominated debug
+/// captures even when dividing by an alpha of 255. vImage supplies vectorized conversion
+/// in debug builds too; its documented nonzero-alpha rounding matches the scalar path.
+fn convert_rgba8(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    map: [u8; 4],
+    premultiplied: bool,
+) -> Result<Vec<u8>> {
+    let row_bytes = width.checked_mul(4).context("capture row size overflow")?;
+    let length = stride
+        .checked_mul(height)
+        .context("capture byte count overflow")?;
+    let pixels = width
+        .checked_mul(height)
+        .context("capture pixel count overflow")?;
+    ensure!(
+        pixels > 0
+            && pixels as u64 <= MAX_CAPTURE_PIXELS
+            && stride >= row_bytes
+            && data.len() >= length
+            && map.iter().all(|&i| i < 4),
+        "invalid bitmap conversion geometry"
+    );
+    let source = ImageBuffer {
+        data: data.as_ptr().cast_mut().cast(),
+        height,
+        width,
+        row_bytes: stride,
+    };
+    let mut opaque = !premultiplied;
+    let mut transparent = false;
+    if premultiplied {
+        let mut histogram = [[0usize; 256]; 4];
+        let channels = histogram.each_mut().map(|channel| channel.as_mut_ptr());
+        // SAFETY: source covers each validated row; vImage writes four 256-bin
+        // histograms and does not modify the source image.
+        let error = unsafe {
+            vImageHistogramCalculation_ARGB8888(&source, channels.as_ptr(), IMAGE_DO_NOT_TILE)
+        };
+        ensure!(error == 0, "vImage alpha histogram failed ({error})");
+        let alpha = &histogram[usize::from(map[3])];
+        opaque = alpha[255] == pixels;
+        transparent = alpha[0] != 0;
+    }
+    let mut rgba = vec![0; pixels * 4];
+    if !transparent {
+        let destination = ImageBuffer {
+            data: rgba.as_mut_ptr().cast(),
+            height,
+            width,
+            row_bytes,
+        };
+        if map == [0, 1, 2, 3] && stride == row_bytes {
+            rgba.copy_from_slice(&data[..pixels * 4]);
+        } else {
+            // SAFETY: source and destination have equal validated pixel dimensions,
+            // disjoint backing storage, valid strides, and a four-channel map.
+            let error = unsafe {
+                vImagePermuteChannels_ARGB8888(
+                    &source,
+                    &destination,
+                    map.as_ptr(),
+                    IMAGE_DO_NOT_TILE,
+                )
+            };
+            ensure!(error == 0, "vImage channel conversion failed ({error})");
+        }
+        if !opaque {
+            // SAFETY: vImage permits in-place unpremultiplication when the two
+            // descriptors have equal data and row strides, as they do here.
+            let error = unsafe {
+                vImageUnpremultiplyData_RGBA8888(&destination, &destination, IMAGE_DO_NOT_TILE)
+            };
+            ensure!(error == 0, "vImage alpha conversion failed ({error})");
+        }
+        return Ok(rgba);
+    }
+    // vImage clears RGB when alpha is zero. Preserve the previous exact bytes even
+    // for nonzero RGB hidden behind zero alpha by retaining the scalar path here.
+    for (y, row) in rgba.chunks_exact_mut(row_bytes).enumerate() {
+        for (pixel, source) in row
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(data[y * stride..y * stride + row_bytes].as_chunks::<4>().0)
+        {
+            let alpha = source[usize::from(map[3])];
+            for c in 0..3 {
+                let value = source[usize::from(map[c])];
+                pixel[c] = if alpha > 0 {
+                    ((u32::from(value) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255)
+                        as u8
+                } else {
+                    value
+                };
+            }
+            pixel[3] = alpha;
+        }
+    }
+    Ok(rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_conversion_matches_scalar_rounding_and_layouts() -> Result<()> {
+        let (width, height) = (256, 255);
+        let stride = width * 4 + 12;
+        for map in [[0, 1, 2, 3], [1, 2, 3, 0], [3, 2, 1, 0], [2, 1, 0, 3]] {
+            let mut source = vec![0xa5; stride * height];
+            for alpha in 1..=255usize {
+                for value in 0..256usize {
+                    let rgba = [
+                        value as u8,
+                        value.wrapping_mul(17) as u8,
+                        255 - value as u8,
+                        alpha as u8,
+                    ];
+                    let offset = (alpha - 1) * stride + value * 4;
+                    for channel in 0..4 {
+                        source[offset + usize::from(map[channel])] = rgba[channel];
+                    }
+                }
+            }
+            for premultiplied in [false, true] {
+                let result = convert_rgba8(&source, width, height, stride, map, premultiplied)?;
+                for (index, pixel) in result.as_chunks::<4>().0.iter().enumerate() {
+                    let alpha = (index / width + 1) as u8;
+                    let value = (index % width) as u8;
+                    let mut expected = [value, value.wrapping_mul(17), 255 - value, alpha];
+                    if premultiplied {
+                        for channel in &mut expected[..3] {
+                            *channel = ((u32::from(*channel) * 255 + u32::from(alpha) / 2)
+                                / u32::from(alpha))
+                            .min(255) as u8;
+                        }
+                    }
+                    assert_eq!(*pixel, expected);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transparent_and_opaque_pixels_keep_exact_bytes() -> Result<()> {
+        for map in [[0, 1, 2, 3], [1, 2, 3, 0], [3, 2, 1, 0], [2, 1, 0, 3]] {
+            let encode = |rgba: &[u8]| {
+                let mut source = vec![0; rgba.len()];
+                for (source, pixel) in source
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(rgba.as_chunks::<4>().0)
+                {
+                    for channel in 0..4 {
+                        source[usize::from(map[channel])] = pixel[channel];
+                    }
+                }
+                source
+            };
+            let pixels = [7, 43, 89, 0, 13, 71, 149, 255, 11, 23, 47, 63];
+            let source = encode(&pixels);
+            assert_eq!(convert_rgba8(&source, 3, 1, 12, map, false)?, pixels);
+            assert_eq!(
+                convert_rgba8(&source, 3, 1, 12, map, true)?,
+                [7, 43, 89, 0, 13, 71, 149, 255, 45, 93, 190, 63],
+            );
+            let opaque = [13, 71, 149, 255, 127, 255, 0, 255];
+            assert_eq!(convert_rgba8(&encode(&opaque), 2, 1, 8, map, true)?, opaque);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_buffers_do_not_reach_native_conversion() {
+        assert!(convert_rgba8(&[0; 4], 1, 1, 3, [0, 1, 2, 3], true).is_err());
+        assert!(convert_rgba8(&[0; 4], 1, 2, 4, [0, 1, 2, 3], true).is_err());
+        assert!(convert_rgba8(&[], 0, 1, 0, [0, 1, 2, 3], true).is_err());
+        assert!(convert_rgba8(&[0; 4], 1, 1, 4, [0, 1, 2, 4], true).is_err());
+    }
 }

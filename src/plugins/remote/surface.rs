@@ -2,7 +2,7 @@
 //!
 //! FREE/READY -> WRITING -> READY -> READING -> FREE. A producer may replace an
 //! unread frame, but never a frame being copied by the consumer. All mapped fields
-//! and bytes are atomic: even malformed peer metadata cannot create Rust aliases
+//! and payload words are atomic: even malformed peer metadata cannot create Rust aliases
 //! to ordinary mutable memory. This is a native-endian, same-executable ABI.
 
 use anyhow::{Context, Result, bail, ensure};
@@ -11,13 +11,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
     path::PathBuf,
-    sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use crate::plugins::surface::{EditorFrame, MAX_DIMENSION, MAX_PIXELS};
 
 const MAGIC: u64 = 0x4e50_5355_5246_3031;
-const VERSION: u32 = 1;
+// Version 2 uses uniformly sized atomic payload accesses on both sides.
+const VERSION: u32 = 2;
 const RGBA8: u32 = 1;
 const MAX_BYTES: usize = MAX_PIXELS * 4;
 const FREE: u32 = 0;
@@ -46,6 +47,9 @@ struct Header {
 
 const HEADER_BYTES: usize = std::mem::size_of::<Header>();
 const MAPPING_BYTES: usize = HEADER_BYTES + MAX_BYTES;
+const WORD_BYTES: usize = std::mem::size_of::<u64>();
+const _: () = assert!(HEADER_BYTES.is_multiple_of(std::mem::align_of::<AtomicU64>()));
+const _: () = assert!(MAX_BYTES.is_multiple_of(WORD_BYTES));
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SurfaceDescriptor {
@@ -275,8 +279,16 @@ impl FrameMap {
         h.native_height
             .store(frame.native_size.1, Ordering::Relaxed);
         h.byte_len.store(frame.rgba.len() as u64, Ordering::Relaxed);
-        for (index, byte) in frame.rgba.iter().enumerate() {
-            self.byte(index).store(*byte, Ordering::Relaxed);
+        let (words, tail) = frame.rgba.as_chunks::<WORD_BYTES>();
+        for (index, bytes) in words.iter().enumerate() {
+            self.word(index)
+                .store(u64::from_ne_bytes(*bytes), Ordering::Relaxed);
+        }
+        if !tail.is_empty() {
+            let mut bytes = [0; WORD_BYTES];
+            bytes[..tail.len()].copy_from_slice(tail);
+            self.word(words.len())
+                .store(u64::from_ne_bytes(bytes), Ordering::Relaxed);
         }
         self.validate_header()?;
         h.sequence.store(sequence, Ordering::Relaxed);
@@ -310,11 +322,23 @@ impl FrameMap {
             metadata.sequence > self.last_sequence.load(Ordering::Acquire),
             "stale editor frame sequence"
         );
-        let mut rgba = Vec::new();
+        let mut rgba: Vec<u8> = Vec::new();
         rgba.try_reserve_exact(length)
             .context("allocate captured editor image")?;
-        for index in 0..length {
-            rgba.push(self.byte(index).load(Ordering::Relaxed));
+        // SAFETY: the fallible reserve provides at least `length` writable bytes owned
+        // solely by this Vec. Initialize them before publishing its length. A bulk fill
+        // avoids Vec::resize's per-byte initialization loop in unoptimized builds.
+        unsafe {
+            rgba.as_mut_ptr().write_bytes(0, length);
+            rgba.set_len(length);
+        }
+        let (words, tail) = rgba.as_chunks_mut::<WORD_BYTES>();
+        for (index, bytes) in words.iter_mut().enumerate() {
+            *bytes = self.word(index).load(Ordering::Relaxed).to_ne_bytes();
+        }
+        if !tail.is_empty() {
+            let bytes = self.word(words.len()).load(Ordering::Relaxed).to_ne_bytes();
+            tail.copy_from_slice(&bytes[..tail.len()]);
         }
         self.validate_header()?;
         ensure!(
@@ -349,12 +373,21 @@ impl FrameMap {
         unsafe { &*self.map.as_ptr().cast::<Header>() }
     }
 
-    fn byte(&self, index: usize) -> &AtomicU8 {
-        debug_assert!(index < MAX_BYTES);
-        // SAFETY: callers use only lengths validated against MAX_BYTES. AtomicU8
-        // has byte alignment; the OS initializes the extended file to zero. Atomic
-        // access is used by both peers, including when the peer violates ownership.
-        unsafe { AtomicU8::from_ptr(self.map.as_ptr().add(HEADER_BYTES + index).cast_mut()) }
+    fn word(&self, index: usize) -> &AtomicU64 {
+        debug_assert!(index < MAX_BYTES / WORD_BYTES);
+        // SAFETY: the page-aligned mapping and Header size align every word. Validated
+        // image lengths, including a padded final partial word, fit inside MAX_BYTES.
+        // Both peers use AtomicU64 exclusively; ordinary references never span peer
+        // writes, even if its ownership or metadata is malformed.
+        unsafe {
+            AtomicU64::from_ptr(
+                self.map
+                    .as_ptr()
+                    .add(HEADER_BYTES + index * WORD_BYTES)
+                    .cast_mut()
+                    .cast(),
+            )
+        }
     }
 
     fn validate_header(&self) -> Result<()> {
@@ -409,6 +442,63 @@ mod tests {
             native_size: (16, 8),
             rgba: vec![value; 32 * 16 * 4],
         }
+    }
+
+    #[test]
+    fn patterned_pixels_roundtrip_including_a_partial_word() -> Result<()> {
+        for (width, height) in [(1, 1), (2, 1), (3, 1), (3, 3), (17, 19)] {
+            let image = EditorFrame {
+                width,
+                height,
+                native_size: (width, height),
+                rgba: (0..width as usize * height as usize * 4)
+                    .map(|index| index.wrapping_mul(37) as u8)
+                    .collect(),
+            };
+            let map = FrameMap::create(101, 27)?;
+            let peer = FrameMap::open(&map.descriptor())?;
+            assert!(peer.publish(&image)?);
+            assert_eq!(map.take_latest()?.unwrap().rgba, image.rgba);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reports capture-sized image transfer timings; run with --nocapture"]
+    fn frame_transfer_timings() -> Result<()> {
+        use std::time::{Duration, Instant};
+        const FRAMES: u32 = 4;
+        for (width, height) in [(640, 360), (1252, 770), (2560, 1440)] {
+            let map = FrameMap::create(102, 28)?;
+            let peer = FrameMap::open(&map.descriptor())?;
+            let image = EditorFrame {
+                width,
+                height,
+                native_size: (width, height),
+                rgba: vec![123; width as usize * height as usize * 4],
+            };
+            let mut publish = Duration::ZERO;
+            let mut read = Duration::ZERO;
+            for _ in 0..FRAMES {
+                let start = Instant::now();
+                assert!(peer.publish(std::hint::black_box(&image))?);
+                publish += start.elapsed();
+                let start = Instant::now();
+                let received = map.take_latest()?.unwrap();
+                read += start.elapsed();
+                assert_eq!(received.rgba.len(), image.rgba.len());
+                std::hint::black_box(received);
+            }
+            println!(
+                "frame-transfer-benchmark {}",
+                serde_json::json!({
+                    "debug": cfg!(debug_assertions), "width": width, "height": height,
+                    "frames": FRAMES, "publish_ms": publish.as_secs_f64() * 1000.0 / f64::from(FRAMES),
+                    "read_ms": read.as_secs_f64() * 1000.0 / f64::from(FRAMES),
+                })
+            );
+        }
+        Ok(())
     }
 
     #[test]
