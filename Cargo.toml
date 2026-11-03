@@ -84,6 +84,7 @@ winit = "0.30"
 
 [build-dependencies]
 cmake = "0.1"
+cc = "1"
 
 # As midi-blocks-rs: csynth and the MIDI file player are much faster this way.
 [profile.release]
