@@ -5,6 +5,7 @@
 //! while its child is alive. Only 64-bit targets with lock-free 32/64-bit atomics are
 //! accepted. This is an OS-coherent native-endian ABI, not a cross-architecture ABI.
 use super::protocol::VERSION;
+use crate::engine::{PlaybackState, Transport};
 use anyhow::{Result, bail};
 use memmap2::{MmapMut, MmapOptions};
 use std::{
@@ -31,6 +32,53 @@ pub struct WireMidi {
     pub data: [u8; 3],
     pub reserved: u8,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct WireTransport {
+    pub state: u32,
+    pub reserved: u32,
+    pub position_seconds: f64,
+    pub seconds_per_frame: f64,
+}
+
+impl From<Transport> for WireTransport {
+    fn from(transport: Transport) -> Self {
+        Self {
+            state: match transport.state {
+                PlaybackState::Stopped => 0,
+                PlaybackState::Playing => 1,
+                PlaybackState::Paused => 2,
+            },
+            reserved: 0,
+            position_seconds: transport.position_seconds,
+            seconds_per_frame: transport.seconds_per_frame,
+        }
+    }
+}
+
+impl WireTransport {
+    pub fn decode(self) -> Option<Transport> {
+        if self.reserved != 0
+            || !self.position_seconds.is_finite()
+            || self.position_seconds < 0.0
+            || !self.seconds_per_frame.is_finite()
+            || self.seconds_per_frame < 0.0
+        {
+            return None;
+        }
+        Some(Transport {
+            state: match self.state {
+                0 => PlaybackState::Stopped,
+                1 => PlaybackState::Playing,
+                2 => PlaybackState::Paused,
+                _ => return None,
+            },
+            position_seconds: self.position_seconds,
+            seconds_per_frame: self.seconds_per_frame,
+        })
+    }
+}
 #[repr(C)]
 pub struct Payload {
     pub generation: u64,
@@ -38,6 +86,7 @@ pub struct Payload {
     pub first_sample: u64,
     pub frames: u32,
     pub midi_count: u32,
+    pub transport: WireTransport,
     pub left: [f32; Q],
     pub right: [f32; Q],
     pub midi: [WireMidi; MIDI],
@@ -179,6 +228,37 @@ impl Drop for Shared {
 mod tests {
     use super::*;
     #[test]
+    fn rejects_invalid_transport_metadata() {
+        for invalid in [
+            WireTransport {
+                state: 3,
+                ..Default::default()
+            },
+            WireTransport {
+                reserved: 1,
+                ..Default::default()
+            },
+            WireTransport {
+                position_seconds: f64::NAN,
+                ..Default::default()
+            },
+            WireTransport {
+                position_seconds: -1.0,
+                ..Default::default()
+            },
+            WireTransport {
+                seconds_per_frame: f64::INFINITY,
+                ..Default::default()
+            },
+            WireTransport {
+                seconds_per_frame: -1.0,
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.decode().is_none());
+        }
+    }
+    #[test]
     fn ownership_survives_second_mapping_and_busy_slot_is_not_free() {
         let path = std::env::temp_dir().join(format!(
             "nodeplayer-map-test-{}-{}",
@@ -194,6 +274,12 @@ mod tests {
         let p = parent.slot(0);
         unsafe {
             p.payload().sequence = 42;
+            p.payload().transport = Transport {
+                state: PlaybackState::Paused,
+                position_seconds: 1.25,
+                seconds_per_frame: 0.0,
+            }
+            .into();
         }
         p.state.store(INPUT, Ordering::Release);
         let c = child.slot(0);
@@ -205,6 +291,14 @@ mod tests {
         assert_ne!(p.state.load(Ordering::Acquire), FREE);
         unsafe {
             assert_eq!(c.payload().sequence, 42);
+            assert_eq!(
+                c.payload().transport.decode().unwrap().position_seconds,
+                1.25
+            );
+            assert_eq!(
+                c.payload().transport.decode().unwrap().state,
+                PlaybackState::Paused
+            );
             c.payload().left[0] = 0.75;
         }
         c.state.store(OUTPUT, Ordering::Release);

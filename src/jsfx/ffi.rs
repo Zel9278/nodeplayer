@@ -47,7 +47,9 @@ pub struct ysfx_time_info_t {
     pub time_signature: [u32; 2],
 }
 
+pub const YSFX_PLAYBACK_STOPPED: u32 = 0;
 pub const YSFX_PLAYBACK_PLAYING: u32 = 1;
+pub const YSFX_PLAYBACK_PAUSED: u32 = 2;
 
 #[repr(C)]
 pub struct ysfx_state_slider_t {

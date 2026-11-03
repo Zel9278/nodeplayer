@@ -2,7 +2,7 @@ use super::{
     Core,
     shared::{self, DELAY, FREE, INPUT, MAX_LATENCY, MIDI, OUTPUT, Q, SLOTS},
 };
-use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf};
+use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf, Transport};
 use std::sync::{Arc, atomic::Ordering};
 
 const HISTORY: usize = 131072;
@@ -24,6 +24,8 @@ pub(super) struct RemoteProcessor {
     in_count: usize,
     fill: usize,
     first: u64,
+    transport: Transport,
+    in_transport: Transport,
     sequence: u64,
     wet_l: Vec<f32>,
     wet_r: Vec<f32>,
@@ -52,6 +54,8 @@ impl RemoteProcessor {
             in_count: 0,
             fill: 0,
             first: cursor,
+            transport: Transport::default(),
+            in_transport: Transport::default(),
             sequence: 0,
             wet_l: vec![0.0; HISTORY],
             wet_r: vec![0.0; HISTORY],
@@ -183,6 +187,7 @@ impl RemoteProcessor {
             p.first_sample = self.first;
             p.frames = Q as u32;
             p.midi_count = self.in_count as u32;
+            p.transport = self.in_transport.into();
             p.left.copy_from_slice(&self.in_l);
             p.right.copy_from_slice(&self.in_r);
             if self.child_reset {
@@ -269,6 +274,9 @@ impl RemoteProcessor {
             }
             if self.fill == 0 {
                 self.first = t;
+                // Retain the clock at this quantum's first sample, even if a later host
+                // callback changes state before the quantum has finished accumulating.
+                self.in_transport = self.transport.at_offset(j);
             }
             self.in_l[self.fill] = l;
             self.in_r[self.fill] = r;
@@ -332,10 +340,15 @@ impl RemoteProcessor {
         }
         self.future.retain(|e| e.at >= self.cursor);
         self.core.cursor.store(self.cursor, Ordering::Release);
+        self.transport = self.transport.at_offset(n);
     }
 }
 
 impl Processor for RemoteProcessor {
+    fn set_transport(&mut self, transport: Transport) {
+        self.transport = transport;
+    }
+
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
         self.render(n, inputs, outputs, &[], None)
     }
@@ -428,6 +441,57 @@ mod tests {
             {
                 s.state.store(OUTPUT, Ordering::Release);
             }
+        }
+    }
+    #[test]
+    fn transport_stays_with_the_first_sample_of_each_quantum() {
+        use crate::engine::PlaybackState;
+        let (map, c) = fixture();
+        let mut p = RemoteProcessor::new(c);
+        let mut input = [StereoBuf::new()];
+        let mut output = [StereoBuf::new()];
+        let playing = Transport {
+            state: PlaybackState::Playing,
+            position_seconds: 5.0,
+            seconds_per_frame: 1.0 / 48_000.0,
+        };
+        p.set_transport(playing);
+        p.process(100, &mut input, &mut output);
+        let paused = Transport {
+            state: PlaybackState::Paused,
+            ..playing.at_offset(100)
+        };
+        p.set_transport(paused);
+        p.process(Q - 100, &mut input, &mut output);
+        assert_eq!(
+            unsafe { map.slot(0).payload().transport }.decode(),
+            Some(playing)
+        );
+        p.process(Q, &mut input, &mut output);
+        assert_eq!(
+            unsafe { map.slot(1).payload().transport }.decode(),
+            Some(paused)
+        );
+        let resumed = Transport {
+            position_seconds: 10.0,
+            seconds_per_frame: 2.0 / 48_000.0,
+            ..playing
+        };
+        p.set_transport(resumed);
+        p.process(3 * Q, &mut input, &mut output);
+        for i in 0..3 {
+            assert_eq!(
+                unsafe { map.slot(2 + i).payload().transport }.decode(),
+                Some(resumed.at_offset(i * Q))
+            );
+        }
+        p.set_transport(Transport::default());
+        p.process(2 * Q, &mut input, &mut output);
+        for i in 5..7 {
+            assert_eq!(
+                unsafe { map.slot(i).payload().transport }.decode(),
+                Some(Transport::default())
+            );
         }
     }
     #[test]

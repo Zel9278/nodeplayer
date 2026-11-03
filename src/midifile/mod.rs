@@ -1436,6 +1436,21 @@ pub struct MidiPlayer {
     bytes_loaded: u64,
 }
 
+/// Read-only clock for the audio thread. Contention skips a snapshot, never waits.
+pub struct MidiClock(Arc<Shared>);
+
+impl MidiClock {
+    pub fn try_snapshot(&self) -> Option<(bool, f64, f64)> {
+        let c = self.0.control.try_lock().ok()?;
+        let duration = c.file.as_ref().map_or(0.0, |f| f.info.duration);
+        Some((
+            c.playing,
+            c.shown_position().min(duration),
+            if c.running() { c.speed } else { 0.0 },
+        ))
+    }
+}
+
 /// Bytes of MIDI files read so far, by what: loading reads the file, the rest unpack it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct BytesRead {
@@ -1490,6 +1505,10 @@ impl MidiPlayer {
 
     fn control(&self) -> MutexGuard<'_, Control> {
         self.shared.lock()
+    }
+
+    pub fn clock(&self) -> MidiClock {
+        MidiClock(self.shared.clone())
     }
 
     /// Load `path` in the background; `play` starts it once loaded.
@@ -1862,6 +1881,47 @@ pub fn group_digits(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_clock_follows_midi_transport_without_blocking() {
+        let piano = track(&[(0, &[0x90, 60, 100]), (9600, &[0x80, 60, 0])]);
+        let mut player = MidiPlayer::new(MidiSettings {
+            speed: 1.0,
+            ..Default::default()
+        });
+        player.install(parse_bytes(file(480, &[piano])).unwrap(), false, None);
+        let clock = player.clock();
+        let snapshot = || {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(snapshot) = clock.try_snapshot() {
+                    break snapshot;
+                }
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+        };
+        assert_eq!(snapshot(), (false, 0.0, 0.0));
+        player.seek(1.0);
+        assert_eq!(snapshot(), (false, 1.0, 0.0));
+        player.play();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !clock
+            .try_snapshot()
+            .is_some_and(|(playing, position, speed)| playing && position >= 1.0 && speed == 1.0)
+        {
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        player.pause();
+        let paused = snapshot();
+        assert!(!paused.0 && paused.1 >= 1.0 && paused.2 == 0.0);
+        assert_eq!(snapshot(), paused);
+        player.stop();
+        assert_eq!(snapshot(), (false, 0.0, 0.0));
+        let _lock = player.control();
+        assert!(clock.try_snapshot().is_none());
+    }
 
     fn var_len(mut v: u32) -> Vec<u8> {
         let mut bytes = vec![(v & 0x7f) as u8];

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use super::{MidiBuf, MidiEvent, Processor, StereoBuf};
+use super::{MidiBuf, MidiEvent, Processor, StereoBuf, Transport};
 
 pub(crate) fn db_to_gain(db: f32) -> f32 {
     10f32.powf(db / 20.0)
@@ -725,6 +725,10 @@ impl PluginProc {
 }
 
 impl Processor for PluginProc {
+    fn set_transport(&mut self, transport: Transport) {
+        self.inner.set_transport(transport);
+    }
+
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
         if let Some(delayed) = &mut self.delayed {
             delayed.fallback.process(n, inputs, &mut delayed.audio);

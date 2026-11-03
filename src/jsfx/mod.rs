@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use egui::{Color32, Rect, Sense, Vec2, pos2, vec2};
 
-use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf};
+use crate::engine::{MidiBuf, MidiEvent, PlaybackState, Processor, StereoBuf, Transport};
 use crate::plugins::{self, BodyIo, Format, ParamDesc, PluginInfo};
 use ffi::*;
 
@@ -284,7 +284,14 @@ impl JsfxPlugin {
             gfx: has_gfx.then(|| Gfx::new(fx.clone())),
             show_sliders: !has_gfx,
         };
-        Ok((me, JsfxProcessor { fx, from_ui, time_set: false }))
+        Ok((
+            me,
+            JsfxProcessor {
+                fx,
+                from_ui,
+                transport: Transport::default(),
+            },
+        ))
     }
 
     fn value(&self, index: u32) -> f64 {
@@ -953,7 +960,7 @@ fn map_key(key: egui::Key) -> Option<u32> {
 pub struct JsfxProcessor {
     fx: Arc<Fx>,
     from_ui: rtrb::Consumer<(u32, f64)>,
-    time_set: bool,
+    transport: Transport,
 }
 
 impl JsfxProcessor {
@@ -972,17 +979,18 @@ impl JsfxProcessor {
         };
         let fx = self.fx.ptr;
         unsafe {
-            if !self.time_set {
-                let info = ysfx_time_info_t {
-                    tempo: 120.0,
-                    playback_state: YSFX_PLAYBACK_PLAYING,
-                    time_position: 0.0,
-                    beat_position: 0.0,
-                    time_signature: [4, 4],
-                };
-                ysfx_set_time_info(fx, &info);
-                self.time_set = true;
-            }
+            let info = ysfx_time_info_t {
+                tempo: 120.0,
+                playback_state: match self.transport.state {
+                    PlaybackState::Stopped => YSFX_PLAYBACK_STOPPED,
+                    PlaybackState::Playing => YSFX_PLAYBACK_PLAYING,
+                    PlaybackState::Paused => YSFX_PLAYBACK_PAUSED,
+                },
+                time_position: self.transport.position_seconds,
+                beat_position: self.transport.position_seconds * 2.0,
+                time_signature: [4, 4],
+            };
+            ysfx_set_time_info(fx, &info);
             while let Ok((index, value)) = self.from_ui.pop() {
                 ysfx_slider_set_value(fx, index, value, true);
             }
@@ -1011,6 +1019,10 @@ impl JsfxProcessor {
 }
 
 impl Processor for JsfxProcessor {
+    fn set_transport(&mut self, transport: Transport) {
+        self.transport = transport;
+    }
+
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
         self.run(n, inputs, outputs, &[], None);
     }
@@ -1030,6 +1042,47 @@ impl Processor for JsfxProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_receives_playing_paused_and_stopped() {
+        let path =
+            std::env::temp_dir().join(format!("nodeplayer-transport-{}.jsfx", std::process::id()));
+        std::fs::write(
+            &path,
+            "desc:Transport probe\n@sample\nspl0 = play_state;\nspl1 = play_position;\n",
+        )
+        .unwrap();
+        let fx = Arc::new(Fx::load(&path, true).unwrap());
+        unsafe {
+            ysfx_set_sample_rate(fx.ptr, 48_000.0);
+            ysfx_set_block_size(fx.ptr, 64);
+            ysfx_init(fx.ptr);
+        }
+        let (_tx, from_ui) = rtrb::RingBuffer::new(1);
+        let mut proc = JsfxProcessor {
+            fx,
+            from_ui,
+            transport: Transport::default(),
+        };
+        let mut input = [StereoBuf::new()];
+        let mut output = [StereoBuf::new()];
+        for (state, value, position) in [
+            (PlaybackState::Playing, 1.0, 1.25),
+            (PlaybackState::Paused, 2.0, 1.25),
+            (PlaybackState::Paused, 2.0, 1.25),
+            (PlaybackState::Stopped, 0.0, 0.0),
+        ] {
+            proc.set_transport(Transport {
+                state,
+                position_seconds: position,
+                seconds_per_frame: 1.0 / 48_000.0,
+            });
+            proc.process(64, &mut input, &mut output);
+            assert_eq!(output[0].l[0], value);
+            assert_eq!(output[0].r[0], position as f32);
+        }
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn parses_gfx_menus() {
