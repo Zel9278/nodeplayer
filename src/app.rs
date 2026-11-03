@@ -1130,6 +1130,12 @@ impl App {
         }
     }
 
+    /// Track `i` is the current one and the file the player has open.
+    fn is_loaded(&self, i: usize) -> bool {
+        self.library.current == Some(i)
+            && self.library.tracks.get(i).is_some_and(|t| self.player.status().path.as_ref() == Some(&t.path))
+    }
+
     fn play_track(&mut self, i: usize) {
         let Some(t) = self.library.tracks.get(i) else { return };
         self.player.load(&t.path);
@@ -1571,6 +1577,12 @@ impl App {
                 self.player.set_playing(true);
             } else {
                 match self.library.next(true) {
+                    // Repeat-one (or a one-track list): the file that's open, from the top,
+                    // without reading it in again.
+                    Some(i) if self.is_loaded(i) => {
+                        self.player.seek(0.0);
+                        self.player.set_playing(true);
+                    }
                     Some(i) => self.play_track(i),
                     None => {
                         self.misskey.stopped(&self.player.status());

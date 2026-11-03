@@ -16,10 +16,11 @@ use rubato::{Adjustable, Async, Fft, FixedAsync, FixedSync, Indexing, Resampler,
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymError;
 use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::well_known::FORMAT_ID_ISOMP4;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTag, StandardVisualKey};
-use symphonia::core::units::{Time, TimeBase};
+use symphonia::core::units::{Time, TimeBase, Timestamp};
 
 use crate::engine::{MidiBuf, MidiEvent, PlaybackState, Processor, StereoBuf, Transport};
 use crate::midi_song::{MidiFeed, MidiSong, is_midi_file};
@@ -446,6 +447,11 @@ impl Decoder {
         }
     }
 
+    /// Whether `seek` still works once the end was reached.
+    fn seeks_after_end(&self) -> bool {
+        matches!(self, Self::Sym(_))
+    }
+
     fn name(&self) -> &'static str {
         match self {
             Self::Sym(_) => "symphonia",
@@ -473,6 +479,16 @@ struct SymDecoder {
     /// After a seek: the time asked for. Seeks land on a packet at or before it; what comes
     /// before it is left out.
     trim_to: Option<f64>,
+    path: PathBuf,
+    /// Where the track's last packet ends, for formats whose reader can't seek once it has
+    /// read past it (MP4: it seeks, but the next read fails). Decoding stops there instead.
+    end_ts: Option<Timestamp>,
+    /// Decoding reached the end: at `end_ts`, or the reader's own end (`reader_ended`).
+    ended: bool,
+    reader_ended: bool,
+    /// Seeked to this time after the reader's own end, and nothing read since: a reader that
+    /// fails then is opened again.
+    resumed_after_end: Option<f64>,
 }
 
 impl SymDecoder {
@@ -499,9 +515,26 @@ impl SymDecoder {
             .ok_or_else(|| anyhow!("not an audio track"))?;
         let sample_rate = params.sample_rate.unwrap_or(44_100);
         let channels = params.channels.as_ref().map(|c| c.count()).unwrap_or(2);
+        let end_ts = (format.format_info().format == FORMAT_ID_ISOMP4)
+            .then(|| track.start_ts.checked_add(track.duration?))
+            .flatten();
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(params, &AudioDecoderOptions::default())?;
-        Ok(Self { format, decoder, track_id, sample_rate, channels, time_base, last_packet: None, trim_to: None })
+        Ok(Self {
+            format,
+            decoder,
+            track_id,
+            sample_rate,
+            channels,
+            time_base,
+            last_packet: None,
+            trim_to: None,
+            path: path.to_path_buf(),
+            end_ts,
+            ended: false,
+            reader_ended: false,
+            resumed_after_end: None,
+        })
     }
 
     fn tags(&mut self) -> Tags {
@@ -542,9 +575,33 @@ impl SymDecoder {
     fn next_stereo(&mut self, out: &mut Vec<f32>) -> Result<bool> {
         let mut planes: Vec<Vec<f32>> = Vec::new();
         loop {
-            let Some(packet) = self.format.next_packet()? else { return Ok(false) };
+            if self.ended {
+                return Ok(false);
+            }
+            let packet = match self.format.next_packet() {
+                Ok(Some(packet)) => packet,
+                Ok(None) => {
+                    self.ended = true;
+                    self.reader_ended = true;
+                    return Ok(false);
+                }
+                Err(e) => match self.resumed_after_end.take() {
+                    Some(secs) => {
+                        log::debug!("{}: can't read after going back from the end ({e}); opening it again", self.path.display());
+                        *self = Self::open(&self.path)?;
+                        self.seek(secs)?;
+                        continue;
+                    }
+                    None => return Err(e.into()),
+                },
+            };
             if packet.track_id != self.track_id {
                 continue;
+            }
+            self.resumed_after_end = None;
+            if self.end_ts.is_some_and(|end| packet.pts.saturating_add(packet.dur) >= end) {
+                // The last packet: decoded below, and the next call ends.
+                self.ended = true;
             }
             let mut start = None;
             if let Some(tb) = self.time_base {
@@ -582,11 +639,25 @@ impl SymDecoder {
         }
     }
 
+    /// Reading goes on from `secs`, also after the end: the reader is kept, so a loop doesn't
+    /// read the file in again.
     fn seek(&mut self, secs: f64) -> Result<()> {
         let time = Time::try_from_secs_f64(secs).ok_or_else(|| anyhow!("bad seek time"))?;
-        let to = self.format.seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) })?;
+        let after_end = self.reader_ended;
+        let to = match self.format.seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) }) {
+            Ok(to) => to,
+            Err(e) if after_end => {
+                log::debug!("{}: can't seek after the end ({e}); opening it again", self.path.display());
+                *self = Self::open(&self.path)?;
+                return self.seek(secs);
+            }
+            Err(e) => return Err(e.into()),
+        };
         self.decoder.reset();
         self.trim_to = self.time_base.and_then(|tb| tb.calc_time(to.required_ts)).map(|t| t.as_secs_f64());
+        self.ended = false;
+        self.reader_ended = false;
+        self.resumed_after_end = after_end.then_some(secs);
         Ok(())
     }
 }
@@ -697,9 +768,10 @@ impl Worker {
             }
             Cmd::Seek(secs) => {
                 log::debug!("seek {secs:.2}");
-                // Some demuxers (MP4, MKV) can't seek once they've reached the end, so start
-                // over from a freshly opened file then, or whenever seeking fails.
-                let seeked = !self.decoder_done
+                // FFmpeg's demuxers may not seek once they've reached the end, so start over
+                // from a freshly opened file then, or whenever seeking fails. symphonia's
+                // decoder seeks from the end itself (going back to the top for repeat-one).
+                let seeked = (!self.decoder_done || self.decoder.as_ref().is_some_and(Decoder::seeks_after_end))
                     && self.decoder.as_mut().is_some_and(|d| {
                         d.seek(secs).map_err(|e| log::debug!("seek failed, reopening: {e}")).is_ok()
                     });
@@ -1437,6 +1509,49 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         false
+    }
+
+    /// Reads to the end; how many frames that was.
+    fn read_to_end(d: &mut SymDecoder) -> usize {
+        let mut out = Vec::new();
+        let mut frames = 0;
+        while d.next_stereo(&mut out).expect("no read error") {
+            frames += out.len() / 2;
+            out.clear();
+        }
+        frames
+    }
+
+    #[test]
+    fn mp4_goes_back_from_the_end_without_reopening() {
+        // symphonia's MP4 reader seeks once it has read past the last packet, but the next
+        // read then fails ("no atom pending read"); repeat and loops go back from there.
+        let dir = std::env::temp_dir().join(format!("nodeplayer-mp4-loop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tone.m4a");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-c:a", "aac"])
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            eprintln!("no ffmpeg, skipping");
+            return;
+        }
+        let mut d = SymDecoder::open(&path).unwrap();
+        assert!(d.end_ts.is_some());
+        let first = read_to_end(&mut d);
+        assert!(first > 0);
+        assert!(!d.reader_ended, "decoding stops at the last packet, before the reader's end");
+        for _ in 0..3 {
+            d.seek(0.0).unwrap();
+            assert_eq!(read_to_end(&mut d), first);
+        }
+        // Going back to the middle reads the rest again.
+        d.seek(0.5).unwrap();
+        let rest = read_to_end(&mut d);
+        assert!(rest > 0 && rest < first);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A 32-bit float stereo WAV at 48 kHz, `secs` long, each sample the time it is at.
