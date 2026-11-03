@@ -24,6 +24,7 @@ use windows::NativeCapture;
 
 pub const MAX_DIMENSION: u32 = 8192;
 pub const MAX_PIXELS: usize = 16 * 1024 * 1024;
+const CAPTURE_INTERVAL: Duration = Duration::from_millis(33);
 
 #[derive(Clone, Debug)]
 pub struct EditorFrame {
@@ -162,8 +163,9 @@ impl Editor for CapturedEditor {
         if !self.source.idle() {
             return false;
         }
-        if Instant::now() >= self.next_capture {
-            self.next_capture = Instant::now() + Duration::from_millis(33);
+        let now = Instant::now();
+        if now >= self.next_capture {
+            self.next_capture = next_capture_deadline(self.next_capture, now);
             let captured = self.native.capture(self.source.size()).and_then(|frame| {
                 frame.validate()?;
                 Ok(frame)
@@ -195,6 +197,18 @@ impl Editor for CapturedEditor {
     }
 }
 
+fn next_capture_deadline(previous: Instant, now: Instant) -> Instant {
+    // Keep the cadence when a UI tick arrives slightly late. Resetting from `now`
+    // makes a 30 ms UI poll miss every other 33 ms capture. Skip missed intervals
+    // after a stall rather than issuing a burst of catch-up captures.
+    let next = previous + CAPTURE_INTERVAL;
+    if next > now {
+        next
+    } else {
+        now + CAPTURE_INTERVAL
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn initialize_worker_app() -> Result<()> {
     macos::initialize_worker_app()
@@ -207,6 +221,29 @@ pub fn pump_worker_app() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_cadence_survives_ui_polling_jitter_and_skips_stalls() {
+        let start = Instant::now();
+        let mut deadline = start;
+        let mut frames = 0;
+        for tick in 0..=33 {
+            let now = start + Duration::from_millis(tick * 30);
+            if now >= deadline {
+                frames += 1;
+                deadline = next_capture_deadline(deadline, now);
+            }
+        }
+        assert_eq!(
+            frames, 31,
+            "a roughly one-second run keeps the 33 ms cadence"
+        );
+        let resumed = start + Duration::from_secs(10);
+        assert_eq!(
+            next_capture_deadline(deadline, resumed),
+            resumed + CAPTURE_INTERVAL
+        );
+    }
 
     #[test]
     fn rejects_invalid_frames_and_input_before_native_delivery() {

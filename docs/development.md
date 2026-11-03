@@ -61,6 +61,8 @@ Diagnostic GUI scenarios can wait for `editor-frame` to confirm that an actual c
 image reached the parent renderer. Explicit `graph-zoom` steps accept a `factor` between
 0.2 and 3.0, and `screenshot` steps save a PNG named by their `name` in the run artifacts.
 Screenshot names contain only letters, digits, hyphens, or underscores.
+The ignored `frame_transfer_timings` test reports shared-memory publish/read costs
+separately from capture and rendering.
 
 ## Releases
 
