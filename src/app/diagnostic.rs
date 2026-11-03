@@ -21,6 +21,9 @@ pub(super) struct GuiDiagnostic {
 
 impl App {
     pub fn attach_diagnostic(&mut self, run: Arc<DiagnosticRun>) {
+        if let Some(audio) = &run.scenario.audio_file {
+            self.load_file(audio);
+        }
         let scan = run.scenario.plugin.clone().map(|fixture| {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             std::thread::spawn(move || {
@@ -89,7 +92,11 @@ impl App {
         self.diagnostic = Some(diagnostic);
     }
 
-    fn advance_diagnostic(&mut self, diagnostic: &mut GuiDiagnostic, ctx: &egui::Context) -> Result<()> {
+    fn advance_diagnostic(
+        &mut self,
+        diagnostic: &mut GuiDiagnostic,
+        ctx: &egui::Context,
+    ) -> Result<()> {
         let run = &diagnostic.run;
         if !diagnostic.started {
             diagnostic.started = true;
@@ -123,6 +130,9 @@ impl App {
                             .collect();
                         for (o, i) in inputs {
                             self.snarl.disconnect(o, i);
+                            if run.scenario.audio_file.is_some() {
+                                self.snarl.connect(o, InPinId { node: id, input: 0 });
+                            }
                         }
                         self.snarl.connect(
                             OutPinId {
@@ -146,6 +156,10 @@ impl App {
             }
         }
         if Instant::now() >= diagnostic.next_telemetry {
+            let editor = diagnostic.node.and_then(|id| match &self.snarl[id].kind {
+                NodeKind::Plugin(plugin) => Some(&plugin.editor_view),
+                _ => None,
+            });
             let counters = diagnostic.node.and_then(|id| match &self.snarl[id].kind {
                 NodeKind::Plugin(plugin) => plugin.instance.remote_counters(),
                 _ => None,
@@ -158,6 +172,7 @@ impl App {
                     "midi_overflows":self.engine.as_ref().map(Engine::midi_overflows),
                     "bridge_underruns":counters.map(|c| c.0),
                     "bridge_overflows":counters.map(|c| c.1),
+                    "editor_frame_stats":editor.and_then(|editor| editor.frame_stats()),
                 }),
             )?;
             diagnostic.next_telemetry = Instant::now() + Duration::from_millis(250);
@@ -203,20 +218,43 @@ impl App {
             Step::Screenshot { name } => {
                 complete = false;
                 if !diagnostic.step_requested {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(name.clone())));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+                        name.clone(),
+                    )));
                     diagnostic.step_requested = true;
                 }
                 for event in ctx.input(|input| input.events.clone()) {
-                    if let egui::Event::Screenshot { user_data, image, .. } = event
-                        && user_data.data.as_ref().and_then(|data| data.downcast_ref::<String>()) == Some(&name)
+                    if let egui::Event::Screenshot {
+                        user_data, image, ..
+                    } = event
+                        && user_data
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.downcast_ref::<String>())
+                            == Some(&name)
                     {
-                        let bytes: Vec<u8> = image.pixels.iter().flat_map(|pixel| pixel.to_array()).collect();
-                        image::save_buffer(run.root.join(format!("{name}.png")), &bytes, image.width() as u32, image.height() as u32, image::ColorType::Rgba8)?;
-                        let dimensions = diagnostic.node.and_then(|id| match &self.snarl[id].kind {
-                            NodeKind::Plugin(plugin) => plugin.editor_view.dimensions(),
+                        let bytes: Vec<u8> = image
+                            .pixels
+                            .iter()
+                            .flat_map(|pixel| pixel.to_array())
+                            .collect();
+                        image::save_buffer(
+                            run.root.join(format!("{name}.png")),
+                            &bytes,
+                            image.width() as u32,
+                            image.height() as u32,
+                            image::ColorType::Rgba8,
+                        )?;
+                        let editor = diagnostic.node.and_then(|id| match &self.snarl[id].kind {
+                            NodeKind::Plugin(plugin) => Some(&plugin.editor_view),
                             _ => None,
                         });
-                        run.event("screenshot", json!({"name":name,"graph_zoom":self.zoom,"editor_dimensions":dimensions}))?;
+                        run.event(
+                            "screenshot",
+                            json!({"name":name,"graph_zoom":self.zoom,
+                            "editor_dimensions":editor.and_then(|editor| editor.dimensions()),
+                            "editor_frame_stats":editor.and_then(|editor| editor.frame_stats())}),
+                        )?;
                         complete = true;
                     }
                 }

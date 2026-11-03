@@ -61,8 +61,17 @@ Diagnostic GUI scenarios can wait for `editor-frame` to confirm that an actual c
 image reached the parent renderer. Explicit `graph-zoom` steps accept a `factor` between
 0.2 and 3.0, and `screenshot` steps save a PNG named by their `name` in the run artifacts.
 Screenshot names contain only letters, digits, hyphens, or underscores.
-The ignored `frame_transfer_timings` test reports shared-memory publish/read costs
-separately from capture and rendering.
+An optional `audio_file` names a local GUI-test input, resolved relative to the scenario.
+It plays through the ordinary player and diagnostic plugin graph; output remains null
+unless the scenario explicitly selects device audio. Offline fixtures cannot use it.
+The `engine-progress` and `screenshot` events include `editor_frame_stats` with the
+delivered frame count, elapsed seconds, and average delivery rate for the current
+editor open. Diagnostic capture also counts `changed_frames` by comparing image hashes,
+including the initial image. Delivery includes identical images; use the change count
+to check that a stationary-cursor animation actually produces new pixels.
+For steady delivery measurements, use the periodic progress events before a screenshot,
+since PNG encoding pauses the diagnostic UI. The ignored `frame_transfer_timings` test
+reports shared-memory publish/read costs separately from capture and rendering.
 
 ## Releases
 

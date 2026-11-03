@@ -121,6 +121,9 @@ pub struct Scenario {
     /// Real device output requires explicit scenario opt-in; default is a null engine.
     #[serde(default)]
     pub audio_output: AudioOutput,
+    /// Explicit local audio input for GUI animation/analyzer checks.
+    #[serde(default)]
+    pub audio_file: Option<PathBuf>,
     #[serde(default)]
     pub plugin: Option<PluginFixture>,
     #[serde(default)]
@@ -144,6 +147,16 @@ impl Scenario {
         let mut scenario: Self =
             serde_json::from_slice(&bytes).context("parse diagnostic scenario")?;
         scenario.validate()?;
+        if let Some(audio) = &mut scenario.audio_file {
+            if audio.is_relative() {
+                *audio = path.parent().unwrap_or(Path::new(".")).join(&*audio);
+            }
+            *audio =
+                std::fs::canonicalize(&*audio).context("explicit audio fixture does not exist")?;
+            if !audio.is_file() {
+                bail!("audio fixture must be a local file");
+            }
+        }
         if let Some(plugin) = &mut scenario.plugin {
             if plugin.path.is_relative() {
                 plugin.path = path.parent().unwrap_or(Path::new(".")).join(&plugin.path);
@@ -180,10 +193,18 @@ impl Scenario {
                 {
                     bail!("parameter value must be finite and normalized")
                 }
-                Step::GraphZoom { factor } if !factor.is_finite() || !(0.2..=3.0).contains(factor) => {
+                Step::GraphZoom { factor }
+                    if !factor.is_finite() || !(0.2..=3.0).contains(factor) =>
+                {
                     bail!("graph zoom must be finite and between 0.2 and 3.0");
                 }
-                Step::Screenshot { name } if name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => {
+                Step::Screenshot { name }
+                    if name.is_empty()
+                        || name.len() > 64
+                        || !name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+                {
                     bail!("invalid diagnostic screenshot name");
                 }
                 Step::Wait { duration_ms } if *duration_ms > 86_400_000 => {
@@ -216,7 +237,7 @@ impl Scenario {
                 if self.audio_output != AudioOutput::Null {
                     bail!("offline fixtures cannot use device audio");
                 }
-                if self.plugin.is_some() || !self.steps.is_empty() {
+                if self.plugin.is_some() || self.audio_file.is_some() || !self.steps.is_empty() {
                     bail!("offline fixture cannot execute plugin or GUI steps");
                 }
                 if !(8000..=384_000).contains(&f.sample_rate)
@@ -287,5 +308,43 @@ mod tests {
         )
         .unwrap();
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn audio_fixtures_require_gui_mode_and_a_local_file() {
+        let offline: Scenario = serde_json::from_str(
+            r#"{"version":1,"name":"audio","mode":"offline","offline":{},"audio_file":"input.wav"}"#,
+        )
+        .unwrap();
+        assert!(offline.validate().is_err());
+
+        let root = std::env::temp_dir().join(format!(
+            "nodeplayer-scenario-audio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let scenario = root.join("scenario.json");
+        let audio = root.join("input.wav");
+        std::fs::write(
+            &scenario,
+            r#"{"version":1,"name":"audio","audio_file":"input.wav"}"#,
+        )
+        .unwrap();
+        assert!(Scenario::load(&scenario).is_err());
+        std::fs::create_dir(&audio).unwrap();
+        assert!(Scenario::load(&scenario).is_err());
+        std::fs::remove_dir(&audio).unwrap();
+        std::fs::write(&audio, []).unwrap();
+        let loaded = Scenario::load(&scenario).unwrap();
+        assert_eq!(loaded.audio_output, AudioOutput::Null);
+        assert_eq!(
+            loaded.audio_file,
+            Some(std::fs::canonicalize(&audio).unwrap())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

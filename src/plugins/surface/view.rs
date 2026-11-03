@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use egui::{Pos2, Rect};
+use std::time::Instant;
 
 use super::{EditorFrame, EditorPointer, PointerKind};
 use crate::plugins::{Editor, Spot};
@@ -13,11 +14,34 @@ pub struct EditorView {
     screen: Option<Rect>,
     buttons: u8,
     last_position: Option<Pos2>,
+    frames: u64,
+    first_frame_at: Option<Instant>,
+    changed_frames: u64,
+    last_frame_hash: Option<ring::digest::Digest>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct EditorFrameStats {
+    frames: u64,
+    elapsed_seconds: f64,
+    frames_per_second: f64,
+    changed_frames: Option<u64>,
 }
 
 impl EditorView {
     pub fn dimensions(&self) -> Option<((u32, u32), [usize; 2])> {
         Some((self.native_size?, self.texture.as_ref()?.size()))
+    }
+
+    pub fn frame_stats(&self) -> Option<EditorFrameStats> {
+        let elapsed_seconds = self.first_frame_at?.elapsed().as_secs_f64();
+        Some(EditorFrameStats {
+            frames: self.frames,
+            elapsed_seconds,
+            frames_per_second: self.frames.saturating_sub(1) as f64
+                / elapsed_seconds.max(f64::EPSILON),
+            changed_frames: self.last_frame_hash.as_ref().map(|_| self.changed_frames),
+        })
     }
 
     pub fn paint(
@@ -64,6 +88,21 @@ impl EditorView {
     }
 
     fn update_texture(&mut self, context: &egui::Context, frame: EditorFrame) {
+        self.frames = self.frames.saturating_add(1);
+        self.first_frame_at.get_or_insert_with(Instant::now);
+        // Diagnostics must distinguish repeated captures from actual plugin redraws.
+        // Keep hashing off the ordinary editor path.
+        if crate::diagnostics::active().is_some() {
+            let hash = ring::digest::digest(&ring::digest::SHA256, &frame.rgba);
+            if self
+                .last_frame_hash
+                .as_ref()
+                .is_none_or(|previous| previous.as_ref() != hash.as_ref())
+            {
+                self.changed_frames = self.changed_frames.saturating_add(1);
+                self.last_frame_hash = Some(hash);
+            }
+        }
         if self.texture.is_none()
             && let Some(run) = crate::diagnostics::active()
         {
