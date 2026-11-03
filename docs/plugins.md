@@ -62,6 +62,10 @@ Plugin state is saved with the session and presets, as is whether each editor wa
 When a plugin changes its ports or latency (some do when a setting changes), it is restarted:
 the audio passes through while it is, and wires to pins that no longer exist are dropped.
 
+On macOS, popped-out editors use regular primary windows that participate in Stage Manager,
+Spaces and window cycling. CLAP host resizes update the parent window before calling the
+plugin, keeping autoresized child views and their rendered content at the accepted size.
+
 ## When a plugin crashes
 
 Plugins run inside nodeplayer, so one that crashes takes the app with it. nodeplayer notes
