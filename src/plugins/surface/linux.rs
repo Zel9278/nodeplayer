@@ -1,7 +1,8 @@
 //! Capture an existing, mapped X11 editor without taking ownership of its window.
 //!
 //! XComposite retains the complete hierarchy while its native source is obscured. The
-//! capture connection owns only its redirection and named pixmap; the editor's backend
+//! capture connection owns its redirection, named pixmap and an unmapped timestamp
+//! helper; the editor's backend
 //! continues to own mapping, resizing, event pumping, and destruction. A capture-only
 //! host remains mapped outside the root window with physical input disabled.
 
@@ -24,6 +25,7 @@ pub struct NativeCapture {
     pixmap: Option<Pixmap>,
     masks: [u32; 3],
     pointer_target: Option<Window>,
+    timestamp_window: Option<Window>,
 }
 
 impl NativeCapture {
@@ -90,10 +92,77 @@ impl NativeCapture {
             pixmap: None,
             masks,
             pointer_target: None,
+            timestamp_window: None,
         };
+        let timestamp_window = capture.conn.generate_id()?;
+        capture.timestamp_window = Some(timestamp_window);
+        capture
+            .conn
+            .create_window(
+                0,
+                timestamp_window,
+                capture.root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WindowClass::INPUT_ONLY,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            )?
+            .check()
+            .context("create editor input timestamp helper")?;
         capture.rename_pixmap()?;
         capture.conn.flush()?;
         Ok(capture)
+    }
+
+    fn server_time(&self) -> Result<Timestamp> {
+        let helper = self
+            .timestamp_window
+            .context("editor input timestamp helper missing")?;
+        // CurrentTime is a sentinel in requests, but XSendEvent preserves a zero
+        // event.time verbatim. Native toolkits use that field for click tracking
+        // and may pass it back to focus/grab requests. Ask this display for a real
+        // timestamp without changing a plugin property or mapping another window.
+        self.conn
+            .change_property(
+                PropMode::REPLACE,
+                helper,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                8,
+                1,
+                &[0],
+            )?
+            .check()
+            .context("request editor input timestamp")?;
+        // The reply ensures the preceding PropertyNotify is already queued. Never
+        // wait indefinitely for an event or drain an unbounded resize stream.
+        self.conn.get_input_focus()?.reply()?;
+        for _ in 0..256 {
+            let Some(event) = self.conn.poll_for_event()? else {
+                break;
+            };
+            match event {
+                Event::PropertyNotify(event)
+                    if event.window == helper && event.atom == u32::from(AtomEnum::WM_NAME) =>
+                {
+                    ensure!(
+                        event.time != x11rb::CURRENT_TIME,
+                        "editor input timestamp is zero"
+                    );
+                    return Ok(event.time);
+                }
+                Event::Error(error) => bail!("editor input X11 request failed: {error:?}"),
+                Event::DestroyNotify(event) if event.window == self.window => {
+                    bail!("editor capture source was destroyed")
+                }
+                _ => {}
+            }
+        }
+        bail!("editor input timestamp notification missing")
     }
 
     fn rename_pixmap(&mut self) -> Result<()> {
@@ -258,7 +327,9 @@ impl NativeCapture {
             (super::MOD_ALT, KeyButMask::MOD1),
             (super::MOD_SUPER, KeyButMask::MOD4),
         ] {
-            if event.modifiers & bit != 0 { state |= mask; }
+            if event.modifiers & bit != 0 {
+                state |= mask;
+            }
         }
         match event.kind {
             PointerKind::Cancel => {
@@ -274,7 +345,7 @@ impl NativeCapture {
                             response_type: MOTION_NOTIFY_EVENT,
                             detail: Motion::NORMAL,
                             sequence: 0,
-                            time: x11rb::CURRENT_TIME,
+                            time: self.server_time()?,
                             root: self.root,
                             event: target,
                             child: x11rb::NONE,
@@ -369,7 +440,7 @@ impl NativeCapture {
                     },
                     detail,
                     sequence: 0,
-                    time: x11rb::CURRENT_TIME,
+                    time: self.server_time()?,
                     root: self.root,
                     event: target,
                     child: x11rb::NONE,
@@ -388,6 +459,9 @@ impl NativeCapture {
 
 impl Drop for NativeCapture {
     fn drop(&mut self) {
+        if let Some(window) = self.timestamp_window.take() {
+            let _ = self.conn.destroy_window(window);
+        }
         if let Some(pixmap) = self.pixmap.take() {
             let _ = self.conn.free_pixmap(pixmap);
         }
@@ -471,6 +545,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires an X11 display with XComposite"]
+    fn forwarded_clicks_have_server_timestamps_and_release_the_private_helper() -> Result<()> {
+        let source = Source::new()?;
+        source
+            .conn
+            .change_window_attributes(
+                source.window,
+                &ChangeWindowAttributesAux::new()
+                    .event_mask(EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE),
+            )?
+            .check()?;
+        let mut capture = NativeCapture::new(source.window as usize)?;
+        let helper = capture.timestamp_window.unwrap();
+        let attributes = source.conn.get_window_attributes(helper)?.reply()?;
+        assert_eq!(attributes.class, WindowClass::INPUT_ONLY);
+        assert_eq!(attributes.map_state, MapState::UNMAPPED);
+        let mut times = Vec::new();
+        for (kind, buttons, click_count) in [
+            (PointerKind::Down(1), 1, 1),
+            (PointerKind::Up(1), 0, 1),
+            (PointerKind::Down(1), 1, 2),
+            (PointerKind::Up(1), 0, 2),
+        ] {
+            capture.pointer(EditorPointer {
+                position: [32.0, 24.0],
+                kind,
+                buttons,
+                modifiers: 0,
+                click_count,
+            })?;
+            source.conn.get_input_focus()?.reply()?;
+            for _ in 0..256 {
+                let Some(event) = source.conn.poll_for_event()? else {
+                    break;
+                };
+                match event {
+                    Event::ButtonPress(event) | Event::ButtonRelease(event) => {
+                        times.push(event.time);
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        assert_eq!(times.len(), 4);
+        assert!(times.iter().all(|time| *time != x11rb::CURRENT_TIME));
+        assert!(times.windows(2).all(|pair| {
+            let elapsed = pair[1].wrapping_sub(pair[0]);
+            elapsed > 0 && elapsed < 400
+        }));
+        // A toolkit's normal X11 double-click detector now sees a valid recent
+        // first press. These are server times, suitable for native grab requests.
+        assert!(times[2].wrapping_sub(times[0]) < 400);
+        drop(capture);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while source.conn.get_window_attributes(helper)?.reply().is_ok() {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "timestamp helper leaked"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(source.conn.get_geometry(source.window)?.reply()?.width, 640);
+        Ok(())
     }
 
     struct Source {

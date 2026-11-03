@@ -28,6 +28,8 @@ use windows::core::{HSTRING, PCWSTR, w};
 use super::{Placement, Spot, WinEvent, WindowId};
 
 const CLASS: PCWSTR = w!("nodeplayer-plugin-editor");
+// The Win32 bindings group this core mouse message under the optional Controls API.
+const WM_MOUSELEAVE: u32 = 0x02a3;
 
 type SubclassProc =
     Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT>;
@@ -389,6 +391,7 @@ unsafe extern "system" fn capture_input_proc(
     }
     if message == WM_CAPTURECHANGED {
         if hwnd == input.suppress_capture.get() && next.0.is_null()
+            || input.depth.get() != 0 && next == hwnd && input.owns(hwnd)
             || hwnd == input.returning_capture.get() && input.depth.get() != 0 && input.owns(next)
         {
             return LRESULT(0);
@@ -404,7 +407,12 @@ unsafe extern "system" fn capture_input_proc(
     if message == WM_KILLFOCUS {
         let next = HWND(value.0 as *mut _);
         if hwnd == input.suppress_focus.get() && next == input.returning_focus.get()
-            || hwnd == input.returning_focus.get() && input.depth.get() != 0 && input.owns(next)
+            // Restoring focus can issue a redundant loss-to-self notification while
+            // activating an owned popup. No logical focus change happened in that case.
+            || input.depth.get() != 0 && next == hwnd && input.owns(hwnd)
+            || hwnd == input.returning_focus.get()
+                && input.depth.get() != 0
+                && (input.owns(next) || next == hwnd)
         {
             return LRESULT(0);
         }
@@ -433,7 +441,7 @@ unsafe extern "system" fn capture_input_proc(
         }
     }
     let _scope = (input.owns(hwnd)
-        && matches!(message, WM_TIMER | WM_PAINT | WM_PRINT | WM_PRINTCLIENT))
+        && matches!(message, WM_TIMER | WM_PAINT | WM_PRINT | WM_PRINTCLIENT | WM_MOUSELEAVE))
     .then(|| input.enter());
     unsafe { DefSubclassProc(hwnd, message, value, position) }
 }
