@@ -21,7 +21,10 @@ pub(super) struct Smoothed {
 
 impl Smoothed {
     pub(super) fn new(v: f32) -> Self {
-        Self { current: v, target: v }
+        Self {
+            current: v,
+            target: v,
+        }
     }
 
     #[inline]
@@ -50,7 +53,9 @@ impl Processor for Through {
 
 impl Gain {
     pub fn new(db: f32) -> Self {
-        Self { gain: Smoothed::new(db_to_gain(db)) }
+        Self {
+            gain: Smoothed::new(db_to_gain(db)),
+        }
     }
 }
 
@@ -78,7 +83,9 @@ pub struct Pan {
 
 impl Pan {
     pub fn new(pan: f32) -> Self {
-        Self { pan: Smoothed::new(pan) }
+        Self {
+            pan: Smoothed::new(pan),
+        }
     }
 }
 
@@ -135,7 +142,10 @@ impl Processor for Delay {
             let d = self.time.next().clamp(1.0, (len - 2) as f32);
             let read = self.pos as f32 - d + len as f32;
             let (ri, frac) = (read as usize % len, read.fract());
-            for (ch, (x, y)) in [(i.l[k], &mut o.l[k]), (i.r[k], &mut o.r[k])].into_iter().enumerate() {
+            for (ch, (x, y)) in [(i.l[k], &mut o.l[k]), (i.r[k], &mut o.r[k])]
+                .into_iter()
+                .enumerate()
+            {
                 let b = &mut self.buf[ch];
                 let wet = b[ri] * (1.0 - frac) + b[(ri + 1) % len] * frac;
                 b[self.pos] = x + wet * self.feedback;
@@ -165,7 +175,9 @@ pub struct Mixer {
 
 impl Mixer {
     pub fn new(gains_db: [f32; MIXER_INPUTS]) -> Self {
-        Self { gains: gains_db.map(|g| Smoothed::new(db_to_gain(g))) }
+        Self {
+            gains: gains_db.map(|g| Smoothed::new(db_to_gain(g))),
+        }
     }
 }
 
@@ -215,7 +227,10 @@ pub struct Output {
 
 impl Output {
     pub fn new(volume_db: f32, meter: Arc<Meter>) -> Self {
-        Self { volume: Smoothed::new(db_to_gain(volume_db)), meter }
+        Self {
+            volume: Smoothed::new(db_to_gain(volume_db)),
+            meter,
+        }
     }
 }
 
@@ -257,7 +272,14 @@ pub struct LimiterParams {
 
 impl Default for LimiterParams {
     fn default() -> Self {
-        Self { threshold_db: -6.0, release_ms: 50.0, lookahead_ms: 5.0, output_db: 0.0, bypass: false, graph_speed: 10.0 }
+        Self {
+            threshold_db: -6.0,
+            release_ms: 50.0,
+            lookahead_ms: 5.0,
+            output_db: 0.0,
+            bypass: false,
+            graph_speed: 10.0,
+        }
     }
 }
 
@@ -281,7 +303,11 @@ pub struct LimiterMeter {
 impl Default for LimiterMeter {
     fn default() -> Self {
         let one = || AtomicU32::new(1f32.to_bits());
-        Self { gain: one(), history: (0..Self::HISTORY).map(|_| one()).collect(), pos: AtomicUsize::new(0) }
+        Self {
+            gain: one(),
+            history: (0..Self::HISTORY).map(|_| one()).collect(),
+            pos: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -296,14 +322,18 @@ impl LimiterMeter {
     pub fn history(&self) -> Vec<f32> {
         let pos = self.pos.load(Ordering::Acquire);
         (0..Self::HISTORY)
-            .map(|k| f32::from_bits(self.history[(pos + k) % Self::HISTORY].load(Ordering::Relaxed)))
+            .map(|k| {
+                f32::from_bits(self.history[(pos + k) % Self::HISTORY].load(Ordering::Relaxed))
+            })
             .collect()
     }
 
     fn feed(&self, gain: f32) {
-        let _ = self.gain.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-            (gain < f32::from_bits(old)).then_some(gain.to_bits())
-        });
+        let _ = self
+            .gain
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                (gain < f32::from_bits(old)).then_some(gain.to_bits())
+            });
     }
 
     fn push(&self, gain: f32) {
@@ -396,7 +426,11 @@ impl Processor for KazuLimiter {
                     self.threshold / *env
                 };
                 let g = &mut self.gain[ch];
-                *g = if target < *g { target } else { self.release_coef * *g + (1.0 - self.release_coef) * target };
+                *g = if target < *g {
+                    target
+                } else {
+                    self.release_coef * *g + (1.0 - self.release_coef) * target
+                };
             }
             let gain = self.gain[0].min(self.gain[1]);
             o.l[k] = x[0] * gain * self.output_gain;
@@ -444,7 +478,11 @@ impl Tap {
 
     pub fn new() -> Arc<Self> {
         let buf = || (0..Self::FRAMES).map(|_| AtomicU32::new(0)).collect();
-        Arc::new(Self { l: buf(), r: buf(), written: AtomicU64::new(0) })
+        Arc::new(Self {
+            l: buf(),
+            r: buf(),
+            written: AtomicU64::new(0),
+        })
     }
 
     /// Total frames written so far.
@@ -504,9 +542,15 @@ impl Processor for TapNode {
 /// the processor can be rebuilt; only the audio thread locks it, so `try_lock` always wins.
 pub type MidiQueue<T> = Arc<std::sync::Mutex<T>>;
 
-pub fn midi_queue() -> (MidiQueue<rtrb::Producer<MidiEvent>>, MidiQueue<rtrb::Consumer<MidiEvent>>) {
+pub fn midi_queue() -> (
+    MidiQueue<rtrb::Producer<MidiEvent>>,
+    MidiQueue<rtrb::Consumer<MidiEvent>>,
+) {
     let (tx, rx) = rtrb::RingBuffer::new(MidiBuf::CAPACITY * 4);
-    (Arc::new(std::sync::Mutex::new(tx)), Arc::new(std::sync::Mutex::new(rx)))
+    (
+        Arc::new(std::sync::Mutex::new(tx)),
+        Arc::new(std::sync::Mutex::new(rx)),
+    )
 }
 
 /// Connects the graph's MIDI with other threads: events from `from` come out of the node's
@@ -564,43 +608,28 @@ impl Processor for MidiBridge {
 
 const BYPASS_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 const BYPASS_MIDI_CAPACITY: usize = 4096;
+// Keep a real input horizon through remote latency changes and one-second local edits
+// at 96 kHz. Longer initial delays prepare their full requested history as usual.
+const BYPASS_HISTORY_RESERVE: u64 = 131_072;
 static BYPASS_ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Shared by live, queued and retired bypasses, so control-side replacement cannot exceed
 /// the bound by keeping an old allocation alive until the audio thread acknowledges it.
-struct BypassReservation<'a> {
-    budget: &'a AtomicUsize,
-    bytes: usize,
-}
-
-impl<'a> BypassReservation<'a> {
-    fn reserve_in(budget: &'a AtomicUsize, limit: usize, bytes: usize) -> anyhow::Result<Self> {
-        budget.try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-            used.checked_add(bytes).filter(|&next| next <= limit)
-        }).map_err(|_| anyhow::anyhow!("prepared plugin bypass memory budget exceeded ({bytes} bytes requested, {limit} byte limit)"))?;
-        Ok(Self { budget, bytes })
-    }
-}
-
-impl Drop for BypassReservation<'_> {
-    fn drop(&mut self) {
-        self.budget.fetch_sub(self.bytes, Ordering::Relaxed);
-    }
-}
+type BypassReservation<'a> = super::compensation::StorageReservation<'a>;
 
 fn bypass_allocation_bytes(total_latency: u32) -> anyhow::Result<usize> {
+    super::compensation::AudioDelay::allocation_frames(total_latency as u64)?;
     // Include the warmed output and MidiBuf owned by PluginProc as well as delay storage.
     // Standalone restart fallbacks conservatively reserve the same overhead.
     let fixed = BYPASS_MIDI_CAPACITY
         .checked_mul(size_of::<super::compensation::TimedMidi>())
         .and_then(|n| n.checked_add(super::MAX_BLOCK * 2 * size_of::<f32>()))
-        .and_then(|n| n.checked_add(MidiBuf::CAPACITY * size_of::<MidiEvent>()))
+        .and_then(|n| n.checked_add(2 * MidiBuf::CAPACITY * size_of::<MidiEvent>()))
         .and_then(|n| n.checked_add(4096))
         .ok_or_else(|| anyhow::anyhow!("prepared bypass allocation size overflow"))?;
-    usize::try_from(total_latency)?
-        .checked_mul(2 * size_of::<f32>())
-        .and_then(|n| n.checked_add(fixed))
-        .ok_or_else(|| anyhow::anyhow!("prepared bypass allocation size overflow"))
+    super::compensation::AudioDelay::allocation_bytes(u64::from(total_latency).max(BYPASS_HISTORY_RESERVE))?
+    .checked_add(fixed)
+    .ok_or_else(|| anyhow::anyhow!("prepared bypass allocation size overflow"))
 }
 
 /// Prepared fixed-timeline replacement while a plugin restarts/faults. FX emits delayed dry,
@@ -620,15 +649,29 @@ impl LatencyBypass {
         let reservation = BypassReservation::reserve_in(
             &BYPASS_ALLOCATED_BYTES,
             BYPASS_BUDGET_BYTES,
-            bypass_allocation_bytes(total_latency)?,
+            bypass_allocation_bytes(total_latency)?
+                - super::compensation::AudioDelay::allocation_bytes(u64::from(total_latency).max(BYPASS_HISTORY_RESERVE))?,
         )?;
         Ok(Self {
-            audio: super::compensation::AudioDelay::new(total_latency as u64)?,
+            audio: super::compensation::AudioDelay::with_budget(
+                total_latency as u64,
+                u64::from(total_latency).max(BYPASS_HISTORY_RESERVE),
+                &BYPASS_ALLOCATED_BYTES,
+                BYPASS_BUDGET_BYTES,
+            )?,
             midi: super::compensation::MidiDelay::new(bridge_latency as u64, BYPASS_MIDI_CAPACITY)?,
             instrument,
             cursor: 0,
             _reservation: reservation,
         })
+    }
+
+    fn inherit(&mut self, previous: &mut Self) {
+        // A metadata-only latency change is continuous audio time. Preserve the samples
+        // already rendered into the dry history rather than priming a fresh delay.
+        self.audio.inherit(&mut previous.audio);
+        self.midi.inherit(&mut previous.midi);
+        self.cursor = previous.cursor;
     }
 }
 
@@ -667,6 +710,10 @@ impl Processor for LatencyBypass {
         midi_in: &[MidiEvent],
         midi_out: &mut MidiBuf,
     ) {
+        if first_sample != self.cursor {
+            self.audio.invalidate();
+            self.midi.invalidate();
+        }
         self.process(n, inputs, outputs);
         self.midi.process(midi_in, midi_out, first_sample, n);
         self.cursor = first_sample.saturating_add(n as u64);
@@ -682,19 +729,25 @@ struct PreparedBypass {
 /// A hosted plugin's processor with a bypass switch (parameter 0). `new` retains legacy
 /// immediate bypass; `with_latency` opts into prepared, constantly warmed delayed dry.
 pub struct PluginProc {
-    pub inner: Box<dyn Processor>,
+    inner: Option<Box<dyn Processor>>,
     bypass: bool,
     delayed: Option<PreparedBypass>,
     cursor: u64,
+    midi_cleanup: bool,
+    inner_cleanup: bool,
+    resume_midi: MidiBuf,
 }
 
 impl PluginProc {
     pub fn new(inner: Box<dyn Processor>) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             bypass: false,
             delayed: None,
             cursor: 0,
+            midi_cleanup: false,
+            inner_cleanup: false,
+            resume_midi: MidiBuf::new(),
         }
     }
 
@@ -708,9 +761,12 @@ impl PluginProc {
         instrument: bool,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            inner,
+            inner: Some(inner),
             bypass: false,
             cursor: 0,
+            midi_cleanup: false,
+            inner_cleanup: false,
+            resume_midi: MidiBuf::new(),
             delayed: Some(PreparedBypass {
                 fallback: Box::new(LatencyBypass::new(
                     total_latency,
@@ -726,14 +782,18 @@ impl PluginProc {
 
 impl Processor for PluginProc {
     fn set_transport(&mut self, transport: Transport) {
-        self.inner.set_transport(transport);
+        if let Some(inner) = &mut self.inner {
+            inner.set_transport(transport);
+        }
     }
 
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
         if let Some(delayed) = &mut self.delayed {
             delayed.fallback.process(n, inputs, &mut delayed.audio);
-            self.inner.process(n, inputs, outputs);
-            if self.bypass {
+            if let Some(inner) = &mut self.inner {
+                inner.process(n, inputs, outputs);
+            }
+            if self.bypass || self.inner.is_none() {
                 for (index, out) in outputs.iter_mut().enumerate() {
                     if let Some(dry) = delayed.audio.get(index) {
                         out.l[..n].copy_from_slice(&dry.l[..n]);
@@ -743,7 +803,7 @@ impl Processor for PluginProc {
                     }
                 }
             }
-        } else if self.bypass {
+        } else if self.bypass || self.inner.is_none() {
             for (index, out) in outputs.iter_mut().enumerate() {
                 if let Some(input) = inputs.get(index) {
                     out.l[..n].copy_from_slice(&input.l[..n]);
@@ -752,8 +812,8 @@ impl Processor for PluginProc {
                     out.clear(n);
                 }
             }
-        } else {
-            self.inner.process(n, inputs, outputs);
+        } else if let Some(inner) = &mut self.inner {
+            inner.process(n, inputs, outputs);
         }
     }
 
@@ -777,6 +837,25 @@ impl Processor for PluginProc {
         midi_in: &[MidiEvent],
         midi_out: &mut MidiBuf,
     ) {
+        let inner_midi = if self.inner_cleanup && self.inner.is_some() && n > 0 {
+            self.resume_midi.clear();
+            for channel in 0..16 {
+                for cc in [64, 123, 120] {
+                    self.resume_midi.push(MidiEvent {
+                        time: 0,
+                        data: [0xb0 | channel, cc, 0],
+                    });
+                }
+            }
+            let mut complete = true;
+            for event in midi_in {
+                complete &= self.resume_midi.push(*event);
+            }
+            self.inner_cleanup = !complete;
+            self.resume_midi.events()
+        } else {
+            midi_in
+        };
         if let Some(delayed) = &mut self.delayed {
             delayed.midi.clear();
             delayed.fallback.process_timed(
@@ -787,9 +866,10 @@ impl Processor for PluginProc {
                 midi_in,
                 &mut delayed.midi,
             );
-            self.inner
-                .process_timed(first_sample, n, inputs, outputs, midi_in, midi_out);
-            if self.bypass {
+            if let Some(inner) = &mut self.inner {
+                inner.process_timed(first_sample, n, inputs, outputs, inner_midi, midi_out);
+            }
+            if self.bypass || self.inner.is_none() {
                 for (index, output) in outputs.iter_mut().enumerate() {
                     if let Some(dry) = delayed.audio.get(index) {
                         output.l[..n].copy_from_slice(&dry.l[..n]);
@@ -803,7 +883,7 @@ impl Processor for PluginProc {
                     midi_out.push(*event);
                 }
             }
-        } else if self.bypass {
+        } else if self.bypass || self.inner.is_none() {
             for (index, output) in outputs.iter_mut().enumerate() {
                 if let Some(input) = inputs.get(index) {
                     output.l[..n].copy_from_slice(&input.l[..n]);
@@ -815,9 +895,29 @@ impl Processor for PluginProc {
             for event in midi_in {
                 midi_out.push(*event);
             }
-        } else {
-            self.inner
-                .process_timed(first_sample, n, inputs, outputs, midi_in, midi_out);
+        } else if let Some(inner) = &mut self.inner {
+            inner.process_timed(first_sample, n, inputs, outputs, inner_midi, midi_out);
+        }
+        if self.midi_cleanup && n > 0 {
+            // An inner processor can retain a note-off while parked. Cleanup sorts ahead
+            // of this block's events, including notes stamped at its first sample.
+            const CLEANUP_EVENTS: usize = 16 * 3;
+            let overflow = midi_out.events.len() > MidiBuf::CAPACITY - CLEANUP_EVENTS;
+            midi_out.events.truncate(MidiBuf::CAPACITY - CLEANUP_EVENTS);
+            let len = midi_out.events.len();
+            midi_out
+                .events
+                .resize(len + CLEANUP_EVENTS, MidiEvent::default());
+            midi_out.events.copy_within(..len, CLEANUP_EVENTS);
+            for channel in 0..16 {
+                for (index, cc) in [64, 123, 120].into_iter().enumerate() {
+                    midi_out.events[channel * 3 + index] = MidiEvent {
+                        time: 0,
+                        data: [0xb0 | channel as u8, cc, 0],
+                    };
+                }
+            }
+            self.midi_cleanup = overflow;
         }
         self.cursor = first_sample.saturating_add(n as u64);
     }
@@ -825,14 +925,32 @@ impl Processor for PluginProc {
     fn set_param(&mut self, _index: usize, value: f32) {
         self.bypass = value > 0.5;
     }
-    fn replace_latency_bypass(&mut self, bypass: Box<LatencyBypass>) -> Box<LatencyBypass> {
+    fn flush_params(&mut self) {
+        if let Some(inner) = &mut self.inner {
+            inner.flush_params();
+        }
+    }
+    fn replace_plugin_inner(
+        &mut self,
+        inner: Option<Box<dyn Processor>>,
+    ) -> Option<Box<dyn Processor>> {
+        self.midi_cleanup |= self.inner.is_some() != inner.is_some();
+        self.inner_cleanup |= self.inner.is_none() && inner.is_some();
+        std::mem::replace(&mut self.inner, inner)
+    }
+    fn replace_latency_bypass(&mut self, mut bypass: Box<LatencyBypass>) -> Box<LatencyBypass> {
         match &mut self.delayed {
-            Some(delayed) => std::mem::replace(&mut delayed.fallback, bypass),
+            Some(delayed) => {
+                bypass.inherit(&mut delayed.fallback);
+                std::mem::replace(&mut delayed.fallback, bypass)
+            }
             None => bypass,
         }
     }
     fn deactivate(&mut self) {
-        self.inner.deactivate();
+        if let Some(inner) = &mut self.inner {
+            inner.deactivate();
+        }
     }
 }
 
@@ -840,6 +958,224 @@ impl Processor for PluginProc {
 mod tests {
     use super::*;
     use crate::engine::MAX_BLOCK;
+
+    fn continuity_signal(sample: usize, rate: f32) -> [f32; 2] {
+        let phase = sample as f32 / rate * std::f32::consts::TAU;
+        [
+            0.2 + 0.04 * (phase * 997.0).sin(),
+            -0.3 + 0.03 * (phase * 1301.0).cos(),
+        ]
+    }
+
+    #[test]
+    fn final_pcm_stays_warm_through_suspend_resume_and_latency_edits() {
+        use crate::engine::{
+            AudioState, Command, Garbage, NodeSlot, Schedule, Step, compensation, timing,
+        };
+        struct Signal(f32, usize);
+        impl Processor for Signal {
+            fn process(&mut self, n: usize, _: &mut [StereoBuf], out: &mut [StereoBuf]) {
+                for i in 0..n {
+                    let sample = continuity_signal(self.1 + i, self.0);
+                    out[0].l[i] = sample[0];
+                    out[0].r[i] = sample[1];
+                }
+                self.1 += n;
+            }
+        }
+        struct WarmPlugin {
+            latency: Arc<AtomicUsize>,
+            history: Vec<[f32; 2]>,
+            cursor: usize,
+            valid: usize,
+        }
+        impl Processor for WarmPlugin {
+            fn process(&mut self, n: usize, input: &mut [StereoBuf], out: &mut [StereoBuf]) {
+                let delay = self.latency.load(Ordering::Relaxed);
+                let capacity = self.history.len();
+                for i in 0..n {
+                    let source = [input[0].l[i], input[0].r[i]];
+                    let value = if delay == 0 {
+                        source
+                    } else if self.valid >= delay {
+                        self.history[(self.cursor + capacity - delay) % capacity]
+                    } else {
+                        [0.0; 2]
+                    };
+                    out[0].l[i] = value[0];
+                    out[0].r[i] = value[1];
+                    self.history[self.cursor] = source;
+                    self.cursor = (self.cursor + 1) % capacity;
+                    self.valid = (self.valid + 1).min(capacity);
+                }
+            }
+        }
+        fn schedule(latency: u64, parallel: bool) -> Schedule {
+            let count = if parallel { 4 } else { 3 };
+            let nodes: Vec<_> = (0..count)
+                .map(|id| timing::NodeSpec {
+                    id,
+                    audio_inputs: usize::from(id != 0),
+                    audio_outputs: usize::from(id < 2),
+                    midi_input: false,
+                    midi_output: false,
+                    sink: id >= 2,
+                    midi_sink: false,
+                    timing: timing::NodeTiming {
+                        algorithm_latency_frames: if id == 1 { latency } else { 0 },
+                        ..Default::default()
+                    },
+                })
+                .collect();
+            let edge = |from, to| timing::EdgeKey {
+                from,
+                to,
+                kind: timing::EdgeKind::Audio {
+                    output: 0,
+                    input: 0,
+                },
+                occurrence: 0,
+            };
+            let mut edges = vec![edge(0, 1), edge(1, 2)];
+            if parallel {
+                edges.push(edge(0, 3));
+            }
+            let analysis =
+                timing::analyze(&nodes, &edges, true, timing::TimingLimits::default()).unwrap();
+            let mut schedule = Schedule::default();
+            for node in analysis.order.iter().copied() {
+                schedule.steps.push(Step {
+                    node,
+                    inputs: if node == 0 {
+                        vec![]
+                    } else {
+                        vec![vec![(if node == 2 { 1 } else { 0 }, 0)]]
+                    },
+                    midi: vec![],
+                });
+                if node >= 2 {
+                    schedule.sinks.push(node);
+                }
+            }
+            schedule.timing = Some(
+                compensation::TimingPlan::prepare(
+                    &analysis,
+                    timing::TimingLimits::default(),
+                    &schedule.steps,
+                )
+                .unwrap(),
+            );
+            schedule
+        }
+        for (rate, block) in [
+            (48_000.0, 64),
+            (48_000.0, 256),
+            (48_000.0, 512),
+            (96_000.0, 256),
+        ] {
+            for parallel in [false, true] {
+                let latency = Arc::new(AtomicUsize::new(192));
+                let plugin = PluginProc::with_latency(
+                    Box::new(WarmPlugin {
+                        latency: latency.clone(),
+                        history: vec![[0.0; 2]; 131072],
+                        cursor: 0,
+                        valid: 0,
+                    }),
+                    192,
+                    0,
+                    false,
+                )
+                .unwrap();
+                let (mut commands, cmd_rx) = rtrb::RingBuffer::new(32);
+                let (garbage_tx, mut garbage) = rtrb::RingBuffer::new(32);
+                let mut state = AudioState {
+                    slots: (0..crate::engine::MAX_NODES).map(|_| None).collect(),
+                    schedule: Box::new(schedule(192, parallel)),
+                    cmd_rx,
+                    garbage_tx,
+                    sample_clock: 0,
+                    status: Arc::default(),
+                };
+                state.slots[0] = Some(NodeSlot::new(Box::new(Signal(rate, 0)), 0, 1));
+                state.slots[1] = Some(NodeSlot::new(Box::new(plugin), 1, 1));
+                state.slots[2] = Some(NodeSlot::new(
+                    Box::new(Output::new(0.0, Arc::default())),
+                    1,
+                    0,
+                ));
+                if parallel {
+                    state.slots[3] = Some(NodeSlot::new(
+                        Box::new(Output::new(0.0, Arc::default())),
+                        1,
+                        0,
+                    ));
+                }
+                let mut pcm = vec![0.0; block * 2];
+                for _ in 0..(rate as usize * 2 / block) {
+                    state.render(&mut pcm, 2);
+                }
+                let mut edits = vec![230, 208, 96, 0, 111, 131];
+                if !parallel {
+                    edits.extend([0, rate as usize, rate as usize / 2, 0]);
+                }
+                for delay in edits {
+                    latency.store(delay, Ordering::Relaxed);
+                    commands
+                        .push(Command::ConfigureBypass(
+                            1,
+                            Box::new(LatencyBypass::new(delay as u32, 0, false).unwrap()),
+                        ))
+                        .ok()
+                        .unwrap();
+                    commands
+                        .push(Command::SetSchedule(Box::new(schedule(
+                            delay as u64,
+                            parallel,
+                        ))))
+                        .ok()
+                        .unwrap();
+                    commands.push(Command::SuspendPlugin(1)).ok().unwrap();
+                    let mut inner = None;
+                    for _ in 0..3 {
+                        let first = state.sample_clock as usize;
+                        state.render(&mut pcm, 2);
+                        for (i, frame) in pcm.as_chunks::<2>().0.iter().enumerate() {
+                            let expected = continuity_signal(first + i - delay, rate);
+                            let gain = if parallel { 2.0 } else { 1.0 };
+                            assert_eq!(
+                                frame,
+                                &[expected[0] * gain, expected[1] * gain],
+                                "fallback alignment: rate={rate} block={block} parallel={parallel} delay={delay} sample={}",
+                                first + i
+                            );
+                        }
+                        while let Ok(item) = garbage.pop() {
+                            if let Garbage::PluginSuspended(1, retired) = item {
+                                inner = retired;
+                            }
+                        }
+                    }
+                    commands
+                        .push(Command::ResumePlugin(
+                            1,
+                            inner.take().expect("suspended inner acknowledgement"),
+                        ))
+                        .ok()
+                        .unwrap();
+                    for _ in 0..32 {
+                        state.render(&mut pcm, 2);
+                        assert!(
+                            pcm.iter()
+                                .all(|sample| *sample != 0.0 && sample.is_finite()),
+                            "cold final PCM: rate={rate} block={block} parallel={parallel} delay={delay}"
+                        );
+                        while garbage.pop().is_ok() {}
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn delayed_bypass_is_warm_and_keeps_inner_pumping() {
@@ -884,6 +1220,72 @@ mod tests {
     }
 
     #[test]
+    fn suspend_resume_cleans_midi_before_first_sample_notes_on_both_sides() {
+        struct MidiEcho(Arc<std::sync::Mutex<Vec<MidiEvent>>>);
+        impl Processor for MidiEcho {
+            fn process(&mut self, _: usize, _: &mut [StereoBuf], _: &mut [StereoBuf]) {}
+            fn process_midi(
+                &mut self,
+                _: usize,
+                _: &mut [StereoBuf],
+                _: &mut [StereoBuf],
+                input: &[MidiEvent],
+                output: &mut MidiBuf,
+            ) {
+                *self.0.lock().unwrap() = input.to_vec();
+                for event in input {
+                    output.push(*event);
+                }
+            }
+        }
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut plugin =
+            PluginProc::with_latency(Box::new(MidiEcho(observed.clone())), 0, 0, false).unwrap();
+        let mut input = [StereoBuf::new()];
+        let mut output = [StereoBuf::new()];
+        let mut midi = MidiBuf::new();
+        plugin.process_timed(
+            0,
+            1,
+            &mut input,
+            &mut output,
+            &[MidiEvent {
+                time: 0,
+                data: [0x90, 60, 1],
+            }],
+            &mut midi,
+        );
+        let inner = plugin.replace_plugin_inner(None).unwrap();
+        midi.clear();
+        let off = MidiEvent {
+            time: 0,
+            data: [0x80, 60, 0],
+        };
+        plugin.process_timed(1, 1, &mut input, &mut output, &[off], &mut midi);
+        assert_eq!(midi.events().len(), 49);
+        assert_eq!(midi.events()[0].data, [0xb0, 64, 0]);
+        assert_eq!(midi.events()[48], off);
+        assert!(plugin.replace_plugin_inner(Some(inner)).is_none());
+        midi.clear();
+        let on = MidiEvent {
+            time: 0,
+            data: [0x90, 61, 1],
+        };
+        plugin.process_timed(2, 1, &mut input, &mut output, &[on], &mut midi);
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 49);
+        assert_eq!(observed[0].data, [0xb0, 64, 0]);
+        assert_eq!(observed[47].data, [0xbf, 120, 0]);
+        assert_eq!(observed[48], on);
+        assert!(
+            midi.events()[..48]
+                .iter()
+                .all(|event| event.data[0] & 0xf0 == 0xb0)
+        );
+        assert_eq!(midi.events().last(), Some(&on));
+    }
+
+    #[test]
     fn bypass_budget_counts_live_and_retired_reservations() {
         let budget = AtomicUsize::new(0);
         let live = BypassReservation::reserve_in(&budget, 100, 60).unwrap();
@@ -906,13 +1308,30 @@ mod tests {
     fn bypass_budget_charges_delay_and_warmed_storage_before_allocating() {
         let fixed = BYPASS_MIDI_CAPACITY * size_of::<crate::engine::compensation::TimedMidi>()
             + MAX_BLOCK * 2 * size_of::<f32>()
-            + MidiBuf::CAPACITY * size_of::<MidiEvent>()
+            + 2 * MidiBuf::CAPACITY * size_of::<MidiEvent>()
             + 4096;
-        assert_eq!(bypass_allocation_bytes(0).unwrap(), fixed);
-        assert_eq!(bypass_allocation_bytes(512).unwrap(), fixed + 512 * 8);
+        assert_eq!(
+            bypass_allocation_bytes(0).unwrap(),
+            fixed
+                + super::super::compensation::AudioDelay::allocation_bytes(
+                    BYPASS_HISTORY_RESERVE
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            bypass_allocation_bytes(512).unwrap(),
+            fixed
+                + super::super::compensation::AudioDelay::allocation_bytes(
+                    BYPASS_HISTORY_RESERVE
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            bypass_allocation_bytes(262_144).unwrap(),
+            fixed + super::super::compensation::AudioDelay::allocation_bytes(262_144).unwrap()
+        );
         let budget = AtomicUsize::new(0);
-        let oversized = bypass_allocation_bytes(u32::MAX).unwrap();
-        assert!(BypassReservation::reserve_in(&budget, BYPASS_BUDGET_BYTES, oversized).is_err());
+        assert!(bypass_allocation_bytes(u32::MAX).is_err());
         assert_eq!(budget.load(Ordering::Relaxed), 0);
     }
 
@@ -989,9 +1408,16 @@ mod tests {
                 ins[0].r[k] = v * 0.5;
             }
             lim.process(MAX_BLOCK, &mut ins, &mut outs);
-            peak = outs[0].l.iter().chain(&outs[0].r).fold(peak, |m, v| m.max(v.abs()));
+            peak = outs[0]
+                .l
+                .iter()
+                .chain(&outs[0].r)
+                .fold(peak, |m, v| m.max(v.abs()));
         }
-        assert!(peak <= threshold + 1e-6, "peak {peak} over threshold {threshold}");
+        assert!(
+            peak <= threshold + 1e-6,
+            "peak {peak} over threshold {threshold}"
+        );
         let gr = meter.take_gain();
         assert!((gr - threshold).abs() < 0.01, "gain {gr}");
         assert!(meter.history().iter().any(|g| *g < 0.6));

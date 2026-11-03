@@ -369,7 +369,8 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                 let restart = instance.wants_restart();
                 if restart {
                     park(&ctl, true)?;
-                    map.invalidate();
+                    // A warm activation retains the plugin state and its sample timeline.
+                    // Keep queued bridge audio; only destructive Load invalidates an epoch.
                     let proc = instance.restart(init.sr as f64, crate::engine::MAX_BLOCK)?;
                     audio_tx
                         .send_timeout(AudioMessage::Replace(proc), Duration::from_secs(1))
@@ -587,13 +588,9 @@ fn audio_loop(
         if ctl.park.load(Ordering::Acquire) || stopped {
             if !stopped {
                 if ctl.gate.swap(0, Ordering::AcqRel) != 0 {
-                    // Local parameter setters enqueue to DSP. Consume those queues before
-                    // saving/restarting, even when no parent input quantum is available.
-                    // This child-only silent quantum is discarded, not published as audio.
-                    inputs[0].clear(Q);
-                    outputs[0].clear(Q);
-                    output_midi.clear();
-                    proc.process_midi(Q, &mut inputs, &mut outputs, &[], &mut output_midi);
+                    // Consume active parameter changes on their legal thread without
+                    // inventing input samples or advancing/overlapping process clocks.
+                    proc.flush_params();
                 }
                 proc.deactivate();
                 stopped = true;
@@ -980,5 +977,111 @@ mod tests {
         for (i, received) in received.into_iter().enumerate() {
             assert_eq!(received.unwrap(), (1000 + i as u64 * Q as u64, states[i]));
         }
+    }
+
+    #[test]
+    fn audio_worker_restart_flushes_controls_without_fabricating_samples() {
+        #[derive(Debug, PartialEq)]
+        enum Observation {
+            Process(u8, u64, f32, f32),
+            Flush(u8),
+            Stop(u8),
+        }
+        struct Probe(u8, crossbeam_channel::Sender<Observation>);
+        impl Processor for Probe {
+            fn process(&mut self, _: usize, _: &mut [StereoBuf], _: &mut [StereoBuf]) {
+                panic!("worker must supply an actual input sample clock");
+            }
+            fn process_timed(
+                &mut self,
+                clock: u64,
+                n: usize,
+                inputs: &mut [StereoBuf],
+                outputs: &mut [StereoBuf],
+                _: &[MidiEvent],
+                _: &mut MidiBuf,
+            ) {
+                assert_eq!(n, Q);
+                outputs[0].l[..n].copy_from_slice(&inputs[0].l[..n]);
+                outputs[0].r[..n].copy_from_slice(&inputs[0].r[..n]);
+                self.1
+                    .send(Observation::Process(
+                        self.0,
+                        clock,
+                        inputs[0].l[0],
+                        inputs[0].r[0],
+                    ))
+                    .unwrap();
+            }
+            fn flush_params(&mut self) {
+                self.1.send(Observation::Flush(self.0)).unwrap();
+            }
+            fn deactivate(&mut self) {
+                self.1.send(Observation::Stop(self.0)).unwrap();
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "nodeplayer-worker-warm-restart-{}",
+            std::process::id()
+        ));
+        let map = Arc::new(Shared::create(path, 1).unwrap());
+        let publish = |index: usize, sample: u64, value: f32| {
+            let slot = map.slot(index);
+            let payload = unsafe { slot.payload() };
+            payload.generation = map.epoch();
+            payload.sequence = sample / Q as u64;
+            payload.first_sample = sample;
+            payload.frames = Q as u32;
+            payload.midi_count = 0;
+            payload.left.fill(value);
+            payload.right.fill(-value);
+            slot.state.store(INPUT, Ordering::Release);
+        };
+        publish(0, 1024, 0.25);
+        let ctl = Arc::new(AudioControl {
+            park: AtomicBool::new(false),
+            parked: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            gate: AtomicU32::new(0),
+        });
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (control_tx, control_rx) = crossbeam_channel::bounded(2);
+        let child_map = map.clone();
+        let child_ctl = ctl.clone();
+        let probe = Probe(0, tx.clone());
+        let handle = std::thread::spawn(move || {
+            audio_loop(Box::new(probe), child_map, child_ctl, control_rx);
+        });
+        let result = (|| -> Result<Vec<Observation>> {
+            let mut seen = vec![rx.recv_timeout(Duration::from_secs(2))?];
+            park(&ctl, true)?;
+            // Actual queued audio survives parking and resumes at the next sample.
+            publish(1, 1024 + Q as u64, 0.75);
+            control_tx
+                .send(AudioMessage::Replace(Box::new(Probe(1, tx))))
+                .map_err(|_| anyhow::anyhow!("worker replacement channel closed"))?;
+            resume(&ctl)?;
+            for _ in 0..3 {
+                seen.push(rx.recv_timeout(Duration::from_secs(2))?);
+            }
+            Ok(seen)
+        })();
+        ctl.stop.store(true, Ordering::Release);
+        handle.join().unwrap();
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                Observation::Process(0, 1024, 0.25, -0.25),
+                Observation::Flush(0),
+                Observation::Stop(0),
+                Observation::Process(1, 1024 + Q as u64, 0.75, -0.75),
+            ]
+        );
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![Observation::Stop(1)]
+        );
+        assert!(!ctl.failed.load(Ordering::Acquire));
     }
 }

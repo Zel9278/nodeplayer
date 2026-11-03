@@ -126,7 +126,6 @@ pub fn create(info: &PluginInfo, sr: f32, max_block: usize) -> Result<Created> {
             editor: true,
             status: "pending".into(),
             revision: 0,
-            restart: false,
         }),
         processor,
     })
@@ -143,7 +142,6 @@ struct RemoteInstance {
     editor: bool,
     status: String,
     revision: u64,
-    restart: bool,
 }
 impl Drop for RemoteInstance {
     fn drop(&mut self) {
@@ -208,10 +206,6 @@ impl Instance for RemoteInstance {
         if self.revision != s.revision {
             self.revision = s.revision;
             if let Some(m) = &s.metadata {
-                self.restart |= self.params.len() != m.params.len()
-                    || self.params.iter().zip(&m.params).any(|(a, b)| a.id != b.id)
-                    || self.latency != m.latency
-                    || self.midi != m.midi;
                 self.params = m.params.clone();
                 self.latency = m.latency;
                 self.midi = m.midi;
@@ -225,7 +219,9 @@ impl Instance for RemoteInstance {
         self.displays.extend(s.displays.clone());
     }
     fn wants_restart(&mut self) -> bool {
-        std::mem::take(&mut self.restart)
+        // Parameter/MIDI-port metadata changes update only graph pins. The worker and
+        // fixed stereo bridge continue in place, including their queued dry/wet history.
+        false
     }
     fn restart(&mut self, sr: f64, max_block: usize) -> Result<Box<dyn Processor>> {
         // This replaces only graph metadata/ports. Instance/supervisor owns the worker,

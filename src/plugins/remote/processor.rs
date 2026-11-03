@@ -39,6 +39,7 @@ pub(super) struct RemoteProcessor {
     prime_until: u64,
     epoch: u64,
     minimum_input: u64,
+    minimum_dry: u64,
 }
 impl RemoteProcessor {
     pub fn new(core: Arc<Core>) -> Self {
@@ -69,6 +70,7 @@ impl RemoteProcessor {
             prime_until: cursor.saturating_add(DELAY as u64),
             epoch: 0,
             minimum_input: cursor,
+            minimum_dry: cursor,
         }
     }
     fn align_cursor(&mut self, first_sample: u64) {
@@ -79,6 +81,7 @@ impl RemoteProcessor {
         // fallback. Never retime queued audio/MIDI onto the new engine sample position.
         self.cursor = first_sample;
         self.minimum_input = first_sample;
+        self.minimum_dry = first_sample;
         self.fill = 0;
         self.in_count = 0;
         self.future.clear();
@@ -88,6 +91,9 @@ impl RemoteProcessor {
         self.core.cursor.store(first_sample, Ordering::Release);
     }
     fn attach(&mut self) {
+        // Ordinary warm plugin activation keeps the same mapping/epoch. A new worker or
+        // explicit state-load epoch is a real old-output boundary: discard queued wet/MIDI,
+        // while retaining actual dry-input history for the continuously running fallback.
         if let Ok(m) = self.core.map.try_lock()
             && let Some(m) = m.as_ref()
             && (self
@@ -163,7 +169,10 @@ impl RemoteProcessor {
                             at: t,
                             sequence,
                             index: index as u32,
-                            event: MidiEvent { time: 0, data: e.data },
+                            event: MidiEvent {
+                                time: 0,
+                                data: e.data,
+                            },
                         });
                     }
                 }
@@ -263,7 +272,7 @@ impl RemoteProcessor {
                     && let Some(source) = t.checked_sub(delay as u64)
                 {
                     let x = source as usize & (HISTORY - 1);
-                    if self.dry_tags[x] == source {
+                    if source >= self.minimum_dry && self.dry_tags[x] == source {
                         audio = (self.dry_l[x], self.dry_r[x]);
                     }
                 }
@@ -538,6 +547,162 @@ mod tests {
         }
         assert_eq!(found, vec![(DELAY, 1.0)]);
         assert_eq!(found_midi, vec![DELAY]);
+    }
+
+    fn signal(sample: usize, rate: f32) -> [f32; 2] {
+        let phase = sample as f32 * std::f32::consts::TAU / rate;
+        [
+            0.2 + 0.04 * (997.0 * phase).sin(),
+            -0.3 + 0.03 * (1301.0 * phase).cos(),
+        ]
+    }
+
+    #[test]
+    fn final_pcm_bridge_keeps_wet_and_dry_history_through_warm_restart_latency_edits() {
+        use crate::engine::{compensation::AudioDelay, nodes::Output};
+        fn render_final(
+            processor: &mut RemoteProcessor,
+            sink: &mut Output,
+            device_delay: &mut AudioDelay,
+            format: (f32, usize),
+            input: &mut [StereoBuf; 1],
+            output: &mut [StereoBuf; 1],
+            pcm: &mut [f32],
+        ) {
+            let (rate, block) = format;
+            let first = processor.cursor as usize;
+            for i in 0..block {
+                let value = signal(first + i, rate);
+                input[0].l[i] = value[0];
+                input[0].r[i] = value[1];
+            }
+            processor.process(block, input, output);
+            sink.process(block, output, &mut []);
+            pcm.fill(0.0);
+            device_delay.mix_device(output.first(), pcm, 2);
+        }
+        for (rate, block) in [
+            (48_000.0, 64),
+            (48_000.0, 256),
+            (48_000.0, 512),
+            (96_000.0, 256),
+        ] {
+            let (map, core) = fixture();
+            core.algorithm_latency.store(192, Ordering::Release);
+            let mut processor = RemoteProcessor::new(core.clone());
+            let mut sink = Output::new(0.0, Arc::default());
+            let mut device_delay = AudioDelay::new(0).unwrap();
+            let mut input = [StereoBuf::new()];
+            let mut output = [StereoBuf::new()];
+            let mut pcm = vec![0.0; block * 2];
+            for _ in 0..(HISTORY / block) {
+                render_final(
+                    &mut processor,
+                    &mut sink,
+                    &mut device_delay,
+                    (rate, block),
+                    &mut input,
+                    &mut output,
+                    &mut pcm,
+                );
+                echo(&map);
+            }
+            for latency in [230, 208, 96, 0, MAX_LATENCY as u32, 111, 131, 0] {
+                // The same worker/plugin remains alive. Missing worker output during its
+                // parked interval uses the warmed algorithm+bridge dry reference.
+                core.ready.store(false, Ordering::Release);
+                core.algorithm_latency.store(latency, Ordering::Release);
+                for _ in 0..(DELAY * 2 / block) {
+                    let first = processor.cursor as usize;
+                    render_final(
+                        &mut processor,
+                        &mut sink,
+                        &mut device_delay,
+                        (rate, block),
+                        &mut input,
+                        &mut output,
+                        &mut pcm,
+                    );
+                    for (i, frame) in pcm.as_chunks::<2>().0.iter().enumerate() {
+                        assert_eq!(
+                            frame,
+                            &signal(first + i - DELAY - latency as usize, rate),
+                            "dry timing: rate={rate} block={block} latency={latency} at={}",
+                            first + i
+                        );
+                    }
+                    echo(&map);
+                }
+                core.ready.store(true, Ordering::Release);
+                for _ in 0..(DELAY * 2 / block) {
+                    render_final(
+                        &mut processor,
+                        &mut sink,
+                        &mut device_delay,
+                        (rate, block),
+                        &mut input,
+                        &mut output,
+                        &mut pcm,
+                    );
+                    assert!(
+                        pcm.iter()
+                            .all(|sample| sample.is_finite() && *sample != 0.0),
+                        "cold bridge after warm activation: rate={rate} block={block} latency={latency}"
+                    );
+                    echo(&map);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generation_and_state_epochs_discard_wet_midi_but_keep_aligned_dry_input() {
+        let (map, core) = fixture();
+        let mut processor = RemoteProcessor::new(core.clone());
+        let mut input = [StereoBuf::new()];
+        let mut output = [StereoBuf::new()];
+        let mut midi = MidiBuf::new();
+        input[0].l[..Q].fill(0.25);
+        input[0].r[..Q].fill(-0.5);
+        for _ in 0..(DELAY * 2 / Q) {
+            processor.process_timed(processor.cursor, Q, &mut input, &mut output, &[], &mut midi);
+            echo(&map);
+        }
+        let cursor = processor.cursor;
+        processor.wet_l[cursor as usize & (HISTORY - 1)] = 99.0;
+        processor.wet_tags[cursor as usize & (HISTORY - 1)] = cursor;
+        processor.future.push(Timed {
+            at: cursor,
+            sequence: 1,
+            index: 0,
+            event: MidiEvent {
+                time: 0,
+                data: [0x90, 60, 127],
+            },
+        });
+        map.invalidate();
+        processor.process_timed(cursor, Q, &mut input, &mut output, &[], &mut midi);
+        assert!(output[0].l[..Q].iter().all(|sample| *sample == 0.25));
+        assert!(
+            midi.events()
+                .iter()
+                .all(|event| event.data[0] & 0xf0 != 0x90)
+        );
+        let path = std::env::temp_dir().join(format!(
+            "np-slot-generation-{}-{}",
+            std::process::id(),
+            cursor
+        ));
+        let replacement = Arc::new(shared::Shared::create(path, map.generation() + 1).unwrap());
+        *core.map.lock().unwrap() = Some(replacement);
+        let cursor = processor.cursor;
+        processor.process_timed(cursor, Q, &mut input, &mut output, &[], &mut midi);
+        assert!(output[0].l[..Q].iter().all(|sample| *sample == 0.25));
+        assert!(
+            midi.events()
+                .iter()
+                .all(|event| event.data[0] & 0xf0 != 0x90)
+        );
     }
     #[test]
     fn bogus_child_midi_count_is_dropped_without_panicking() {

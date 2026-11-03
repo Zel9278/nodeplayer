@@ -14,7 +14,7 @@ use egui_snarl::ui::{PinInfo, SnarlPin, SnarlStyle, SnarlViewer, SnarlWidget};
 use egui_snarl::{InPin, NodeId, OutPin, OutPinId, InPinId, Snarl};
 
 use crate::engine::eq::EqSettings;
-use crate::engine::nodes::{Delay, LimiterParams, MIXER_INPUTS, MidiBridge, PluginProc};
+use crate::engine::nodes::{Delay, LimiterParams, MIXER_INPUTS, PluginProc};
 use crate::engine::{Command, Engine, Garbage, MAX_BLOCK, NodeSlot};
 use crate::audio2midi::Audio2Midi;
 use crate::csynth_node::CSynthNode;
@@ -1237,16 +1237,24 @@ impl App {
         }
     }
 
-    /// Plugin windows are children of the main window, so they must be closed while it still
-    /// exists; then audio stops before the plugins are terminated.
+    /// Stop processing before state serialization and plugin teardown. Child editor windows
+    /// are closed while their main window still exists.
     fn shutdown(&mut self) {
         if std::mem::replace(&mut self.shut_down, true) {
             return;
         }
-        // Save first: plugin state has to be read before the plugins go away.
+        // Dropping the device alone does not prove an in-flight/null callback has left
+        // plugin code. Retire every processor before destroying its instance or module.
+        if self.engine.as_mut().is_some_and(|engine| !engine.shutdown()) {
+            self.retain_audio_owners();
+            self.engine = None;
+            return;
+        }
+        self.engine = None;
+        // Plugin instances still exist, and their processors can no longer race state
+        // serialization or editor teardown. A failed handshake never enters plugin UI.
         self.save_session();
         self.keep_selection(true);
-        self.extensions = Extensions::default();
         while self.leave_group() {}
         for node in every_node(&mut self.snarl, &mut self.outer) {
             if let NodeKind::Plugin(p) = &mut node.kind {
@@ -1254,12 +1262,23 @@ impl App {
                 p.editor = None;
             }
         }
-        self.engine = None;
+        self.extensions = Extensions::default();
         for (_, p) in self.pending_teardown.drain() {
             let _g = guard::enter(&p.tag.clone());
             drop(p);
         }
         drop_nodes(std::mem::take(&mut self.snarl));
+    }
+
+    /// A stuck in-process callback cannot be safely unloaded. Keep its owners until
+    /// process exit; the engine has already detached its backend on handshake failure.
+    fn retain_audio_owners(&mut self) {
+        log::error!("audio shutdown timed out; retaining plugin instances until process exit");
+        std::mem::forget(std::mem::take(&mut self.snarl));
+        std::mem::forget(std::mem::take(&mut self.outer));
+        std::mem::forget(std::mem::take(&mut self.pending_teardown));
+        std::mem::forget(std::mem::take(&mut self.extensions));
+        std::mem::forget(std::mem::take(&mut self.host));
     }
 
     fn remove_node(&mut self, id: NodeId) {
@@ -1352,19 +1371,18 @@ impl App {
                     self.pending_teardown.remove(&eid);
                     self.ids.free(eid);
                 }
-                Garbage::Replaced(eid, slot) => {
-                    // Only retirement of the tagged plugin processor acknowledges a
-                    // restart. An older untagged fallback ACK may arrive while a newer
-                    // restart is pending; it does not prove that plugin has stopped.
-                    let plugin_retired = slot.tag().is_some();
-                    let g = slot.tag().map(|t| guard::enter(&t));
-                    drop(slot);
-                    drop(g);
-                    if plugin_retired && self.restarting.remove(&eid) {
+                Garbage::PluginSuspended(eid, proc) => {
+                    let tag = every_node(&mut self.snarl, &mut self.outer).into_iter()
+                        .find(|node| node.eid == eid).and_then(|node| node.kind.tag());
+                    let _g = tag.as_deref().map(guard::enter_borrowed);
+                    let acknowledged = proc.is_some();
+                    drop(proc);
+                    drop(_g);
+                    if self.restarting.remove(&eid) && acknowledged {
                         self.finish_restart(eid);
                     }
                 }
-                Garbage::Schedule(_) | Garbage::Bypass(_) => {}
+                Garbage::Schedule(_) | Garbage::Bypass(_) | Garbage::PluginInner(_) => {}
             }
         }
     }
@@ -1377,29 +1395,12 @@ impl App {
         if !self.restarting.insert(eid) {
             return;
         }
-        let (ins, outs) = node.kind.engine_ports();
-        let fallback: Box<dyn crate::engine::Processor> = if crate::runtime::get().experimental_pdc
-        {
-            let NodeKind::Plugin(p) = &node.kind else {
-                return;
-            };
-            match crate::engine::nodes::LatencyBypass::new(
-                p.instance.latency(),
-                p.instance.bridge_latency(),
-                p.info().is_instrument(),
-            ) {
-                Ok(proc) => Box::new(proc),
-                Err(error) => {
-                    log::error!("can't prepare restart fallback: {error:#}");
-                    self.restarting.remove(&eid);
-                    return;
-                }
-            }
-        } else {
-            Box::new(MidiBridge::default())
-        };
-        let slot = NodeSlot::new(fallback, ins, outs);
-        e.send(Command::ReplaceNode(eid, slot));
+        if !matches!(node.kind, NodeKind::Plugin(_)) {
+            self.restarting.remove(&eid);
+            return;
+        }
+        // Retain the wrapper, its warm dry path and the existing slot/graph histories.
+        e.send(Command::SuspendPlugin(eid));
     }
 
     fn finish_restart(&mut self, eid: u32) {
@@ -1413,30 +1414,8 @@ impl App {
         let _g = guard::enter(&tag);
         match p.instance.restart(self.sample_rate as f64, MAX_BLOCK) {
             Ok(proc) => {
-                p.timing = (p.instance.latency(), p.instance.bridge_latency());
-                let mut proc = if crate::runtime::get().experimental_pdc {
-                    match PluginProc::with_latency(
-                        proc,
-                        p.instance.latency(),
-                        p.instance.bridge_latency(),
-                        p.info().is_instrument(),
-                    ) {
-                        Ok(proc) => proc,
-                        Err(error) => {
-                            self.log(format!("restart timing rejected: {error:#}"));
-                            return;
-                        }
-                    }
-                } else {
-                    PluginProc::new(proc)
-                };
-                if p.bypass {
-                    crate::engine::Processor::set_param(&mut proc, 0, 1.0);
-                }
-                let kind = &self.snarl[id].kind;
-                let slot = NodeSlot::new(Box::new(proc), kind.audio_inputs(), kind.audio_outputs()).with_tag(Some(tag));
-                if let Some(e) = &mut self.engine {
-                    e.send(Command::ReplaceNode(eid, slot));
+                if let Some(engine) = &mut self.engine {
+                    engine.send(Command::ResumePlugin(eid, proc));
                 }
                 self.drop_stale_wires(id);
                 self.dirty = true;
@@ -1634,11 +1613,16 @@ impl App {
 
         let mut closed = Vec::new();
         let mut restart = Vec::new();
+        let mut ports_changed = Vec::new();
         for node in every_node(&mut self.snarl, &mut self.outer) {
             match &mut node.kind {
                 NodeKind::Plugin(p) => {
                     let _g = guard::enter(&p.tag);
+                    let old_midi_ports = p.instance.midi_ports();
                     p.instance.idle();
+                    if p.instance.midi_ports() != old_midi_ports {
+                        ports_changed.push(node.eid);
+                    }
                     let timing = (p.instance.latency(), p.instance.bridge_latency());
                     if crate::runtime::get().experimental_pdc && timing != p.timing {
                         match crate::engine::nodes::LatencyBypass::new(
@@ -1680,6 +1664,11 @@ impl App {
         }
         for eid in restart {
             self.begin_restart(eid);
+        }
+        // Metadata can change graph pins without changing the fixed stereo audio slot.
+        // Recompile its routing while preserving the live processor and bridge history.
+        for eid in ports_changed {
+            self.at_eid(eid, |app, id| app.drop_stale_wires(id));
         }
     }
 
@@ -2577,6 +2566,17 @@ impl App {
                     });
                 });
         }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // on_exit is not guaranteed on every framework error/unwind path. Do not save
+        // state or invoke UI callbacks here; only establish the plugin lifetime barrier.
+        if self.engine.as_mut().is_some_and(|engine| !engine.shutdown()) {
+            self.retain_audio_owners();
+        }
+        self.engine = None;
     }
 }
 

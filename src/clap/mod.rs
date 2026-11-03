@@ -1012,6 +1012,7 @@ impl Buses {
 
 pub struct ClapProcessor {
     plugin: *const clap_plugin,
+    params: *const clap_plugin_params,
     started: bool,
     from_ui: rtrb::Consumer<ParamChange>,
     in_events: Box<InEvents>,
@@ -1039,6 +1040,11 @@ impl ClapProcessor {
     ) -> Self {
         Self {
             plugin,
+            params: unsafe {
+                (*plugin).get_extension.map_or(std::ptr::null(), |get| {
+                    get(plugin, CLAP_EXT_PARAMS.as_ptr()).cast()
+                })
+            },
             started: false,
             from_ui,
             in_events: InEvents::new(),
@@ -1174,6 +1180,23 @@ impl Processor for ClapProcessor {
     ) {
         self.steady_time = first_sample.min(i64::MAX as u64) as i64;
         self.process_midi(n, inputs, outputs, midi_in, midi_out);
+    }
+
+    fn flush_params(&mut self) {
+        AUDIO_THREAD.with(|thread| thread.set(true));
+        self.in_events.events.clear();
+        while let Ok(change) = self.from_ui.pop() {
+            if self.in_events.events.len() < QUEUE_LEN {
+                self.in_events.events.push(AnyEvent { param: param_event(change.id, change.value) });
+            }
+        }
+        if !self.in_events.events.is_empty()
+            && let Some(flush) = unsafe { self.params.as_ref() }.and_then(|params| params.flush)
+        {
+            // CLAP permits active params.flush on the audio thread outside process.
+            // This updates controls without advancing the plugin's audio/steady clock.
+            unsafe { flush(self.plugin, &self.in_events.list, &self.out_events.list) };
+        }
     }
 
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
@@ -1333,6 +1356,63 @@ mod tests {
         }
         proc.deactivate();
         assert_eq!(capture.stops, 1);
+    }
+
+    #[test]
+    fn parameter_flush_keeps_the_audio_clock_and_returns_plugin_edits() {
+        #[derive(Default)]
+        struct Capture {
+            flushes: usize,
+            audio_thread: bool,
+            values: Vec<(u32, f64)>,
+        }
+        unsafe extern "C" fn flush(
+            plugin: *const clap_plugin,
+            input: *const clap_input_events,
+            output: *const clap_output_events,
+        ) {
+            unsafe {
+                let capture = &mut *((*plugin).plugin_data as *mut Capture);
+                capture.flushes += 1;
+                capture.audio_thread = AUDIO_THREAD.with(Cell::get);
+                for index in 0..(*input).size.unwrap()(input) {
+                    let event = &*((*input).get.unwrap()(input, index) as *const clap_event_param_value);
+                    capture.values.push((event.param_id, event.value));
+                }
+                let reported = param_event(19, 0.75);
+                (*output).try_push.unwrap()(output, &reported.header);
+            }
+        }
+        let mut capture = Capture::default();
+        let mut plugin: clap_plugin = unsafe { std::mem::zeroed() };
+        plugin.plugin_data = (&mut capture as *mut Capture).cast();
+        let extension = clap_plugin_params {
+            count: None,
+            get_info: None,
+            get_value: None,
+            value_to_text: None,
+            text_to_value: None,
+            flush: Some(flush),
+        };
+        let (mut to_audio, from_ui) = rtrb::RingBuffer::new(4);
+        let (to_ui, mut from_audio) = rtrb::RingBuffer::new(4);
+        let mut proc = ClapProcessor::new(&plugin, from_ui, to_ui, &[2], &[2], None, 64);
+        proc.params = &extension;
+        proc.steady_time = 1234;
+        let was_audio = AUDIO_THREAD.with(Cell::get);
+        to_audio.push(ParamChange { id: 7, value: 0.25 }).ok().unwrap();
+        to_audio.push(ParamChange { id: 8, value: 0.5 }).ok().unwrap();
+        proc.flush_params();
+        proc.flush_params();
+        AUDIO_THREAD.with(|thread| thread.set(was_audio));
+        assert_eq!(proc.steady_time, 1234);
+        assert!(!proc.started, "flushing never calls start_processing or process");
+        assert_eq!(capture.flushes, 1, "pending edits are consumed exactly once");
+        assert!(capture.audio_thread);
+        assert_eq!(capture.values, vec![(7, 0.25), (8, 0.5)]);
+        let reported = from_audio.pop().unwrap();
+        assert_eq!((reported.id, reported.value), (19, 0.75));
+        assert!(from_audio.pop().is_err());
     }
 
     #[cfg(not(target_os = "macos"))]

@@ -2,53 +2,196 @@
 //! transfer use bounded storage without locks or allocation.
 
 use anyhow::{Result, ensure};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::timing::{EdgeKey, EdgeKind, TimingAnalysis, TimingLimits};
 use super::{MidiBuf, MidiEvent, StereoBuf};
 
+pub(super) struct StorageReservation<'a> {
+    budget: &'a AtomicUsize,
+    bytes: usize,
+}
+
+impl<'a> StorageReservation<'a> {
+    pub(super) fn reserve_in(budget: &'a AtomicUsize, limit: usize, bytes: usize) -> Result<Self> {
+        budget.try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(bytes).filter(|&next| next <= limit)
+        }).map_err(|_| anyhow::anyhow!("prepared plugin bypass memory budget exceeded ({bytes} bytes requested, {limit} byte limit)"))?;
+        Ok(Self { budget, bytes })
+    }
+}
+
+impl Drop for StorageReservation<'_> {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+const AUDIO_PAGE_FRAMES: usize = 1024;
+
+struct AudioPage {
+    frames: [[f32; 2]; AUDIO_PAGE_FRAMES],
+    // Each allocation keeps its own budget token while moving between delay rings.
+    _reservation: Option<StorageReservation<'static>>,
+}
+
 pub struct AudioDelay {
-    frames: Vec<[f32; 2]>,
-    cursor: usize,
-    invalid_frames: usize,
+    delay: usize,
+    pages: Vec<Box<AudioPage>>,
+    cursor: u64,
+    valid: usize,
 }
 
 impl AudioDelay {
-    pub fn new(frames: u64) -> Result<Self> {
+    // Storage capacity, never additional signal delay. Zero-delay routes also retain real
+    // input, so ordinary latency increases can select an already warm history tap.
+    pub const HISTORY_RESERVE: usize = 8192;
+
+    pub fn allocation_frames(frames: u64) -> Result<usize> {
         ensure!(
             frames <= TimingLimits::default().max_latency_frames,
             "audio delay exceeds frame limit"
         );
+        Ok(usize::try_from(frames)?
+            .max(Self::HISTORY_RESERVE)
+            .next_power_of_two())
+    }
+
+    pub fn allocation_bytes(frames: u64) -> Result<usize> {
+        Ok(Self::allocation_frames(frames)? / AUDIO_PAGE_FRAMES
+            * (size_of::<AudioPage>() + size_of::<Box<AudioPage>>()))
+    }
+
+    pub fn new(frames: u64) -> Result<Self> {
+        Self::prepare(frames, frames, None)
+    }
+
+    pub(super) fn with_budget(
+        frames: u64,
+        capacity: u64,
+        budget: &'static AtomicUsize,
+        limit: usize,
+    ) -> Result<Self> {
+        let reservation =
+            StorageReservation::reserve_in(budget, limit, Self::allocation_bytes(capacity)?)?;
+        Self::prepare(frames, capacity, Some(reservation))
+    }
+
+    fn prepare(
+        frames: u64,
+        capacity: u64,
+        mut reservation: Option<StorageReservation<'static>>,
+    ) -> Result<Self> {
+        ensure!(
+            frames <= capacity,
+            "audio delay exceeds prepared history capacity"
+        );
+        let count = Self::allocation_frames(capacity)? / AUDIO_PAGE_FRAMES;
+        let mut pages = Vec::with_capacity(count);
+        for _ in 0..count {
+            let token = reservation.as_mut().map(|total| {
+                let bytes = size_of::<AudioPage>() + size_of::<Box<AudioPage>>();
+                total.bytes -= bytes;
+                StorageReservation {
+                    budget: total.budget,
+                    bytes,
+                }
+            });
+            pages.push(Box::new(AudioPage {
+                frames: [[0.0; 2]; AUDIO_PAGE_FRAMES],
+                _reservation: token,
+            }));
+        }
         Ok(Self {
-            frames: vec![[0.0; 2]; usize::try_from(frames)?],
+            delay: usize::try_from(frames)?,
+            pages,
             cursor: 0,
-            invalid_frames: 0,
+            valid: 0,
         })
     }
 
+    #[cfg(test)]
     pub fn frames(&self) -> usize {
-        self.frames.len()
+        self.delay
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.pages.len() * (size_of::<AudioPage>() + size_of::<Box<AudioPage>>())
+    }
+
+    fn capacity(&self) -> usize {
+        self.pages.len() * AUDIO_PAGE_FRAMES
     }
 
     /// Invalidate without zeroing a potentially long allocation on the audio thread.
     pub fn invalidate(&mut self) {
-        self.invalid_frames = self.frames.len();
+        self.valid = 0;
+    }
+
+    /// Move prepared pages, never copy an arbitrary-length audio history. Ordinary edits
+    /// reuse the entire ring in O(1). Capacity growth swaps at most 4096 page pointers (the
+    /// explicit latency limit) and copies at most one fixed 1024-frame boundary page. All
+    /// unused allocations stay in `previous` for control-thread retirement.
+    pub fn inherit(&mut self, previous: &mut Self) {
+        let retained = previous.valid.min(self.capacity());
+        if previous.capacity() == self.capacity() {
+            std::mem::swap(&mut self.pages, &mut previous.pages);
+        } else if retained != 0 {
+            let first_sample = previous.cursor - retained as u64;
+            let mut first_page = first_sample / AUDIO_PAGE_FRAMES as u64;
+            let last_page = (previous.cursor - 1) / AUDIO_PAGE_FRAMES as u64;
+            let old_mask = previous.pages.len() - 1;
+            let new_mask = self.pages.len() - 1;
+            // A full circular ring's first and last partial pages share one allocation.
+            // Growth splits the old boundary, while shrink joins the new one. All other
+            // pages move by pointer swap. The owned capacity stays exactly as prepared.
+            let split = first_page != last_page
+                && first_page as usize & old_mask == last_page as usize & old_mask;
+            let join = first_page != last_page
+                && first_page as usize & new_mask == last_page as usize & new_mask;
+            let boundary = (
+                first_page as usize & old_mask,
+                first_sample as usize & (AUDIO_PAGE_FRAMES - 1),
+            );
+            if split {
+                let offset = first_sample as usize & (AUDIO_PAGE_FRAMES - 1);
+                self.pages[first_page as usize & new_mask].frames[offset..].copy_from_slice(
+                    &previous.pages[first_page as usize & old_mask].frames[offset..],
+                );
+            }
+            if split || join {
+                first_page += 1;
+            }
+            for page in first_page..=last_page {
+                std::mem::swap(
+                    &mut self.pages[page as usize & new_mask],
+                    &mut previous.pages[page as usize & old_mask],
+                );
+            }
+            if join {
+                self.pages[last_page as usize & new_mask].frames[boundary.1..]
+                    .copy_from_slice(&previous.pages[boundary.0].frames[boundary.1..]);
+            }
+        }
+        self.cursor = previous.cursor;
+        self.valid = retained;
+        previous.valid = 0;
     }
 
     fn next(&mut self, sample: [f32; 2]) -> [f32; 2] {
-        if self.frames.is_empty() {
-            return sample;
-        }
-        let old = std::mem::replace(&mut self.frames[self.cursor], sample);
-        let delayed = if self.invalid_frames > 0 {
-            self.invalid_frames -= 1;
-            [0.0; 2]
+        let mask = self.capacity() - 1;
+        let read = self.cursor.wrapping_sub(self.delay as u64) as usize & mask;
+        let delayed = if self.delay == 0 {
+            sample
+        } else if self.delay <= self.valid {
+            self.pages[read / AUDIO_PAGE_FRAMES].frames[read & (AUDIO_PAGE_FRAMES - 1)]
         } else {
-            old
+            [0.0; 2]
         };
-        self.cursor += 1;
-        if self.cursor == self.frames.len() {
-            self.cursor = 0;
-        }
+        let write = self.cursor as usize & mask;
+        self.pages[write / AUDIO_PAGE_FRAMES].frames[write & (AUDIO_PAGE_FRAMES - 1)] = sample;
+        self.cursor = self.cursor.wrapping_add(1);
+        self.valid = (self.valid + 1).min(self.capacity());
         delayed
     }
 
@@ -87,6 +230,7 @@ pub struct TimedMidi {
 
 pub struct MidiDelay {
     delay: u64,
+    cursor: u64,
     future: Vec<TimedMidi>,
     capacity: usize,
     cleanup: bool,
@@ -108,6 +252,7 @@ impl MidiDelay {
         );
         Ok(Self {
             delay,
+            cursor: 0,
             future: Vec::with_capacity(capacity),
             capacity,
             cleanup: false,
@@ -116,13 +261,37 @@ impl MidiDelay {
         })
     }
 
-    pub fn frames(&self) -> u64 {
-        self.delay
-    }
-
     pub fn invalidate(&mut self) {
         self.future.clear();
         self.cleanup = true;
+    }
+
+    /// Keep pending events on the new timing reference without allocating. If shortening
+    /// the delay would move an event into already rendered time, cleanup replaces that
+    /// stale queue; note-offs must never silently disappear or replay late.
+    pub fn inherit(&mut self, previous: &mut Self) {
+        self.cursor = previous.cursor;
+        self.live_notes = previous.live_notes;
+        self.cleanup = previous.cleanup;
+        self.overflow_count = previous.overflow_count;
+        if self.capacity != previous.capacity {
+            self.cleanup = true;
+            return;
+        }
+        std::mem::swap(&mut self.future, &mut previous.future);
+        for event in &mut self.future {
+            match event
+                .sample
+                .checked_sub(previous.delay)
+                .and_then(|sample| sample.checked_add(self.delay))
+            {
+                Some(sample) if sample >= self.cursor => event.sample = sample,
+                _ => self.cleanup = true,
+            }
+        }
+        if self.cleanup {
+            self.future.clear();
+        }
     }
 
     fn overflow(&mut self) {
@@ -161,6 +330,24 @@ impl MidiDelay {
         complete
     }
 
+    fn deliver_due(&mut self, output: &mut MidiBuf, first_sample: u64, end: u64) {
+        let due = self.future.partition_point(|event| event.sample < end);
+        for i in 0..due {
+            let event = self.future[i];
+            if event.sample < first_sample
+                || !output.push_sorted(MidiEvent {
+                    time: (event.sample - first_sample) as u32,
+                    data: event.data,
+                })
+            {
+                self.overflow();
+            } else {
+                self.track(event.data);
+            }
+        }
+        self.future.drain(..due);
+    }
+
     /// Absolute timestamps survive arbitrary callback partitioning. Out-of-block events are
     /// retained, not clamped to this block's last sample. Equal-time arrival order is stable.
     pub fn process(
@@ -174,6 +361,7 @@ impl MidiDelay {
             self.overflow();
             return;
         };
+        self.cursor = end;
         if self.cleanup && n > 0 {
             // Losing note-off or sustain is unsafe: discard stale events and send bounded
             // channel-wide sustain-off, all-notes-off, all-sound-off before accepting notes.
@@ -187,6 +375,7 @@ impl MidiDelay {
             }
         }
         if self.delay == 0 {
+            self.deliver_due(output, first_sample, end);
             for event in input {
                 if output.push_sorted(*event) {
                     self.track(event.data);
@@ -217,22 +406,7 @@ impl MidiDelay {
                 },
             );
         }
-        let due = self.future.partition_point(|event| event.sample < end);
-        for i in 0..due {
-            let event = self.future[i];
-            // Past events may arise only at a discontinuity: discard, never replay late.
-            if event.sample < first_sample
-                || !output.push_sorted(MidiEvent {
-                    time: (event.sample - first_sample) as u32,
-                    data: event.data,
-                })
-            {
-                self.overflow();
-            } else {
-                self.track(event.data);
-            }
-        }
-        self.future.drain(..due);
+        self.deliver_due(output, first_sample, end);
     }
 }
 
@@ -286,13 +460,46 @@ impl TimingPlan {
         let epoch = EPOCH
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| anyhow::anyhow!("plan epoch exhausted"))?;
+        // Timing analysis charges the requested signal delay. Charge the continuously
+        // warmed reserve as well, before any route allocation takes place.
+        let mut allocated_delay_bytes = analysis.delay_bytes;
+        for delay in analysis
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                matches!(edge.key.kind, EdgeKind::Audio { .. }).then_some(edge.delay_frames)
+            })
+            .chain(analysis.sinks.iter().map(|&(_, delay)| delay))
+        {
+            let reserve = AudioDelay::allocation_bytes(delay)?
+                - usize::try_from(delay)? * size_of::<[f32; 2]>();
+            allocated_delay_bytes = allocated_delay_bytes
+                .checked_add(reserve)
+                .ok_or_else(|| anyhow::anyhow!("audio history allocation size overflow"))?;
+        }
+        for _ in analysis
+            .midi_outputs
+            .iter()
+            .filter(|(_, delay)| *delay == 0)
+        {
+            allocated_delay_bytes = allocated_delay_bytes
+                .checked_add(limits.midi_capacity * size_of::<TimedMidi>())
+                .ok_or_else(|| anyhow::anyhow!("MIDI history allocation size overflow"))?;
+        }
+        ensure!(
+            allocated_delay_bytes <= limits.max_delay_bytes,
+            "PDC delay memory budget exceeded ({} > {} bytes)",
+            allocated_delay_bytes,
+            limits.max_delay_bytes
+        );
         let mut edges = Vec::with_capacity(analysis.edges.len());
         for edge in &analysis.edges {
             let delay = match edge.key.kind {
                 EdgeKind::Audio { .. } => EdgeDelay::Audio(AudioDelay::new(edge.delay_frames)?),
-                EdgeKind::Midi => {
-                    EdgeDelay::Midi(Box::new(MidiDelay::new(edge.delay_frames, limits.midi_capacity)?))
-                }
+                EdgeKind::Midi => EdgeDelay::Midi(Box::new(MidiDelay::new(
+                    edge.delay_frames,
+                    limits.midi_capacity,
+                )?)),
             };
             edges.push(PreparedEdge {
                 key: edge.key,
@@ -323,8 +530,13 @@ impl TimingPlan {
         let midi_outputs = analysis
             .midi_outputs
             .iter()
-            .filter(|(_, delay)| *delay > 0)
-            .map(|&(node, delay)| Ok((node, MidiDelay::new(delay, limits.midi_capacity)?, MidiBuf::new())))
+            .map(|&(node, delay)| {
+                Ok((
+                    node,
+                    MidiDelay::new(delay, limits.midi_capacity)?,
+                    MidiBuf::new(),
+                ))
+            })
             .collect::<Result<_>>()?;
         let sinks = analysis
             .sinks
@@ -340,7 +552,7 @@ impl TimingPlan {
         Ok(Self {
             epoch,
             total_latency_frames: analysis.total_latency_frames,
-            allocated_delay_bytes: analysis.delay_bytes,
+            allocated_delay_bytes,
             edges,
             sinks,
             midi_outputs,
@@ -363,7 +575,7 @@ impl TimingPlan {
                 continue;
             };
             let reusable = old.reusable && self.edges.binary_search_by_key(&old.key, |edge| edge.key).ok().is_some_and(|index| {
-                matches!(&self.edges[index].delay, EdgeDelay::Midi(new) if new.frames() == old_delay.frames() && new.capacity == old_delay.capacity)
+                matches!(&self.edges[index].delay, EdgeDelay::Midi(new) if new.capacity == old_delay.capacity)
             });
             if !reusable
                 && let Some(step) = self.steps.iter_mut().find(|step| step.node == old.key.to)
@@ -378,27 +590,62 @@ impl TimingPlan {
                     continue;
                 }
                 match (&mut edge.delay, &mut old.delay) {
-                    (EdgeDelay::Audio(new), EdgeDelay::Audio(old))
-                        if new.frames() == old.frames() =>
-                    {
-                        std::mem::swap(new, old)
-                    }
-                    (EdgeDelay::Midi(new), EdgeDelay::Midi(old))
-                        if new.frames() == old.frames() && new.capacity == old.capacity =>
-                    {
-                        std::mem::swap(new, old)
+                    (EdgeDelay::Audio(new), EdgeDelay::Audio(old)) => new.inherit(old),
+                    (EdgeDelay::Midi(new), EdgeDelay::Midi(old)) => {
+                        new.inherit(old);
+                        if new.cleanup
+                            && let Some(step) =
+                                self.steps.iter_mut().find(|step| step.node == edge.key.to)
+                        {
+                            // Route timing can discard a queued note-off. The destination
+                            // receives the same bounded panic as a retired route before
+                            // any other route supplies first-sample notes.
+                            step.midi_cleanup = true;
+                            new.cleanup = false;
+                            new.live_notes = [0; 16];
+                        }
                     }
                     _ => {}
                 }
             }
         }
         for sink in &mut self.sinks {
-            if let Some(old) = previous.sinks.iter_mut().find(|old| {
-                old.node == sink.node && old.reusable && old.delay.frames() == sink.delay.frames()
-            }) {
-                std::mem::swap(&mut sink.delay, &mut old.delay);
+            if let Some(old) = previous
+                .sinks
+                .iter_mut()
+                .find(|old| old.node == sink.node && old.reusable)
+            {
+                sink.delay.inherit(&mut old.delay);
             }
         }
+        for (node, delay, _) in &mut self.midi_outputs {
+            if let Some((_, old, _)) = previous
+                .midi_outputs
+                .iter_mut()
+                .find(|(old_node, _, _)| old_node == node)
+            {
+                delay.inherit(old);
+            }
+        }
+        // Report full prepared page storage, including the warm reserve and metadata.
+        self.allocated_delay_bytes = self
+            .edges
+            .iter()
+            .map(|edge| match &edge.delay {
+                EdgeDelay::Audio(delay) => delay.allocated_bytes(),
+                EdgeDelay::Midi(delay) => delay.capacity * size_of::<TimedMidi>(),
+            })
+            .sum::<usize>()
+            + self
+                .sinks
+                .iter()
+                .map(|sink| sink.delay.allocated_bytes())
+                .sum::<usize>()
+            + self
+                .midi_outputs
+                .iter()
+                .map(|(_, delay, _)| delay.capacity * size_of::<TimedMidi>())
+                .sum::<usize>();
     }
 
     /// A recycled slot must never inherit the previous instance's buffered events/audio.
@@ -416,6 +663,11 @@ impl TimingPlan {
             if sink.node == node {
                 sink.reusable = false;
                 sink.delay.invalidate();
+            }
+        }
+        for (output, delay, _) in &mut self.midi_outputs {
+            if *output == node {
+                delay.invalidate();
             }
         }
     }
@@ -467,6 +719,256 @@ mod tests {
         d.write(None, &mut out, 4);
         assert_eq!(&out.l[..4], &[0.0, 1.0, 0.0, 0.0]);
     }
+
+    #[test]
+    fn latency_edits_preserve_exact_audio_history_across_callback_sizes() {
+        for block in [64, 256, 512] {
+            let mut delay = AudioDelay::new(0).unwrap();
+            let mut cursor = 0;
+            let mut source = StereoBuf::new();
+            let mut output = StereoBuf::new();
+            for latency in [0, 192, 230, 208, 96, 0, 111, 131, 4096, 4352, 0] {
+                let mut next = AudioDelay::new(latency).unwrap();
+                next.inherit(&mut delay);
+                delay = next;
+                for _ in 0..(2 * AudioDelay::HISTORY_RESERVE / block) {
+                    for i in 0..block {
+                        source.l[i] = (cursor + i + 1) as f32;
+                        source.r[i] = -(cursor as f32 + i as f32 + 1.0);
+                    }
+                    delay.write(Some(&source), &mut output, block);
+                    for i in 0..block {
+                        if cursor + i >= latency as usize {
+                            let expected = (cursor + i - latency as usize + 1) as f32;
+                            assert_eq!(
+                                [output.l[i], output.r[i]],
+                                [expected, -expected],
+                                "block={block} latency={latency} at={}",
+                                cursor + i
+                            );
+                        }
+                    }
+                    cursor += block;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_capacity_growth_keeps_all_available_history() {
+        let mut delay = AudioDelay::new(0).unwrap();
+        let mut cursor = 0;
+        for _ in 0..AudioDelay::HISTORY_RESERVE * 2 {
+            delay.next([cursor as f32 + 1.0; 2]);
+            cursor += 1;
+        }
+        for (latency, count) in [(9000, 17), (10_000, 19), (9500, 12_000), (128, 12_000)] {
+            let retained = delay.valid;
+            let mut next = AudioDelay::new(latency as u64).unwrap();
+            next.inherit(&mut delay);
+            delay = next;
+            for elapsed in 0..count {
+                let got = delay.next([cursor as f32 + 1.0; 2]);
+                let expected = if elapsed + retained >= latency {
+                    (cursor + 1 - latency) as f32
+                } else {
+                    // The previous ring never held this older input. Its absence must not
+                    // be disguised as generated audio or a shifted/replayed sample.
+                    0.0
+                };
+                assert_eq!(got, [expected; 2], "latency={latency} at={cursor}");
+                cursor += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn midi_retiming_keeps_order_and_cleans_notes_when_events_would_be_late() {
+        let mut previous = MidiDelay::new(10, 16).unwrap();
+        let mut output = MidiBuf::new();
+        previous.process(
+            &[
+                MidiEvent {
+                    time: 0,
+                    data: [0x90, 60, 1],
+                },
+                MidiEvent {
+                    time: 15,
+                    data: [0x80, 60, 0],
+                },
+                MidiEvent {
+                    time: 15,
+                    data: [0x90, 61, 1],
+                },
+            ],
+            &mut output,
+            0,
+            8,
+        );
+        let mut next = MidiDelay::new(20, 16).unwrap();
+        next.inherit(&mut previous);
+        next.process(&[], &mut output, 8, 32);
+        assert_eq!(
+            output.events(),
+            &[
+                MidiEvent {
+                    time: 12,
+                    data: [0x90, 60, 1]
+                },
+                MidiEvent {
+                    time: 27,
+                    data: [0x80, 60, 0]
+                },
+                MidiEvent {
+                    time: 27,
+                    data: [0x90, 61, 1]
+                },
+            ]
+        );
+        output.clear();
+        next.process(
+            &[MidiEvent {
+                time: 0,
+                data: [0x80, 61, 0],
+            }],
+            &mut output,
+            40,
+            1,
+        );
+        let mut shorter = MidiDelay::new(0, 16).unwrap();
+        shorter.inherit(&mut next);
+        shorter.process(
+            &[MidiEvent {
+                time: 0,
+                data: [0x90, 62, 1],
+            }],
+            &mut output,
+            41,
+            1,
+        );
+        assert_eq!(
+            output.events(),
+            &[
+                MidiEvent {
+                    time: 0,
+                    data: [0xb0, 64, 0]
+                },
+                MidiEvent {
+                    time: 0,
+                    data: [0xb0, 123, 0]
+                },
+                MidiEvent {
+                    time: 0,
+                    data: [0xb0, 120, 0]
+                },
+                MidiEvent {
+                    time: 0,
+                    data: [0x90, 62, 1]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_charges_warm_history_before_allocating_zero_delay_routes() {
+        let analysis = TimingAnalysis {
+            sinks: vec![(0, 0)],
+            ..TimingAnalysis::default()
+        };
+        let limits = TimingLimits {
+            max_delay_bytes: AudioDelay::allocation_bytes(0).unwrap() - 1,
+            ..TimingLimits::default()
+        };
+        assert!(TimingPlan::prepare(&analysis, limits, &[]).is_err());
+        let plan = TimingPlan::prepare(&analysis, TimingLimits::default(), &[]).unwrap();
+        assert_eq!(
+            plan.allocated_delay_bytes,
+            AudioDelay::allocation_bytes(0).unwrap()
+        );
+    }
+
+    #[test]
+    fn hardware_midi_delay_to_zero_keeps_cleanup_through_queued_plans() {
+        let limits = TimingLimits {
+            midi_capacity: 16,
+            ..TimingLimits::default()
+        };
+        let prepare = |delay| {
+            TimingPlan::prepare(
+                &TimingAnalysis {
+                    midi_outputs: vec![(1, delay)],
+                    delay_bytes: if delay == 0 {
+                        0
+                    } else {
+                        limits.midi_capacity * size_of::<TimedMidi>()
+                    },
+                    ..TimingAnalysis::default()
+                },
+                limits,
+                &[],
+            )
+            .unwrap()
+        };
+        let mut previous = prepare(128);
+        let (_, delay, out) = &mut previous.midi_outputs[0];
+        delay.process(
+            &[
+                MidiEvent {
+                    time: 0,
+                    data: [0x90, 60, 1],
+                },
+                MidiEvent {
+                    time: 100,
+                    data: [0x80, 60, 0],
+                },
+            ],
+            out,
+            0,
+            200,
+        );
+        assert_eq!(
+            out.events(),
+            &[MidiEvent {
+                time: 128,
+                data: [0x90, 60, 1]
+            }]
+        );
+        let mut next = prepare(0);
+        next.inherit(&mut previous);
+        let mut final_plan = prepare(0);
+        final_plan.inherit(&mut next);
+        let (_, delay, out) = &mut final_plan.midi_outputs[0];
+        delay.process(
+            &[MidiEvent {
+                time: 0,
+                data: [0x90, 61, 1],
+            }],
+            out,
+            200,
+            1,
+        );
+        assert_eq!(
+            out.events(),
+            &[
+                MidiEvent {
+                    time: 0,
+                    data: [0xb0, 64, 0]
+                },
+                MidiEvent {
+                    time: 0,
+                    data: [0xb0, 123, 0]
+                },
+                MidiEvent {
+                    time: 0,
+                    data: [0xb0, 120, 0]
+                },
+                MidiEvent {
+                    time: 0,
+                    data: [0x90, 61, 1]
+                },
+            ]
+        );
+    }
     #[test]
     fn midi_q_minus_q_q_plus_and_equal_order() {
         let mut d = MidiDelay::new(256, 16).unwrap();
@@ -495,7 +997,16 @@ mod tests {
     fn zero_delay_midi_passthrough_is_ordered_and_tracks_notes() {
         let mut d = MidiDelay::new(0, 2).unwrap();
         let mut out = MidiBuf::new();
-        let events = [MidiEvent { time: 1, data: [0x90, 60, 1] }, MidiEvent { time: 3, data: [0x90, 61, 1] }];
+        let events = [
+            MidiEvent {
+                time: 1,
+                data: [0x90, 60, 1],
+            },
+            MidiEvent {
+                time: 3,
+                data: [0x90, 61, 1],
+            },
+        ];
         d.process(&events, &mut out, 0, 8);
         assert_eq!(out.events(), &events);
         assert!(d.future.is_empty());

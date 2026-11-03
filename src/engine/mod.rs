@@ -10,6 +10,7 @@ pub mod nodes;
 pub mod timing;
 
 use compensation::EdgeDelay;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -221,6 +222,16 @@ pub trait Processor: Send {
 
     fn set_param(&mut self, _index: usize, _value: f32) {}
 
+    /// Apply pending parameter edits on the processing thread without synthesizing an
+    /// audio block or advancing either timeline. Used before state save/restart quiescence.
+    fn flush_params(&mut self) {}
+
+    /// Suspend/resume a hosted inner processor while retaining the wrapper's warm
+    /// compensation history. Unsupported processors return the supplied ownership.
+    fn replace_plugin_inner(&mut self, replacement: Option<Box<dyn Processor>>) -> Option<Box<dyn Processor>> {
+        replacement
+    }
+
     /// Replace preallocated dry-path timing without restarting the plugin. Always return
     /// ownership of an allocation for control-thread retirement, even when unsupported.
     fn replace_latency_bypass(
@@ -310,20 +321,21 @@ struct EngineStatus {
 
 pub enum Command {
     AddNode(u32, Box<NodeSlot>),
-    /// Swaps the processor of a live node; the old one comes back as [`Garbage::Replaced`].
-    ReplaceNode(u32, Box<NodeSlot>),
     RemoveNode(u32),
     SetSchedule(Box<Schedule>),
     SetParam(u32, usize, f32),
     ConfigureBypass(u32, Box<nodes::LatencyBypass>),
+    SuspendPlugin(u32),
+    ResumePlugin(u32, Box<dyn Processor>),
 }
 
 /// Objects handed back to the UI thread to be freed there.
 pub enum Garbage {
     Node(u32, Box<NodeSlot>),
-    Replaced(u32, Box<NodeSlot>),
     Schedule(#[allow(dead_code)] Box<Schedule>),
     Bypass(#[allow(dead_code)] Box<nodes::LatencyBypass>),
+    PluginSuspended(u32, Option<Box<dyn Processor>>),
+    PluginInner(#[allow(dead_code)] Box<dyn Processor>),
 }
 
 struct AudioState {
@@ -340,7 +352,10 @@ impl AudioState {
     /// to the control thread rather than freeing processors in the audio callback.
     fn deactivate_all(&mut self) {
         for slot in self.slots.iter_mut().flatten() {
-            let _g = slot.tag.as_deref().map(crate::plugins::guard::enter_borrowed);
+            let _g = slot
+                .tag
+                .as_deref()
+                .map(crate::plugins::guard::enter_borrowed);
             slot.proc.deactivate();
         }
     }
@@ -353,7 +368,10 @@ impl AudioState {
         }
         for slot in &mut self.slots {
             if let Some(slot) = slot.take() {
-                let _g = slot.tag.as_deref().map(crate::plugins::guard::enter_borrowed);
+                let _g = slot
+                    .tag
+                    .as_deref()
+                    .map(crate::plugins::guard::enter_borrowed);
                 drop(slot);
             }
         }
@@ -379,19 +397,10 @@ impl AudioState {
                     if let Some(plan) = &mut self.schedule.timing {
                         plan.invalidate_node(id);
                     }
-                    if let Some(old) = self.slots[id as usize].replace(slot) {
-                        self.throw_away(Garbage::Node(id, old));
-                    }
-                }
-                Command::ReplaceNode(id, slot) => {
-                    if let Some(plan) = &mut self.schedule.timing {
-                        plan.invalidate_node(id);
-                    }
                     if let Some(mut old) = self.slots[id as usize].replace(slot) {
-                        let g = old.enter();
+                        let _g = old.enter();
                         old.proc.deactivate();
-                        drop(g);
-                        self.throw_away(Garbage::Replaced(id, old));
+                        self.throw_away(Garbage::Node(id, old));
                     }
                 }
                 Command::RemoveNode(id) => {
@@ -425,6 +434,28 @@ impl AudioState {
                         None => bypass,
                     };
                     self.throw_away(Garbage::Bypass(retired));
+                }
+                Command::SuspendPlugin(id) => {
+                    let old = if let Some(slot) = &mut self.slots[id as usize] {
+                        let _g = slot.tag.as_deref().map(crate::plugins::guard::enter_borrowed);
+                        let mut old = slot.proc.replace_plugin_inner(None);
+                        if let Some(proc) = &mut old {
+                            proc.flush_params();
+                            proc.deactivate();
+                        }
+                        old
+                    } else { None };
+                    self.throw_away(Garbage::PluginSuspended(id, old));
+                }
+                Command::ResumePlugin(id, proc) => {
+                    let retired = if let Some(slot) = &mut self.slots[id as usize] {
+                        let _g = slot.tag.as_deref().map(crate::plugins::guard::enter_borrowed);
+                        slot.proc.replace_plugin_inner(Some(proc))
+                    } else { Some(proc) };
+                    if let Some(mut proc) = retired {
+                        proc.deactivate();
+                        self.throw_away(Garbage::PluginInner(proc));
+                    }
                 }
             }
         }
@@ -649,18 +680,25 @@ impl Engine {
             let returned_tx = returned_tx.clone();
             let diagnostic = diagnostic.clone();
             let mut previous_callback: Option<std::time::Instant> = None;
-            let mut local: Option<AudioState> = None;
+            // A device error can destroy the callback on an arbitrary thread without
+            // calling it again. Only the explicit processing-thread handoff may release
+            // this state; otherwise shutdown times out and the UI retains plugin owners.
+            let mut local: Option<ManuallyDrop<AudioState>> = None;
             device.build_output_stream(
                 config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let started = diagnostic.as_ref().map(|_| std::time::Instant::now());
                     // Take ownership of the state on the first callback; no locking afterwards.
                     if local.is_none() {
-                        local = state.try_lock().ok().and_then(|mut s| s.take());
+                        local = state
+                            .try_lock()
+                            .ok()
+                            .and_then(|mut s| s.take())
+                            .map(ManuallyDrop::new);
                     }
                     if stop.load(Ordering::Acquire) {
                         if let Some(state) = local.take() {
-                            return_audio_state(state, &returned_tx);
+                            return_audio_state(ManuallyDrop::into_inner(state), &returned_tx);
                         }
                         data.fill(0.0);
                         return;
@@ -704,7 +742,13 @@ impl Engine {
 
         Ok(Self {
             _stream: Some(stream),
-            shutdown: AudioShutdown { stop, startup: state, returned, null_thread: None, result: None },
+            shutdown: AudioShutdown {
+                stop,
+                startup: state,
+                returned,
+                null_thread: None,
+                result: None,
+            },
             status,
             cmd_tx,
             pending: Default::default(),
@@ -745,7 +789,10 @@ impl Engine {
         let null_thread = std::thread::Builder::new()
             .name("nodeplayer-null-audio".into())
             .spawn(move || {
-                let Some(mut state) = startup.lock().unwrap().take() else { return };
+                let Some(state) = startup.lock().unwrap().take() else {
+                    return;
+                };
+                let mut state = ManuallyDrop::new(state);
                 let period =
                     std::time::Duration::from_secs_f64(block_size as f64 / sample_rate as f64);
                 let mut deadline = std::time::Instant::now();
@@ -760,16 +807,29 @@ impl Engine {
                     deadline += period;
                     let now = std::time::Instant::now();
                     if deadline > now {
-                        std::thread::park_timeout(deadline - now);
+                        // park_timeout can return spuriously; only shutdown may end this
+                        // wait early, otherwise the null engine would run ahead of time.
+                        while !thread_stop.load(Ordering::Acquire) {
+                            let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+                                break;
+                            };
+                            std::thread::park_timeout(wait);
+                        }
                     } else {
                         deadline = now;
                     }
                 }
-                return_audio_state(state, &returned_tx);
+                return_audio_state(ManuallyDrop::into_inner(state), &returned_tx);
             })?;
         Ok(Self {
             _stream: None,
-            shutdown: AudioShutdown { stop, startup: state, returned, null_thread: Some(null_thread), result: None },
+            shutdown: AudioShutdown {
+                stop,
+                startup: state,
+                returned,
+                null_thread: Some(null_thread),
+                result: None,
+            },
             status,
             cmd_tx,
             pending: Default::default(),
@@ -789,6 +849,7 @@ impl Engine {
     /// case the caller must retain its plugin instances/modules for process lifetime; the
     /// engine also retains a live device stream rather than blocking or racing its callback.
     /// A process watchdog is still required for a wedged in-process plugin.
+    #[must_use = "retain plugin instances and modules when audio shutdown does not complete"]
     pub fn shutdown(&mut self) -> bool {
         self.shutdown_with_timeout(SHUTDOWN_TIMEOUT)
     }
@@ -829,7 +890,9 @@ impl Engine {
                 log::error!("audio shutdown did not complete; plugin lifetimes must be retained");
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())));
+            std::thread::sleep(
+                Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
 
@@ -1041,6 +1104,285 @@ mod tests {
         assert_eq!(after.lock().unwrap().last(), Some(&Transport::default()));
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ShutdownEvent {
+        ProcessStarted,
+        ProcessFinished,
+        StopStarted,
+        StopFinished,
+        Dropped,
+    }
+
+    type ShutdownEvents = Arc<std::sync::Mutex<Vec<(ShutdownEvent, std::thread::ThreadId)>>>;
+
+    struct ShutdownProbe {
+        events: ShutdownEvents,
+        started: Option<crossbeam_channel::Sender<()>>,
+        process_gate: Option<crossbeam_channel::Receiver<()>>,
+        stop_gate: Option<crossbeam_channel::Receiver<()>>,
+        ran: bool,
+    }
+
+    impl ShutdownProbe {
+        fn new(
+            process_gate: Option<crossbeam_channel::Receiver<()>>,
+            stop_gate: Option<crossbeam_channel::Receiver<()>>,
+        ) -> (Self, ShutdownEvents, crossbeam_channel::Receiver<()>) {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            (
+                Self {
+                    events: events.clone(),
+                    started: Some(tx),
+                    process_gate,
+                    stop_gate,
+                    ran: false,
+                },
+                events,
+                rx,
+            )
+        }
+
+        fn event(&self, event: ShutdownEvent) {
+            self.events
+                .lock()
+                .unwrap()
+                .push((event, std::thread::current().id()));
+        }
+    }
+
+    impl Processor for ShutdownProbe {
+        fn process(&mut self, _: usize, _: &mut [StereoBuf], _: &mut [StereoBuf]) {
+            if !std::mem::replace(&mut self.ran, true) {
+                self.event(ShutdownEvent::ProcessStarted);
+                let _ = self.started.take().unwrap().send(());
+                if let Some(gate) = self.process_gate.take() {
+                    let _ = gate.recv();
+                }
+                self.event(ShutdownEvent::ProcessFinished);
+            }
+        }
+
+        fn deactivate(&mut self) {
+            self.event(ShutdownEvent::StopStarted);
+            if let Some(gate) = self.stop_gate.take() {
+                let _ = gate.recv();
+            }
+            self.event(ShutdownEvent::StopFinished);
+        }
+    }
+
+    impl Drop for ShutdownProbe {
+        fn drop(&mut self) {
+            self.event(ShutdownEvent::Dropped);
+        }
+    }
+
+    fn install_shutdown_probe(engine: &mut Engine, probe: ShutdownProbe) {
+        engine.send(Command::AddNode(0, NodeSlot::new(Box::new(probe), 0, 0)));
+        engine.send(Command::SetSchedule(Box::new(Schedule {
+            steps: vec![Step {
+                node: 0,
+                inputs: vec![],
+                midi: vec![],
+            }],
+            ..Default::default()
+        })));
+    }
+
+    fn assert_shutdown_events(events: &ShutdownEvents) {
+        let events = events.lock().unwrap();
+        let stages: Vec<_> = events.iter().map(|&(stage, _)| stage).collect();
+        assert_eq!(
+            stages,
+            [
+                ShutdownEvent::ProcessStarted,
+                ShutdownEvent::ProcessFinished,
+                ShutdownEvent::StopStarted,
+                ShutdownEvent::StopFinished,
+                ShutdownEvent::Dropped,
+            ]
+        );
+        let audio_thread = events[0].1;
+        assert_ne!(audio_thread, std::thread::current().id());
+        assert!(
+            events[..4]
+                .iter()
+                .all(|&(_, thread)| thread == audio_thread)
+        );
+        assert_eq!(
+            events[4].1,
+            std::thread::current().id(),
+            "processor refs retire on the control thread"
+        );
+    }
+
+    #[test]
+    fn shutdown_waits_for_inflight_dsp_and_retires_full_command_backlog() {
+        let mut engine = Engine::start_null(48_000, 64).unwrap();
+        let (release, gate) = crossbeam_channel::bounded(1);
+        let (probe, events, started) = ShutdownProbe::new(Some(gate), None);
+        install_shutdown_probe(&mut engine, probe);
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (queued, queued_events, _) = ShutdownProbe::new(None, None);
+        engine.send(Command::AddNode(1, NodeSlot::new(Box::new(queued), 0, 0)));
+        // Shutdown must not depend on inserting a command or on applying this backlog.
+        while !engine.cmd_tx.is_full() {
+            assert!(
+                engine
+                    .cmd_tx
+                    .push(Command::SetSchedule(Box::default()))
+                    .is_ok()
+            );
+        }
+        let (pending, pending_events, _) = ShutdownProbe::new(None, None);
+        engine.send(Command::AddNode(2, NodeSlot::new(Box::new(pending), 0, 0)));
+        assert_eq!(engine.pending.len(), 1);
+
+        let stop = engine.shutdown.stop.clone();
+        let observed = events.clone();
+        let release_thread = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !stop.load(Ordering::Acquire) {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                observed.lock().unwrap().len(),
+                1,
+                "neither stop nor drop can race the active call"
+            );
+            release.send(()).unwrap();
+        });
+        assert!(engine.shutdown());
+        release_thread.join().unwrap();
+        assert_shutdown_events(&events);
+        for events in [queued_events, pending_events] {
+            assert_eq!(
+                *events.lock().unwrap(),
+                [(ShutdownEvent::Dropped, std::thread::current().id())],
+                "unstarted queued processors are retired without calling stop on the UI thread"
+            );
+        }
+        assert!(engine.shutdown(), "shutdown is idempotent");
+        drop(engine);
+        assert_shutdown_events(&events);
+    }
+
+    #[test]
+    fn shutdown_timeout_preserves_an_inflight_processor_until_late_completion() {
+        let mut engine = Engine::start_null(48_000, 64).unwrap();
+        let (release, gate) = crossbeam_channel::bounded(1);
+        let (probe, events, started) = ShutdownProbe::new(Some(gate), None);
+        install_shutdown_probe(&mut engine, probe);
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before = Instant::now();
+        assert!(!engine.shutdown_with_timeout(Duration::from_millis(20)));
+        assert!(
+            before.elapsed() < Duration::from_secs(1),
+            "a stuck plugin cannot force an unbounded join"
+        );
+        assert_eq!(events.lock().unwrap().len(), 1);
+        assert!(
+            !engine.shutdown(),
+            "a timeout remains a failure requiring owner retention"
+        );
+        // The application retains instance owners after false. Keep the return endpoint
+        // here so the synthetic probe can be reclaimed after the deliberate late finish.
+        let returned = engine.shutdown.returned.clone();
+        drop(engine);
+        assert_eq!(events.lock().unwrap().len(), 1);
+        release.send(()).unwrap();
+        let state = returned.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(events.lock().unwrap().len(), 4);
+        state.retire();
+        assert_shutdown_events(&events);
+    }
+
+    #[test]
+    fn shutdown_timeout_also_bounds_a_stuck_stop_processing() {
+        let mut engine = Engine::start_null(48_000, 64).unwrap();
+        let (release, gate) = crossbeam_channel::bounded(1);
+        let (probe, events, started) = ShutdownProbe::new(None, Some(gate));
+        install_shutdown_probe(&mut engine, probe);
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!engine.shutdown_with_timeout(Duration::from_millis(20)));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(stage, _)| stage == ShutdownEvent::StopStarted)
+        {
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        let stages: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|&(stage, _)| stage)
+            .collect();
+        assert_eq!(
+            stages,
+            [
+                ShutdownEvent::ProcessStarted,
+                ShutdownEvent::ProcessFinished,
+                ShutdownEvent::StopStarted
+            ]
+        );
+        let returned = engine.shutdown.returned.clone();
+        drop(engine);
+        release.send(()).unwrap();
+        returned
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .retire();
+        assert_shutdown_events(&events);
+    }
+
+    #[test]
+    fn shutdown_normal_and_implicit_null_exits_stress_processor_thread_affinity() {
+        for iteration in 0..32 {
+            let mut engine = Engine::start_null(48_000, 64).unwrap();
+            let (probe, events, started) = ShutdownProbe::new(None, None);
+            install_shutdown_probe(&mut engine, probe);
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            if iteration % 2 == 0 {
+                assert!(engine.shutdown());
+            }
+            drop(engine);
+            assert_shutdown_events(&events);
+        }
+        // Also close before the worker necessarily takes the startup state. Queued
+        // wrappers may either be installed/deactivated or remain entirely unstarted.
+        for _ in 0..32 {
+            let mut engine = Engine::start_null(48_000, 64).unwrap();
+            let (probe, events, _) = ShutdownProbe::new(None, None);
+            engine.send(Command::AddNode(0, NodeSlot::new(Box::new(probe), 0, 0)));
+            assert!(engine.shutdown());
+            drop(engine);
+            let events = events.lock().unwrap();
+            assert_eq!(
+                events.last(),
+                Some(&(ShutdownEvent::Dropped, std::thread::current().id()))
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|&(stage, _)| stage == ShutdownEvent::ProcessStarted)
+            );
+            assert!(
+                events
+                    .iter()
+                    .filter(|&&(stage, _)| stage == ShutdownEvent::StopStarted)
+                    .count()
+                    <= 1
+            );
+        }
+    }
+
     fn timing_schedule(nodes: &[timing::NodeSpec], edges: &[timing::EdgeKey]) -> Schedule {
         let limits = timing::TimingLimits::default();
         let analysis = timing::analyze(nodes, edges, true, limits).unwrap();
@@ -1101,6 +1443,80 @@ mod tests {
         fn process(&mut self, n: usize, ins: &mut [StereoBuf], outs: &mut [StereoBuf]) {
             self.0.write(ins.first(), &mut outs[0], n);
         }
+    }
+
+    #[test]
+    fn plugin_handoff_keeps_slot_history_and_final_output_warm() {
+        struct Constant;
+        impl Processor for Constant {
+            fn process(&mut self, n: usize, _: &mut [StereoBuf], out: &mut [StereoBuf]) {
+                out[0].l[..n].fill(0.25);
+                out[0].r[..n].fill(-0.5);
+            }
+        }
+        struct Plugin {
+            state: Arc<std::sync::Mutex<compensation::AudioDelay>>,
+            flushes: Arc<std::sync::atomic::AtomicUsize>,
+            stops: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Processor for Plugin {
+            fn process(&mut self, n: usize, input: &mut [StereoBuf], out: &mut [StereoBuf]) {
+                self.state.lock().unwrap().write(input.first(), &mut out[0], n);
+            }
+            fn flush_params(&mut self) {
+                self.flushes.fetch_add(1, Ordering::Relaxed);
+            }
+            fn deactivate(&mut self) {
+                self.stops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let delay = Arc::new(std::sync::Mutex::new(compensation::AudioDelay::new(128).unwrap()));
+        let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let processor = || Box::new(Plugin {
+            state: delay.clone(),
+            flushes: flushes.clone(),
+            stops: stops.clone(),
+        }) as Box<dyn Processor>;
+        let plugin = nodes::PluginProc::with_latency(processor(), 128, 0, false).unwrap();
+        let schedule = timing_schedule(
+            &[spec(0, 0, false), spec(1, 128, false), spec(2, 0, true)],
+            &[edge(0, 1), edge(1, 2)],
+        );
+        let mut state = offline_state(schedule, vec![
+            (0, NodeSlot::new(Box::new(Constant), 0, 1)),
+            (1, NodeSlot::new(Box::new(plugin), 1, 1)),
+            (2, NodeSlot::new(Box::new(nodes::Output::new(0.0, Arc::default())), 1, 0)),
+        ]);
+        let (mut commands, command_rx) = rtrb::RingBuffer::new(16);
+        let (garbage_tx, mut garbage) = rtrb::RingBuffer::new(16);
+        state.cmd_rx = command_rx;
+        state.garbage_tx = garbage_tx;
+        let epoch = state.schedule.epoch();
+        let slot = state.slots[1].as_ref().unwrap().as_ref() as *const NodeSlot;
+        let input_buffer = state.slots[1].as_ref().unwrap().ins[0].l.as_ptr();
+        state.render(&mut vec![0.0; 2048 * 2], 2);
+        commands.push(Command::ConfigureBypass(1, Box::new(
+            nodes::LatencyBypass::new(128, 0, false).unwrap(),
+        ))).ok().unwrap();
+        commands.push(Command::SuspendPlugin(1)).ok().unwrap();
+        for frames in [64, 127, 512] {
+            let mut output = vec![0.0; frames * 2];
+            state.render(&mut output, 2);
+            assert!(output.as_chunks::<2>().0.iter().all(|frame| *frame == [0.25, -0.5]));
+        }
+        assert_eq!(flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(stops.load(Ordering::Relaxed), 1);
+        assert!(matches!(garbage.pop().unwrap(), Garbage::Bypass(_)));
+        assert!(matches!(garbage.pop().unwrap(), Garbage::PluginSuspended(1, Some(_))));
+        commands.push(Command::ResumePlugin(1, processor())).ok().unwrap();
+        let mut output = vec![0.0; 512 * 2];
+        state.render(&mut output, 2);
+        assert!(output.as_chunks::<2>().0.iter().all(|frame| *frame == [0.25, -0.5]));
+        assert_eq!(state.slots[1].as_ref().unwrap().as_ref() as *const NodeSlot, slot);
+        assert_eq!(state.slots[1].as_ref().unwrap().ins[0].l.as_ptr(), input_buffer);
+        assert_eq!(state.schedule.epoch(), epoch);
+        assert!(garbage.pop().is_err());
     }
 
     fn spec(id: u32, latency: u64, sink: bool) -> timing::NodeSpec {
