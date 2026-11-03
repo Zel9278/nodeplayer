@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, bail, ensure};
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -159,13 +159,29 @@ impl NativeCapture {
             let mut previous = std::mem::take(&mut self.popups);
             let mut remaining = MAX_PIXELS - u64::from(width) * u64::from(height);
             for (hwnd, logical_origin) in self.input.popups()? {
-                // UpdateLayeredWindow bitmaps are compositor-owned. WM_PRINT can
-                // succeed by drawing a stock class caption unrelated to those pixels;
-                // direct DC reads and PrintWindow do not recover the offscreen bitmap.
-                ensure!(
-                    GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0 == 0,
-                    "Layered native popup capture is unsupported; use Pop out"
-                );
+                let layered = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0 != 0;
+                let uploaded = if layered {
+                    crate::plugins::window::layered::image(hwnd)?
+                } else {
+                    None
+                };
+                let mut color_key = COLORREF::default();
+                let mut opacity = 255;
+                let mut attributes = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
+                if layered
+                    && uploaded.is_none()
+                    && GetLayeredWindowAttributes(
+                        hwnd,
+                        Some(&mut color_key),
+                        Some(&mut opacity),
+                        Some(&mut attributes),
+                    )
+                    .is_err()
+                {
+                    // A per-pixel layered window has no printable backing. Keep
+                    // presenting the editor while its first upload is in flight.
+                    continue;
+                }
                 let mut bounds = RECT::default();
                 GetWindowRect(hwnd, &mut bounds).context("read captured popup size")?;
                 let (width, height) = (
@@ -181,45 +197,84 @@ impl NativeCapture {
                     "editor popups exceed capture dimensions or pixel budget"
                 );
                 remaining -= u64::from(width) * u64::from(height);
-                let bitmap = previous
-                    .iter()
-                    .position(|(window, bitmap)| *window == hwnd && bitmap.size == (width, height))
-                    .map(|index| previous.swap_remove(index).1)
-                    .map_or_else(|| Bitmap::new(hwnd, width, height), Ok)?;
-                std::ptr::write_bytes(bitmap.bits, 0, width as usize * height as usize * 4);
-                let mut popup_budget = 512;
-                print_tree(
-                    hwnd,
-                    bitmap.memory_dc,
-                    POINT { x: bounds.left, y: bounds.top },
-                    RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 },
-                    0,
-                    &mut popup_budget,
-                    false,
-                )?;
-                let _ = GdiFlush();
-                let pixels = std::slice::from_raw_parts(
-                    bitmap.bits.cast::<u8>(),
-                    width as usize * height as usize * 4,
-                );
-                let alpha = pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0);
-                let mut rgba = Vec::with_capacity(pixels.len());
-                for pixel in pixels.as_chunks::<4>().0 {
-                    let a = if alpha { pixel[3] } else { 255 };
-                    let straight = |v: u8| {
-                        if a == 0 {
-                            0
+                let rgba = if let Some(image) = uploaded {
+                    ensure!(
+                        (image.width, image.height) == (width, height),
+                        "layered popup upload differs from its native size"
+                    );
+                    image.rgba
+                } else {
+                    let bitmap = previous
+                        .iter()
+                        .position(|(window, bitmap)| {
+                            *window == hwnd && bitmap.size == (width, height)
+                        })
+                        .map(|index| previous.swap_remove(index).1)
+                        .map_or_else(|| Bitmap::new(hwnd, width, height), Ok)?;
+                    std::ptr::write_bytes(bitmap.bits, 0, width as usize * height as usize * 4);
+                    let mut popup_budget = 512;
+                    print_tree(
+                        hwnd,
+                        bitmap.memory_dc,
+                        POINT {
+                            x: bounds.left,
+                            y: bounds.top,
+                        },
+                        RECT {
+                            left: 0,
+                            top: 0,
+                            right: width as i32,
+                            bottom: height as i32,
+                        },
+                        0,
+                        &mut popup_budget,
+                        false,
+                    )?;
+                    let _ = GdiFlush();
+                    let pixels = std::slice::from_raw_parts(
+                        bitmap.bits.cast::<u8>(),
+                        width as usize * height as usize * 4,
+                    );
+                    let alpha =
+                        !layered && pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0);
+                    let mut rgba = Vec::with_capacity(pixels.len());
+                    for pixel in pixels.as_chunks::<4>().0 {
+                        let a = if layered {
+                            let color = u32::from(pixel[2])
+                                | (u32::from(pixel[1]) << 8)
+                                | (u32::from(pixel[0]) << 16);
+                            if attributes & LWA_COLORKEY == LWA_COLORKEY && color == color_key.0 {
+                                0
+                            } else if attributes & LWA_ALPHA == LWA_ALPHA {
+                                opacity
+                            } else {
+                                255
+                            }
+                        } else if alpha {
+                            pixel[3]
                         } else {
-                            ((u32::from(v) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8
-                        }
-                    };
-                    rgba.extend_from_slice(&[
-                        straight(pixel[2]),
-                        straight(pixel[1]),
-                        straight(pixel[0]),
-                        a,
-                    ]);
-                }
+                            255
+                        };
+                        let straight = |v: u8| {
+                            if a == 0 {
+                                0
+                            } else if layered {
+                                v
+                            } else {
+                                ((u32::from(v) * 255 + u32::from(a) / 2) / u32::from(a)).min(255)
+                                    as u8
+                            }
+                        };
+                        rgba.extend_from_slice(&[
+                            straight(pixel[2]),
+                            straight(pixel[1]),
+                            straight(pixel[0]),
+                            a,
+                        ]);
+                    }
+                    self.popups.push((hwnd, bitmap));
+                    rgba
+                };
                 frame.popups.push(EditorPopup {
                     origin: [
                         f64::from(logical_origin.x - origin.x),
@@ -232,7 +287,6 @@ impl NativeCapture {
                     interactive: self.input.owner().is_some()
                         || GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 == 0,
                 });
-                self.popups.push((hwnd, bitmap));
             }
             Ok(frame)
         }
@@ -654,6 +708,7 @@ mod tests {
         capture_changes: Cell<u32>,
         cancels: Cell<u32>,
         last_cancel: Cell<u32>,
+        desktop_moves: Cell<u32>,
     }
 
     struct TestWindow {
@@ -761,6 +816,19 @@ mod tests {
                         state.down.set(false);
                         return LRESULT(0);
                     }
+                    WM_WINDOWPOSCHANGED => {
+                        let mut bounds = RECT::default();
+                        if GetWindowRect(hwnd, &mut bounds).is_ok()
+                            && bounds.right > GetSystemMetrics(SM_XVIRTUALSCREEN)
+                            && bounds.bottom > GetSystemMetrics(SM_YVIRTUALSCREEN)
+                            && bounds.left < GetSystemMetrics(SM_XVIRTUALSCREEN)
+                                + GetSystemMetrics(SM_CXVIRTUALSCREEN)
+                            && bounds.top < GetSystemMetrics(SM_YVIRTUALSCREEN)
+                                + GetSystemMetrics(SM_CYVIRTUALSCREEN)
+                        {
+                            state.desktop_moves.set(state.desktop_moves.get() + 1);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -804,6 +872,7 @@ mod tests {
             capture_changes: Cell::new(0),
             cancels: Cell::new(0),
             last_cancel: Cell::new(0),
+            desktop_moves: Cell::new(0),
         });
         unsafe {
             let style =
@@ -1134,6 +1203,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Windows window station"]
     fn captures_owned_popup_without_exposing_it_on_the_desktop() -> Result<()> {
+        let foreground = unsafe { GetForegroundWindow() };
         let root = fixture(None, (-1400, -1000), (400, 300), [23, 28, 38])?;
         let mut capture = NativeCapture::new(root.hwnd.0 as usize)?;
         let second = fixture(None, (-2400, -1800), (400, 300), [30, 40, 50])?;
@@ -1150,10 +1220,11 @@ mod tests {
             capture_changes: Cell::new(0),
             cancels: Cell::new(0),
             last_cancel: Cell::new(0),
+            desktop_moves: Cell::new(0),
         });
         let popup = unsafe {
             let hwnd = CreateWindowExW(
-                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                WS_EX_APPWINDOW,
                 CLASS,
                 w!("owned captured popup"),
                 WS_POPUP,
@@ -1167,7 +1238,7 @@ mod tests {
                 None,
             )?;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut *state as *mut State as isize);
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(hwnd, SW_SHOW);
             TestWindow { hwnd, state }
         };
         let frame = capture.capture((400, 300))?;
@@ -1177,6 +1248,17 @@ mod tests {
         assert_eq!(image.native_size, (160, 120));
         assert_eq!(&image.rgba[..4], &[180, 90, 30, 255]);
         unsafe {
+            let style = GetWindowLongW(popup.hwnd, GWL_EXSTYLE) as u32;
+            assert_eq!(
+                style & (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_APPWINDOW).0,
+                (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW).0,
+                "captured popup must not activate or enter task switching"
+            );
+            assert_eq!(GetForegroundWindow(), foreground);
+            assert_eq!(
+                SendMessageW(popup.hwnd, WM_MOUSEACTIVATE, WPARAM(0), LPARAM(0)),
+                LRESULT(MA_NOACTIVATE as isize)
+            );
             let mut bounds = RECT::default();
             GetWindowRect(popup.hwnd, &mut bounds)?;
             assert!(
@@ -1203,6 +1285,102 @@ mod tests {
         })?;
         assert_eq!(popup.state.clicks.get(), 1);
         assert_eq!(popup.state.last_up.get(), Some((20, 20)));
+
+        // Layered menus upload their own backing rather than painting WM_PRINT.
+        // Both APIs can move directly onto the desktop, even when the ordinary
+        // WINDOWPOS hook parks every SetWindowPos call.
+        unsafe {
+            SetWindowLongW(
+                popup.hwnd,
+                GWL_EXSTYLE,
+                (GetWindowLongW(popup.hwnd, GWL_EXSTYLE) as u32 | WS_EX_LAYERED.0) as i32,
+            );
+            let bitmap = Bitmap::new(popup.hwnd, 160, 120)?;
+            let pixels = std::slice::from_raw_parts_mut(bitmap.bits.cast::<u8>(), 160 * 120 * 4);
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                *pixel = [16, 32, 64, 128];
+            }
+            pixels[..4].fill(0);
+            let size = windows::Win32::Foundation::SIZE { cx: 160, cy: 120 };
+            let source = POINT::default();
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 128,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            for (indirect, destination) in [
+                (false, POINT { x: 100, y: 200 }),
+                (true, POINT { x: 140, y: 220 }),
+            ] {
+                if indirect {
+                    let update = UPDATELAYEREDWINDOWINFO {
+                        cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+                        pptDst: &destination,
+                        psize: &size,
+                        hdcSrc: bitmap.memory_dc,
+                        pptSrc: &source,
+                        pblend: &blend,
+                        dwFlags: ULW_ALPHA,
+                        ..Default::default()
+                    };
+                    ensure!(
+                        UpdateLayeredWindowIndirect(popup.hwnd, &update).as_bool(),
+                        "upload indirect layered popup: {}",
+                        windows::core::Error::from_win32()
+                    );
+                } else {
+                    UpdateLayeredWindow(
+                        popup.hwnd,
+                        HDC::default(),
+                        Some(&destination),
+                        Some(&size),
+                        bitmap.memory_dc,
+                        Some(&source),
+                        COLORREF::default(),
+                        Some(&blend),
+                        ULW_ALPHA,
+                    )?;
+                }
+                let frame = capture.capture((400, 300))?;
+                assert_eq!(frame.popups.len(), 1);
+                let image = &frame.popups[0];
+                assert_eq!(
+                    image.origin,
+                    [
+                        f64::from(destination.x + 1400),
+                        f64::from(destination.y + 1000)
+                    ]
+                );
+                assert_eq!(&image.rgba[..4], &[0, 0, 0, 0]);
+                assert_eq!(&image.rgba[4..8], &[128, 64, 32, 64]);
+                assert_eq!(GetForegroundWindow(), foreground);
+                assert_eq!(
+                    popup.state.desktop_moves.get(),
+                    0,
+                    "a captured layered popup must never visit the desktop"
+                );
+            }
+            // A position-only update must retain the copied bitmap even when its
+            // uploader has already reused the original DIB.
+            pixels.fill(0);
+            let destination = POINT { x: 180, y: 240 };
+            UpdateLayeredWindow(
+                popup.hwnd,
+                HDC::default(),
+                Some(&destination),
+                None,
+                HDC::default(),
+                None,
+                COLORREF::default(),
+                None,
+                UPDATE_LAYERED_WINDOW_FLAGS::default(),
+            )?;
+            let frame = capture.capture((400, 300))?;
+            assert_eq!(frame.popups[0].origin, [1580.0, 1240.0]);
+            assert_eq!(&frame.popups[0].rgba[4..8], &[128, 64, 32, 64]);
+            assert_eq!(popup.state.desktop_moves.get(), 0);
+        }
         drop(popup);
         assert!(capture.capture((400, 300))?.popups.is_empty());
         Ok(())
