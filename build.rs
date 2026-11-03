@@ -1,6 +1,7 @@
 //! Builds the bundled ysfx (JSFX interpreter) as a static library.
 
 fn main() {
+    println!("cargo:rerun-if-changed=src/plugins/surface/metal_capture.mm");
     let src = "third_party/ysfx";
     println!("cargo:rerun-if-changed={src}/sources");
     println!("cargo:rerun-if-changed={src}/include");
@@ -52,7 +53,14 @@ fn main() {
         println!("cargo:rustc-link-arg=-static-libgcc");
     }
     if os == "macos" {
-        for fw in ["Cocoa", "Carbon", "Foundation", "Metal"] {
+        cc::Build::new()
+            .cpp(true)
+            .file("src/plugins/surface/metal_capture.mm")
+            .flag("-std=c++17")
+            .flag("-fobjc-arc")
+            .opt_level(2)
+            .compile("nodeplayer_metal_capture");
+        for fw in ["Cocoa", "Carbon", "Foundation", "Metal", "MetalKit", "QuartzCore"] {
             println!("cargo:rustc-link-lib=framework={fw}");
         }
     }

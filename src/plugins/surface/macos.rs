@@ -21,6 +21,10 @@ use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSDictionary, NSPoint, NSRe
 
 use super::{EditorFrame, EditorPointer, EditorPopup, MAX_POPUPS, PointerKind};
 
+#[path = "metal.rs"]
+mod metal;
+use metal::MetalCapture;
+
 const MAX_CAPTURE_PIXELS: u64 = 16 * 1024 * 1024;
 
 thread_local! {
@@ -132,6 +136,8 @@ struct PopupCapture {
 }
 
 pub struct NativeCapture {
+    // Detach the drawable adapter before releasing the source or its descendants.
+    metal: Option<MetalCapture>,
     bitmap: BitmapCache,
     popups: Vec<PopupCapture>,
     drag_target: Option<Retained<NSView>>,
@@ -153,7 +159,17 @@ impl NativeCapture {
             view.window().is_some(),
             "native editor is not attached to a window"
         );
+        if log::log_enabled!(log::Level::Debug) {
+            fn describe(view: &NSView, depth: usize) {
+                if depth > 8 { return; }
+                let layer: Option<Retained<objc2::runtime::AnyObject>> = unsafe { msg_send![view, layer] };
+                log::debug!("capture source depth={depth} view={:?} frame={:?} layer={:?}", view.class(), view.frame(), layer.as_deref().map(|layer| layer.class()));
+                for child in view.subviews().iter().take(64) { describe(&child, depth + 1); }
+            }
+            describe(&view, 0);
+        }
         Ok(Self {
+            metal: MetalCapture::attach(&view),
             bitmap: BitmapCache::default(),
             popups: Vec::new(),
             drag_target: None,
@@ -163,7 +179,16 @@ impl NativeCapture {
     }
 
     pub fn capture(&mut self, _native_size: (u32, u32)) -> Result<EditorFrame> {
-        let mut frame = capture_view(&self.view, &mut self.bitmap, MAX_CAPTURE_PIXELS)?;
+        if self.metal.as_ref().is_some_and(|metal| !metal.is_current(&self.view)) {
+            self.metal = None;
+        }
+        if self.metal.is_none() {
+            self.metal = MetalCapture::attach(&self.view);
+        }
+        let mut frame = match self.metal.as_mut().map(MetalCapture::frame).transpose()?.flatten() {
+            Some(frame) => frame,
+            None => capture_view(&self.view, &mut self.bitmap, MAX_CAPTURE_PIXELS)?,
+        };
         let window = self
             .view
             .window()
@@ -357,6 +382,8 @@ impl NativeCapture {
 fn capture_view(view: &NSView, cache: &mut BitmapCache, pixel_budget: u64) -> Result<EditorFrame> {
     MainThreadMarker::new().context("native capture must run on the main thread")?;
     let window = view.window().context("native editor left its window")?;
+    view.layoutSubtreeIfNeeded();
+    view.displayIfNeeded();
     let bounds = view.bounds();
     let backing_scale: f64 = unsafe { msg_send![&*window, backingScaleFactor] };
     ensure!(
@@ -381,7 +408,6 @@ fn capture_view(view: &NSView, cache: &mut BitmapCache, pixel_budget: u64) -> Re
         bounds.size.width.round().max(1.0) as u32,
         bounds.size.height.round().max(1.0) as u32,
     );
-    view.displayIfNeeded();
     let key = (
         bounds.size.width.to_bits(),
         bounds.size.height.to_bits(),
