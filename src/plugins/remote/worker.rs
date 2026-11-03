@@ -200,6 +200,9 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
             // Poll only for the start of a control frame. A quiet parent must not stop the
             // worker's AppKit/native event pump or its independently paced capture updates.
             if !request_pending(&mut socket)? {
+                // Keep native input/timers and capture responsive between commands. This
+                // wait is below the 240 Hz capture period and avoids an idle busy loop.
+                std::thread::sleep(Duration::from_micros(500));
                 return Ok(false);
             }
             let req: Request = match protocol::receive(&mut socket) {
@@ -406,10 +409,11 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
     }
 }
 fn request_pending(socket: &mut TcpStream) -> Result<bool> {
-    let timeout = socket.read_timeout()?;
-    socket.set_read_timeout(Some(Duration::from_millis(8)))?;
+    // Readiness is separate from the framed request deadline. A blocking peek here used
+    // to stall every native UI/capture service pass for 8 ms with a quiet parent.
+    socket.set_nonblocking(true)?;
     let result = socket.peek(&mut [0]);
-    socket.set_read_timeout(timeout)?;
+    socket.set_nonblocking(false)?;
     match result {
         Ok(0) => bail!("control connection closed"),
         Ok(_) => Ok(true),
@@ -722,6 +726,13 @@ mod tests {
         assert_eq!(request.id, 1);
         assert!(!request_pending(&mut worker).unwrap());
         drop(parent);
-        assert!(request_pending(&mut worker).is_err());
+        // FIN delivery is asynchronous even on loopback. Native servicing must remain
+        // nonblocking while the OS makes the closed connection observable.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while let Ok(pending) = request_pending(&mut worker) {
+            assert!(!pending, "the consumed control frame must not reappear");
+            assert!(Instant::now() < deadline, "closed control socket was not detected");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
