@@ -516,6 +516,7 @@ impl EditorView {
                 _ => 0,
             };
             editor.pointer(EditorPointer {
+                timestamp_ms: super::pointer_timestamp_ms(),
                 modifiers: modifier_mask(modifiers),
                 click_count,
                 position: self.native_position(screen, size, position, popup),
@@ -536,6 +537,7 @@ impl EditorView {
                 let bit = 1 << (button - 1);
                 if self.buttons & bit != 0 {
                     editor.pointer(EditorPointer {
+                        timestamp_ms: super::pointer_timestamp_ms(),
                         modifiers: 0,
                         click_count: 0,
                         position: self.native_position(screen, size, position, None),
@@ -596,6 +598,7 @@ impl EditorView {
             let bit = 1 << (button - 1);
             if self.buttons & bit != 0 {
                 editor.pointer(EditorPointer {
+                    timestamp_ms: super::pointer_timestamp_ms(),
                     modifiers: 0,
                     click_count: 0,
                     position,
@@ -606,6 +609,7 @@ impl EditorView {
             }
         }
         editor.pointer(EditorPointer {
+            timestamp_ms: super::pointer_timestamp_ms(),
             modifiers: 0,
             click_count: 0,
             position,

@@ -902,6 +902,7 @@ mod tests {
             generation,
             token: 3,
             event: EditorPointer {
+                timestamp_ms: None,
                 modifiers: 0,
                 click_count: if matches!(kind, PointerKind::Down(_) | PointerKind::Up(_)) {
                     1

@@ -635,6 +635,7 @@ mod tests {
 
     fn pointer(kind: PointerKind, x: f64, buttons: u8) -> EditorPointer {
         EditorPointer {
+            timestamp_ms: None,
             modifiers: 0,
             click_count: if matches!(kind, PointerKind::Down(_) | PointerKind::Up(_)) {
                 1

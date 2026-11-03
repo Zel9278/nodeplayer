@@ -131,6 +131,29 @@ pub struct EditorPointer {
     pub modifiers: u8,
     /// Click sequence on a button transition; zero for motion, wheel, or cancellation.
     pub click_count: u8,
+    /// Input time before worker queueing, in this machine's monotonic clock.
+    /// Linux maps it into X server time so delayed delivery preserves click intervals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
+}
+
+pub(crate) fn pointer_timestamp_ms() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // CLOCK_MONOTONIC has the same origin in the parent and isolated worker.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let time = unsafe { time.assume_init() };
+        let seconds = u64::try_from(time.tv_sec).ok()?;
+        let nanoseconds = u64::try_from(time.tv_nsec).ok()?;
+        seconds.checked_mul(1000)?.checked_add(nanoseconds / 1_000_000)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 impl EditorPointer {
@@ -143,6 +166,10 @@ impl EditorPointer {
         );
         ensure!(self.buttons & !7 == 0, "invalid editor buttons");
         ensure!(self.modifiers & !15 == 0, "invalid editor modifiers");
+        ensure!(
+            self.timestamp_ms.is_none_or(|time| time <= i64::MAX as u64),
+            "invalid editor monotonic timestamp"
+        );
         ensure!(
             matches!(self.kind, PointerKind::Down(_) | PointerKind::Up(_)) || self.click_count == 0,
             "click count on a non-button editor event"
@@ -325,6 +352,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pointer_timestamps_roundtrip_and_legacy_messages_remain_valid() {
+        let legacy = r#"{"position":[1.0,2.0],"kind":"Move","buttons":0,"modifiers":0,"click_count":0}"#;
+        let mut event: EditorPointer = serde_json::from_str(legacy).unwrap();
+        assert!(event.timestamp_ms.is_none());
+        event.validate().unwrap();
+        event.timestamp_ms = Some(123_456);
+        let encoded = serde_json::to_vec(&event).unwrap();
+        let decoded: EditorPointer = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.timestamp_ms, event.timestamp_ms);
+        decoded.validate().unwrap();
+        event.timestamp_ms = Some(u64::MAX);
+        assert!(event.validate().is_err());
+    }
+
+    #[test]
     fn capture_error_history_is_bounded_and_preserves_the_first_failure() {
         let mut errors = CaptureErrors::default();
         errors.record("界".repeat(2048));
@@ -375,6 +417,7 @@ mod tests {
         frame.rgba.pop();
         assert!(frame.validate().is_err());
         let mut event = EditorPointer {
+            timestamp_ms: None,
             modifiers: 0,
             click_count: 1,
             position: [0.0, 0.0],
