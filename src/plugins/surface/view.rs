@@ -24,6 +24,8 @@ pub struct EditorView {
     popups: Vec<PopupTexture>,
     popup_rects: Vec<Rect>,
     popup_layer: Option<egui::LayerId>,
+    popup_anchor: Option<[f64; 2]>,
+    popup_offset: Option<egui::Vec2>,
     cancel_popup: bool,
     drag_popup: Option<PopupMapping>,
     clicks: ClickTracker,
@@ -249,9 +251,15 @@ impl EditorView {
         }
         self.native_size = Some(frame.native_size);
         self.native_units_per_point = Some(frame.native_units_per_point);
+        if frame.popups.iter().any(|popup| popup.interactive)
+            && !self.popups.iter().any(|popup| popup.interactive)
+        {
+            self.popup_offset = None;
+        }
         self.popups.truncate(frame.popups.len());
         if frame.popups.is_empty() {
             self.cancel_popup = false;
+            self.popup_offset = None;
         }
         for (index, popup) in frame.popups.into_iter().enumerate() {
             let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -309,6 +317,27 @@ impl EditorView {
             .copied()
             .reduce(Rect::union)
             .unwrap();
+        if self.popup_offset.is_none() {
+            // Some plugins clamp a menu to their physical monitor even though
+            // their private editor is offscreen. Present that menu by the click
+            // that opened it, while retaining its original native input origin.
+            self.popup_offset = Some(
+                if !bounds.intersects(screen)
+                    && self.popups.iter().any(|popup| popup.interactive)
+                    && let Some(anchor) = self.popup_anchor
+                {
+                    egui::vec2(anchor[0] as f32, anchor[1] as f32)
+                        - (bounds.min - screen.min) / scale
+                } else {
+                    egui::Vec2::ZERO
+                },
+            );
+        }
+        let offset = self.popup_offset.unwrap_or_default() * scale;
+        bounds = bounds.translate(offset);
+        for rect in &mut self.popup_rects {
+            *rect = rect.translate(offset);
+        }
         // The source's virtual desktop differs from the graph viewport. Keep the
         // menu on screen without changing its native coordinates or input mapping.
         let viewport = context.content_rect();
@@ -520,6 +549,9 @@ impl EditorView {
                 }
                 _ => 0,
             };
+            if matches!(kind, PointerKind::Down(_)) && popup.is_none() {
+                self.popup_anchor = Some(native_from_screen(screen, size, position));
+            }
             editor.pointer(EditorPointer {
                 timestamp_ms: super::pointer_timestamp_ms(),
                 modifiers: modifier_mask(modifiers),
@@ -626,6 +658,7 @@ impl EditorView {
         self.popup_layer = None;
         self.popup_rects.clear();
         self.popups.clear();
+        self.popup_offset = None;
         self.clicks = ClickTracker::default();
         Ok(())
     }
@@ -1171,6 +1204,80 @@ mod tests {
             drop(view);
             context.tex_manager().write().take_delta().clear();
         }
+    }
+
+    #[test]
+    fn monitor_clamped_menu_stays_at_its_opening_click_and_keeps_native_input() {
+        use crate::plugins::surface::EditorPopup;
+        let context = egui::Context::default();
+        let mut view = EditorView {
+            screen: Some(Rect::from_min_size(
+                egui::pos2(100.0, 80.0),
+                egui::vec2(626.0, 385.0),
+            )),
+            popup_anchor: Some([24.0, 392.0]),
+            ..Default::default()
+        };
+        view.update_texture(
+            &context,
+            EditorFrame {
+                width: 2,
+                height: 1,
+                native_size: (1252, 770),
+                native_units_per_point: 2.0,
+                rgba: vec![255; 8],
+                popups: vec![EditorPopup {
+                    origin: [1284.0, 802.0],
+                    width: 2,
+                    height: 1,
+                    native_size: (622, 708),
+                    rgba: vec![255; 8],
+                    interactive: true,
+                }],
+            },
+        );
+        let paint = |view: &mut EditorView| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(2000.0, 1600.0))),
+                    ..Default::default()
+                },
+                |ui| view.paint_popups(ui.ctx(), egui::Id::new("monitor-clamped-menu")),
+            );
+            output.textures_delta.clear();
+        };
+        paint(&mut view);
+        let first = view.popup_rects[0];
+        assert_eq!(first.min, egui::pos2(112.0, 276.0));
+        let native = view.native_position(
+            view.screen.unwrap(),
+            (1252, 770),
+            first.min + egui::vec2(10.0, 15.0),
+            Some(0),
+        );
+        assert!((native[0] - 1304.0).abs() < 0.001 && (native[1] - 832.0).abs() < 0.001);
+        view.last_position = Some(egui::pos2(900.0, 1000.0));
+        paint(&mut view);
+        assert_eq!(
+            view.popup_rects[0], first,
+            "menu must not chase the pointer"
+        );
+        view.screen = Some(Rect::from_min_size(
+            egui::pos2(200.0, 120.0),
+            egui::vec2(1252.0, 770.0),
+        ));
+        paint(&mut view);
+        let zoomed = view.popup_rects[0];
+        assert_eq!(zoomed.min, egui::pos2(224.0, 512.0));
+        let native = view.native_position(
+            view.screen.unwrap(),
+            (1252, 770),
+            zoomed.min + egui::vec2(20.0, 30.0),
+            Some(0),
+        );
+        assert!((native[0] - 1304.0).abs() < 0.001 && (native[1] - 832.0).abs() < 0.001);
+        drop(view);
+        context.tex_manager().write().take_delta().clear();
     }
 
     #[test]

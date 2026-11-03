@@ -27,6 +27,8 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use super::{Placement, Spot, WinEvent, WindowId};
 
+pub(crate) mod layered;
+
 const CLASS: PCWSTR = w!("nodeplayer-plugin-editor");
 // The Win32 bindings group this core mouse message under the optional Controls API.
 const WM_MOUSELEAVE: u32 = 0x02a3;
@@ -96,6 +98,7 @@ pub(crate) struct CaptureInput {
 
 impl CaptureInput {
     pub(crate) fn new(root: HWND) -> Result<Rc<Self>> {
+        layered::initialize()?;
         let input = Rc::new(Self {
             root,
             capture: Cell::new(HWND::default()),
@@ -192,7 +195,21 @@ impl CaptureInput {
             "subclass captured editor input"
         );
         self.hooks.borrow_mut().push(hwnd);
+        self.make_popup_passive(hwnd);
         Ok(())
+    }
+
+    fn make_popup_passive(&self, hwnd: HWND) {
+        if hwnd == self.root || unsafe { IsChild(self.root, hwnd) }.as_bool() || !self.owns(hwnd) {
+            return;
+        }
+        unsafe {
+            let current = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            let passive = (current | (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0) & !WS_EX_APPWINDOW.0;
+            if current != passive {
+                SetWindowLongW(hwnd, GWL_EXSTYLE, passive as i32);
+            }
+        }
     }
 
     pub(crate) fn refresh(&self) -> Result<()> {
@@ -270,6 +287,16 @@ impl CaptureInput {
 
     pub(crate) fn contains(&self, hwnd: HWND) -> bool {
         self.owns(hwnd)
+    }
+
+    fn for_window(hwnd: HWND) -> Option<Rc<Self>> {
+        CAPTURE_INPUTS.with(|inputs| {
+            inputs
+                .borrow()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|input| input.owns(hwnd))
+        })
     }
 
     pub(crate) fn cancel(&self) {
@@ -384,6 +411,14 @@ unsafe extern "system" fn capture_input_proc(
     // destruction are confined to this HWND's thread; no Rust mutable borrow spans a call.
     let input = unsafe { &*(data as *const CaptureInput) };
     let next = HWND(position.0 as *mut _);
+    if matches!(message, WM_NCCREATE | WM_SHOWWINDOW | WM_WINDOWPOSCHANGING) {
+        // CREATESTRUCT's extended styles can be overwritten after WH_CBT returns.
+        // Set the live HWND before its first show, and retain that policy on reuse.
+        input.make_popup_passive(hwnd);
+    }
+    if message == WM_MOUSEACTIVATE && input.owns(hwnd) {
+        return LRESULT(MA_NOACTIVATE as isize);
+    }
     if message == WM_WINDOWPOSCHANGING
         && hwnd != input.root
         && !unsafe { IsChild(input.root, hwnd) }.as_bool()
@@ -410,6 +445,7 @@ unsafe extern "system" fn capture_input_proc(
         }
         (change.x, change.y) = actual;
         change.flags &= !SWP_NOMOVE;
+        change.flags |= SWP_NOACTIVATE | SWP_NOOWNERZORDER;
     }
     if message == WM_CAPTURECHANGED {
         if hwnd == input.suppress_capture.get() && next.0.is_null()
@@ -447,6 +483,7 @@ unsafe extern "system" fn capture_input_proc(
         input.capture.set(HWND::default());
     }
     if message == WM_NCDESTROY {
+        layered::forget(hwnd);
         if input.capture.get() == hwnd {
             input.capture.set(HWND::default());
         }
@@ -465,7 +502,11 @@ unsafe extern "system" fn capture_input_proc(
     let _scope = (input.owns(hwnd)
         && matches!(message, WM_TIMER | WM_PAINT | WM_PRINT | WM_PRINTCLIENT | WM_MOUSELEAVE))
     .then(|| input.enter());
-    unsafe { DefSubclassProc(hwnd, message, value, position) }
+    let result = unsafe { DefSubclassProc(hwnd, message, value, position) };
+    if message == WM_NCCREATE {
+        input.make_popup_passive(hwnd);
+    }
+    result
 }
 
 unsafe extern "system" fn capture_create_proc(
@@ -473,18 +514,20 @@ unsafe extern "system" fn capture_create_proc(
     value: WPARAM,
     position: LPARAM,
 ) -> LRESULT {
+    // A captured editor's menus belong to the graph. Allow their native focus and
+    // capture bookkeeping without activating a private top-level window, which
+    // would deactivate the app and briefly change its window decorations.
+    if code == HCBT_ACTIVATE as i32
+        && CaptureInput::for_window(HWND(value.0 as *mut _)).is_some()
+    {
+        return LRESULT(1);
+    }
     if code == HCBT_CREATEWND as i32
         && let Some(create) = unsafe { (position.0 as *mut CBT_CREATEWNDW).as_mut() }
         && let Some(details) = unsafe { create.lpcs.as_mut() }
         && details.style as u32 & WS_CHILD.0 == 0
     {
-        let input = CAPTURE_INPUTS.with(|inputs| {
-            inputs
-                .borrow()
-                .iter()
-                .filter_map(Weak::upgrade)
-                .find(|input| input.owns(details.hwndParent))
-        });
+        let input = CaptureInput::for_window(details.hwndParent);
         if let Some(input) = input {
             let hwnd = HWND(value.0 as *mut _);
             // Every capture source installs this thread-wide callback. Later hook
@@ -492,6 +535,8 @@ unsafe extern "system" fn capture_create_proc(
             // logical origin recorded for this HWND.
             let first_attachment = !input.hooks.borrow().contains(&hwnd);
             if first_attachment && input.hook(hwnd).is_ok() {
+                details.dwExStyle |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+                details.dwExStyle &= !WS_EX_APPWINDOW;
                 input.remember_popup(
                     hwnd,
                     POINT {
@@ -514,6 +559,7 @@ impl Drop for CaptureInput {
         self.cancel();
         let ptr = self as *const Self as usize;
         for hwnd in self.hooks.get_mut().drain(..) {
+            layered::forget(hwnd);
             unsafe {
                 let _ = RemoveWindowSubclass(hwnd, Some(capture_input_proc), ptr);
             }
@@ -522,13 +568,7 @@ impl Drop for CaptureInput {
 }
 
 fn with_capture_input<T>(hwnd: HWND, operation: impl FnOnce() -> T) -> T {
-    let input = CAPTURE_INPUTS.with(|inputs| {
-        inputs
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .find(|input| input.owns(hwnd))
-    });
+    let input = CaptureInput::for_window(hwnd);
     let _scope = input.as_ref().map(|input| input.enter());
     operation()
 }
@@ -696,6 +736,9 @@ impl HostWindow {
         title: &str,
         _announce: bool,
     ) -> Result<Self> {
+        if placement == Placement::CaptureSource {
+            layered::initialize()?;
+        }
         register_class();
         let (w, h) = (w.clamp(16, 8192), h.clamp(16, 8192));
         let state = Box::new(State {
