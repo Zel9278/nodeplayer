@@ -9,7 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
@@ -71,14 +71,17 @@ impl HostWindow {
                     WindowClass::INPUT_OUTPUT,
                     visual,
                     &aux.event_mask(EventMask::STRUCTURE_NOTIFY),
-                )?;
-                conn.change_property8(PropMode::REPLACE, id, AtomEnum::WM_NAME, AtomEnum::STRING, title.as_bytes())?;
+                )?
+                .check()
+                .context("create the native editor window")?;
+                conn.change_property8(PropMode::REPLACE, id, AtomEnum::WM_NAME, AtomEnum::STRING, title.as_bytes())?
+                    .check()?;
                 let net_name = conn.intern_atom(false, b"_NET_WM_NAME")?.reply()?.atom;
                 let utf8 = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
-                conn.change_property8(PropMode::REPLACE, id, net_name, utf8, title.as_bytes())?;
+                conn.change_property8(PropMode::REPLACE, id, net_name, utf8, title.as_bytes())?.check()?;
                 let protocols = conn.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
                 wm_delete = conn.intern_atom(false, b"WM_DELETE_WINDOW")?.reply()?.atom;
-                conn.change_property32(PropMode::REPLACE, id, protocols, AtomEnum::ATOM, &[wm_delete])?;
+                conn.change_property32(PropMode::REPLACE, id, protocols, AtomEnum::ATOM, &[wm_delete])?.check()?;
                 (id, None)
             }
             Placement::CaptureSource => {
@@ -96,30 +99,35 @@ impl HostWindow {
                     visual,
                     &aux.override_redirect(1).event_mask(EventMask::STRUCTURE_NOTIFY),
                 )?
-                .check()?;
+                .check()
+                .context("create the offscreen editor source")?;
                 // Stay mapped for XComposite, but never become a managed desktop
                 // window or a physical pointer target. Synthetic input is delivered
                 // directly to the plugin descendants by the capture adapter.
                 conn.shape_rectangles(shape::SO::SET, shape::SK::INPUT, ClipOrdering::UNSORTED, id, 0, 0, &[])?
-                    .check()?;
+                    .check()
+                    .context("disable physical input to the offscreen editor source")?;
                 (id, None)
             }
             Placement::Embedded(parent) => {
+                let parent = u32::try_from(parent).context("embedded editor parent exceeds the XID range")?;
+                ensure!(parent != x11rb::NONE, "empty embedded editor parent");
                 let container = conn.generate_id()?;
-                conn.create_window(depth, container, parent as u32, 0, 0, w, h, 0, WindowClass::INPUT_OUTPUT, visual, &aux)?;
+                conn.create_window(depth, container, parent, 0, 0, w, h, 0, WindowClass::INPUT_OUTPUT, visual, &aux)?
+                    .check()
+                    .context("create the embedded editor container")?;
                 let id = conn.generate_id()?;
-                conn.create_window(depth, id, container, 0, 0, w, h, 0, WindowClass::INPUT_OUTPUT, visual, &aux)?;
+                conn.create_window(depth, id, container, 0, 0, w, h, 0, WindowClass::INPUT_OUTPUT, visual, &aux)?
+                    .check()
+                    .context("create the embedded editor parent")?;
                 (id, Some(container))
             }
         };
-        // Embedded containers stay unmapped until the host places them.
-        if placement == Placement::CaptureSource {
-            // Capture attaches through another X11 connection immediately after
-            // creation, so mapping must have completed before handing it the XID.
-            conn.map_window(id)?.check()?;
-        } else {
-            conn.map_window(id)?;
-        }
+        // Embedded containers stay unmapped until the host places them. The plugin
+        // reparents through another X11 connection as soon as this returns: flush
+        // alone cannot order those client queues. Checking the requests reports
+        // server errors here and completes a round trip before exposing the XID.
+        conn.map_window(id)?.check().context("map the native editor parent")?;
         conn.flush()?;
         Ok(Self {
             conn,
