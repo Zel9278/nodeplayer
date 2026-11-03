@@ -12,6 +12,7 @@ pub mod timing;
 use compensation::EdgeDelay;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -19,6 +20,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 pub const MAX_BLOCK: usize = 1024;
 pub const MAX_NODES: usize = 1024;
 const CMD_QUEUE_LEN: usize = 1024;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct StereoBuf {
     pub l: Vec<f32>,
@@ -334,6 +336,29 @@ struct AudioState {
 }
 
 impl AudioState {
+    /// Finish plugin processing on the thread that ran it. Ownership is then handed back
+    /// to the control thread rather than freeing processors in the audio callback.
+    fn deactivate_all(&mut self) {
+        for slot in self.slots.iter_mut().flatten() {
+            let _g = slot.tag.as_deref().map(crate::plugins::guard::enter_borrowed);
+            slot.proc.deactivate();
+        }
+    }
+
+    fn retire(mut self) {
+        // Commands not applied before shutdown can also own plugin processors. Retire
+        // these on the control thread while their UI-side instances are still alive.
+        while let Ok(command) = self.cmd_rx.pop() {
+            drop(command);
+        }
+        for slot in &mut self.slots {
+            if let Some(slot) = slot.take() {
+                let _g = slot.tag.as_deref().map(crate::plugins::guard::enter_borrowed);
+                drop(slot);
+            }
+        }
+    }
+
     fn throw_away(&mut self, g: Garbage) {
         if let Err(rtrb::PushError::Full(g)) = self.garbage_tx.push(g) {
             // Should never happen with a sane queue size; leak rather than free on this thread.
@@ -546,9 +571,38 @@ impl AudioState {
     }
 }
 
+/// One owner holds the processing state: the startup cell, the audio thread, or the
+/// returned-state channel. Receiving that state is the shutdown completion handshake.
+struct AudioShutdown {
+    stop: Arc<AtomicBool>,
+    startup: Arc<std::sync::Mutex<Option<AudioState>>>,
+    returned: crossbeam_channel::Receiver<AudioState>,
+    null_thread: Option<std::thread::JoinHandle<()>>,
+    result: Option<bool>,
+}
+
+impl AudioShutdown {
+    fn take_returned(&self) -> Option<AudioState> {
+        self.returned.try_recv().ok().or_else(|| {
+            // A device that never called back, or an immediate close before the null
+            // thread starts, has no running processors. Claim its untouched state here.
+            self.startup.try_lock().ok()?.take()
+        })
+    }
+}
+
+fn return_audio_state(mut state: AudioState, returned: &crossbeam_channel::Sender<AudioState>) {
+    state.deactivate_all();
+    if let Err(error) = returned.try_send(state) {
+        // The UI already timed out and retained the plugin owners. Never destroy the
+        // remaining processor references on this thread after abandoning the handshake.
+        std::mem::forget(error.into_inner());
+    }
+}
+
 pub struct Engine {
     _stream: Option<cpal::Stream>,
-    null_stop: Option<Arc<AtomicBool>>,
+    shutdown: AudioShutdown,
     status: Arc<EngineStatus>,
     cmd_tx: rtrb::Producer<Command>,
     /// Control-side FIFO only. Legacy send cannot return ownership on pressure, so retains
@@ -585,10 +639,14 @@ impl Engine {
             status: status.clone(),
         };
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(state)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (returned_tx, returned) = crossbeam_channel::bounded(1);
         let diagnostic = crate::diagnostics::active().filter(|run| run.metrics.enabled());
 
         let build = |config: cpal::StreamConfig| {
             let state = state.clone();
+            let stop = stop.clone();
+            let returned_tx = returned_tx.clone();
             let diagnostic = diagnostic.clone();
             let mut previous_callback: Option<std::time::Instant> = None;
             let mut local: Option<AudioState> = None;
@@ -599,6 +657,13 @@ impl Engine {
                     // Take ownership of the state on the first callback; no locking afterwards.
                     if local.is_none() {
                         local = state.try_lock().ok().and_then(|mut s| s.take());
+                    }
+                    if stop.load(Ordering::Acquire) {
+                        if let Some(state) = local.take() {
+                            return_audio_state(state, &returned_tx);
+                        }
+                        data.fill(0.0);
+                        return;
                     }
                     match &mut local {
                         Some(s) => s.render(data, channels),
@@ -639,7 +704,7 @@ impl Engine {
 
         Ok(Self {
             _stream: Some(stream),
-            null_stop: None,
+            shutdown: AudioShutdown { stop, startup: state, returned, null_thread: None, result: None },
             status,
             cmd_tx,
             pending: Default::default(),
@@ -651,7 +716,8 @@ impl Engine {
     }
 
     /// Diagnostic silent output: executes the same DSP and commands without opening a device.
-    /// Stop is nonblocking, even if a local plugin hangs; process-level watchdog remains needed.
+    /// Shutdown has a bounded completion handshake; a hung local plugin requires retaining
+    /// its instance for process lifetime (see [`Self::shutdown`]).
     pub fn start_null(sample_rate: u32, block_size: usize) -> Result<Self> {
         anyhow::ensure!(sample_rate > 0, "null sample rate must be nonzero");
         anyhow::ensure!(
@@ -661,7 +727,7 @@ impl Engine {
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(CMD_QUEUE_LEN);
         let (garbage_tx, garbage_rx) = rtrb::RingBuffer::new(CMD_QUEUE_LEN);
         let status = Arc::new(EngineStatus::default());
-        let mut state = AudioState {
+        let state = AudioState {
             slots: (0..MAX_NODES).map(|_| None).collect(),
             schedule: Box::default(),
             cmd_rx,
@@ -671,11 +737,15 @@ impl Engine {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let state = Arc::new(std::sync::Mutex::new(Some(state)));
+        let startup = state.clone();
+        let (returned_tx, returned) = crossbeam_channel::bounded(1);
         let mut output = vec![0.0; block_size * 2];
         let diagnostic = crate::diagnostics::active().filter(|run| run.metrics.enabled());
-        std::thread::Builder::new()
+        let null_thread = std::thread::Builder::new()
             .name("nodeplayer-null-audio".into())
             .spawn(move || {
+                let Some(mut state) = startup.lock().unwrap().take() else { return };
                 let period =
                     std::time::Duration::from_secs_f64(block_size as f64 / sample_rate as f64);
                 let mut deadline = std::time::Instant::now();
@@ -690,15 +760,16 @@ impl Engine {
                     deadline += period;
                     let now = std::time::Instant::now();
                     if deadline > now {
-                        std::thread::sleep(deadline - now);
+                        std::thread::park_timeout(deadline - now);
                     } else {
                         deadline = now;
                     }
                 }
+                return_audio_state(state, &returned_tx);
             })?;
         Ok(Self {
             _stream: None,
-            null_stop: Some(stop),
+            shutdown: AudioShutdown { stop, startup: state, returned, null_thread: Some(null_thread), result: None },
             status,
             cmd_tx,
             pending: Default::default(),
@@ -711,6 +782,55 @@ impl Engine {
 
     pub fn sample_clock(&self) -> u64 {
         self.status.sample_clock.load(Ordering::Acquire)
+    }
+
+    /// Stop DSP and retire its references before the caller destroys plugin instances.
+    /// Returns false after a bounded wait if a callback or plugin will not finish. In that
+    /// case the caller must retain its plugin instances/modules for process lifetime; the
+    /// engine also retains a live device stream rather than blocking or racing its callback.
+    /// A process watchdog is still required for a wedged in-process plugin.
+    pub fn shutdown(&mut self) -> bool {
+        self.shutdown_with_timeout(SHUTDOWN_TIMEOUT)
+    }
+
+    fn shutdown_with_timeout(&mut self, timeout: Duration) -> bool {
+        if let Some(result) = self.shutdown.result {
+            return result;
+        }
+        self.shutdown.stop.store(true, Ordering::Release);
+        if let Some(thread) = &self.shutdown.null_thread {
+            thread.thread().unpark();
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(state) = self.shutdown.take_returned() {
+                state.retire();
+                self.pending.clear();
+                while let Ok(garbage) = self.garbage_rx.pop() {
+                    drop(garbage);
+                }
+                self.shutdown.result = Some(true);
+                // After the state handoff, future device callbacks can only fill silence.
+                drop(self._stream.take());
+                if let Some(thread) = self.shutdown.null_thread.take()
+                    && thread.is_finished()
+                {
+                    let _ = thread.join();
+                }
+                return true;
+            }
+            if Instant::now() >= deadline {
+                self.shutdown.result = Some(false);
+                // Dropping a device stream can join its callback thread. A plugin stuck
+                // inside that callback must not turn GUI teardown into an unbounded join.
+                if let Some(stream) = self._stream.take() {
+                    std::mem::forget(stream);
+                }
+                log::error!("audio shutdown did not complete; plugin lifetimes must be retained");
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())));
+        }
     }
 
     /// ACK for the currently applied timing plan; 0 denotes legacy/off.
@@ -760,9 +880,7 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        if let Some(stop) = &self.null_stop {
-            stop.store(true, Ordering::Release);
-        }
+        let _ = self.shutdown();
     }
 }
 
