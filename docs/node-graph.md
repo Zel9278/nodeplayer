@@ -18,6 +18,7 @@ reaches an **Output** node is what you hear.
 - **Zoom**: Ctrl+wheel or pinch on a supported touchpad. Zoom and two-finger panning preserve
   small movements without snapping. The zoom is shown in the corner; click it to go back to
   100%, where text is sharpest. Double-click empty space to fit the graph.
+  Embedded plugin editor images scale on every gesture frame with their nodes.
 
 Nodes that aren't connected to anything still run, so a visualizer can hang off any output
 as a dead end.

@@ -51,11 +51,12 @@ enables only delay compensation. See the [remote backend](<../src/plugins/remote
 for architecture and limitations. Machine-specific plugins, diagnostic scenarios and
 private notes can be kept under the ignored `.local/` directory.
 
-Captured editor presentation is independently enabled with `--experimental-editor-capture`.
-It works with local hosting or alongside `--experimental-plugin-isolation`; on macOS the
-latter requires capture, since native NSView parenting cannot cross a process boundary.
-Captured editors use a private native rendering host, and graph zoom never requests
-a plugin UI-scale change.
+Embedded VST3/CLAP editors always use captured presentation on macOS, Windows and Linux,
+with local hosting or `--experimental-plugin-isolation`. The legacy
+`--experimental-editor-capture` argument is still accepted by existing launch commands.
+Captured editors use a private native rendering host. Graph zoom transforms the latest
+image on every frame without waiting for capture, resizing the source, or requesting a
+plugin UI-scale change. Popped-out editors use native windows.
 Capture and graph repaint scheduling target 240 Hz. Actual delivery depends on the
 plugin's renderer, native capture cost and event loop; delivered frames do not measure
 compositor presentation. Workers poll control readiness without blocking their native

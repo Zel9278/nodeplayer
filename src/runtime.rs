@@ -10,7 +10,6 @@ use std::{
 pub const HELP: &str = "nodeplayer [options] [file-or-folder]\n\
   --experimental-pdc                 Enable experimental delay compensation\n\
   --experimental-plugin-isolation    Request plugin isolation (also enables PDC)\n\
-  --experimental-editor-capture      Composite plugin editors in the graph\n\
   --data-root <directory>             Separate config/cache/state/data\n\
   --diagnostic-scenario <json>        Run an explicit, restricted scenario\n\
   --diagnostic-output <directory>     New, exclusive artifact directory\n\
@@ -47,7 +46,6 @@ pub struct DiagnosticOptions {
 pub struct RuntimeOptions {
     pub experimental_pdc: bool,
     pub experimental_plugin_isolation: bool,
-    pub experimental_editor_capture: bool,
     pub data_root: Option<PathBuf>,
     pub diagnostic: Option<DiagnosticOptions>,
 }
@@ -170,6 +168,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
     let mut help = false;
     let mut literal = false;
     let mut unknown_options = Vec::new();
+    let mut legacy_capture_flag = false;
     while let Some(arg) = args.next() {
         if literal {
             positional.push(arg);
@@ -184,7 +183,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
             Some("--help" | "-h") => help = true,
             Some("--experimental-pdc") => options.experimental_pdc = true,
             Some("--experimental-plugin-isolation") => options.experimental_plugin_isolation = true,
-            Some("--experimental-editor-capture") => options.experimental_editor_capture = true,
+            // Embedded editors always use capture; accept existing launch commands.
+            Some("--experimental-editor-capture") => legacy_capture_flag = true,
             Some("--data-root") => {
                 if options.data_root.is_some() {
                     bail!("duplicate --data-root");
@@ -263,7 +263,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
         options.experimental_plugin_isolation = true;
     }
     options.experimental_pdc |= options.experimental_plugin_isolation;
-    if !unknown_options.is_empty() && (options.experimental_pdc || options.experimental_plugin_isolation || options.experimental_editor_capture) {
+    if !unknown_options.is_empty() && (options.experimental_pdc || options.experimental_plugin_isolation || legacy_capture_flag) {
         bail!("unknown option {:?}; use -- before a path beginning with '-'", unknown_options[0]);
     }
     if let Some(scenario) = scenario {
@@ -351,7 +351,7 @@ mod tests {
         let p = parse(&["--experimental-plugin-isolation", "--data-root", "a b"]).unwrap();
         assert!(p.options.experimental_pdc && p.options.experimental_plugin_isolation);
         let capture = parse(&["--experimental-editor-capture"]).unwrap();
-        assert!(capture.options.experimental_editor_capture);
+        assert!(matches!(capture.mode, Mode::Gui { initial_file: None }));
         assert!(!capture.options.experimental_plugin_isolation && !capture.options.experimental_pdc);
         assert!(parse(&["--experimental-editor-capture", "--unknown"]).is_err());
         assert!(matches!(parse(&["--unknown"]).unwrap().mode, Mode::Gui { .. }));

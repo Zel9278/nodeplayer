@@ -63,6 +63,8 @@ fn with_native_pool<T>(operation: impl FnOnce() -> T) -> T {
     }
 }
 fn worker_main_inner(args: &[OsString]) -> Result<()> {
+    #[cfg(windows)]
+    crate::plugins::window::initialize_worker_dpi()?;
     if args.len() != 3 {
         bail!("invalid plugin worker arguments")
     }
@@ -233,7 +235,7 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                     | Command::Load(_)
                     | Command::Open { .. }
                     | Command::Place(_, _)
-                    | Command::Zoom(_, _)
+                    | Command::DisplayScale(_, _)
                     | Command::Close(_)
             );
             let result: Result<()> = (|| {
@@ -286,21 +288,26 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                         if token == 0 || token <= editor_id {
                             bail!("invalid editor token")
                         }
-                        if captured && !matches!(placement, Placement::Embedded(_)) {
-                            bail!("captured editor must be presented inside the graph")
+                        if captured != matches!(placement, Placement::Embedded(_)) {
+                            bail!("embedded editor requires captured presentation")
                         }
                         surface = None;
-                        editor = None;
-                        let source = instance.open_editor(if captured {
-                            Placement::CaptureSource
-                        } else {
-                            placement
-                        })?;
-                        editor = Some(if captured {
-                            crate::plugins::surface::capture(source, placement)?
-                        } else {
-                            source
-                        });
+                        drop(editor.take());
+                        // An unsupported renderer or native GUI setup error belongs to
+                        // this editor, not to the healthy audio processor. Retain an
+                        // error proxy so metadata and Pop out remain usable.
+                        editor = Some(editor_or_error(placement, captured, || {
+                            let source = instance.open_editor(if captured {
+                                Placement::CaptureSource
+                            } else {
+                                placement
+                            })?;
+                            if captured {
+                                crate::plugins::surface::capture(source, placement)
+                            } else {
+                                Ok(source)
+                            }
+                        }));
                         editor_id = token;
                     }
                     Command::SetSurface(token, descriptor) => {
@@ -339,15 +346,12 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                             e.place(spot.as_ref());
                         }
                     }
-                    Command::Zoom(token, f) => {
-                        if !f.is_finite() {
-                            bail!("invalid editor zoom")
+                    Command::DisplayScale(token, factor) => {
+                        if !crate::plugins::surface::valid_display_scale(factor) {
+                            bail!("invalid editor display density")
                         }
-                        if token == editor_id
-                            && let Some(e) = editor.as_mut()
-                            && !e.is_captured()
-                        {
-                            e.set_zoom(f.clamp(0.1, 8.0));
+                        if token == editor_id && let Some(editor) = editor.as_mut() {
+                            editor.set_display_scale(factor);
                         }
                     }
                     Command::Close(token) => {
@@ -408,6 +412,38 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
         }
     }
 }
+
+fn editor_or_error(
+    placement: Placement,
+    captured: bool,
+    open: impl FnOnce() -> Result<Box<dyn Editor>>,
+) -> Box<dyn Editor> {
+    open().unwrap_or_else(|error| {
+        Box::new(EditorOpenError {
+            placement,
+            captured,
+            message: format!("Unable to open editor: {error:#}; try Pop out")
+                .chars().take(1024).collect(),
+        })
+    })
+}
+
+struct EditorOpenError {
+    placement: Placement,
+    captured: bool,
+    message: String,
+}
+
+impl Editor for EditorOpenError {
+    fn placement(&self) -> Placement { self.placement }
+    fn size(&self) -> (u32, u32) { (640, 480) }
+    fn ready(&self) -> bool { false }
+    fn is_captured(&self) -> bool { self.captured }
+    fn capture_error(&self) -> Option<&str> { Some(&self.message) }
+    fn place(&mut self, _: Option<&crate::plugins::Spot>) {}
+    fn idle(&mut self) -> bool { true }
+}
+
 fn request_pending(socket: &mut TcpStream) -> Result<bool> {
     // Readiness is separate from the framed request deadline. A blocking peek here used
     // to stall every native UI/capture service pass for 8 ms with a quiet parent.
@@ -440,7 +476,7 @@ fn metadata_changed(
         || i.latency() != cached.latency
         || i.midi_ports() != cached.midi
         || i.has_editor() != cached.editor
-        || e.is_some() != cached.editor_open
+        || e.as_ref().is_some_and(|editor| editor.ready()) != cached.editor_open
         || e.as_ref().map(|e| e.size()).unwrap_or((640, 480)) != cached.editor_size
         || editor_id != cached.editor_id
         || e.as_ref().and_then(|e| e.capture_error()) != cached.editor_error.as_deref()
@@ -493,7 +529,7 @@ fn metadata(i: &dyn Instance, e: &Option<Box<dyn Editor>>, editor_id: u64) -> Re
         instrument: i.info().is_instrument(),
         editor: i.has_editor(),
         editor_size: e.as_ref().map(|e| e.size()).unwrap_or((640, 480)),
-        editor_open: e.is_some(),
+        editor_open: e.as_ref().is_some_and(|editor| editor.ready()),
         editor_id,
         editor_error,
         editor_first_error,
@@ -705,6 +741,22 @@ impl Drop for ComInit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_editor_open_stays_available_as_a_bounded_error() {
+        let mut editor = editor_or_error(Placement::Embedded(1), true, || {
+            anyhow::bail!("capture backend unavailable")
+        });
+        assert!(editor.is_captured());
+        assert!(!editor.ready());
+        assert!(editor.idle(), "an editor setup error must not fault its instance");
+        assert!(editor.take_frame().is_none());
+        assert!(editor.capture_error().unwrap().contains("capture backend unavailable"));
+        let long = editor_or_error(Placement::Embedded(1), true, || {
+            anyhow::bail!("界".repeat(4096))
+        });
+        assert!(long.capture_error().unwrap().len() <= 4096);
+    }
 
     #[test]
     fn metadata_reports_capture_failure_that_recovers_before_polling() {

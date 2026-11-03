@@ -75,8 +75,7 @@ impl PluginNode {
     pub fn open_editor(&mut self, placement: Placement) -> anyhow::Result<()> {
         self.editor = None;
         self.editor_view = Default::default();
-        self.editor = Some(if crate::runtime::get().experimental_editor_capture
-            && matches!(placement, Placement::Embedded(_)) && self.instance.remote_status().is_none()
+        self.editor = Some(if matches!(placement, Placement::Embedded(_)) && self.instance.remote_status().is_none()
             && matches!(self.info().format, Format::Vst3 | Format::Clap)
         {
             let source = self.instance.open_editor(Placement::CaptureSource)?;

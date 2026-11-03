@@ -358,7 +358,7 @@ pub fn prepare(options: &mut RuntimeOptions) -> Result<Option<DiagnosticRun>> {
         "target": option_env!("TARGET"), "started_unix_ms": unix_ms(),
         "experimental_pdc": options.experimental_pdc || options.experimental_plugin_isolation,
         "experimental_plugin_isolation": options.experimental_plugin_isolation,
-        "experimental_editor_capture": options.experimental_editor_capture,
+        "editor_presentation": "captured",
         "deadline_ms": duration.as_millis(), "metrics_mode": metrics_mode,
         "scenario": scenario.name, "scenario_mode": scenario.mode,
         "health_policy": scenario.health,

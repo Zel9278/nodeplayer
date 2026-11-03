@@ -3228,7 +3228,8 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                             }
                         }
                     }
-                    if p.is_embedded()
+                    if p.instance.has_editor()
+                        && p.editor.as_ref().is_none_or(|editor| editor.placement() != Placement::Window)
                         && ui
                             .button("Pop out")
                             .on_hover_text("open in its own window")
@@ -3250,6 +3251,11 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                         }
                     });
                 }
+                if !p.is_embedded()
+                    && let Some(error) = p.editor.as_ref().and_then(|editor| editor.capture_error())
+                {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
                 if p.instance.latency() > 0 {
                     let bridge = p.instance.bridge_latency();
                     ui.small(format!(
@@ -3265,30 +3271,19 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                 let embedded = p.is_embedded();
                 let PluginNode { editor, editor_view, .. } = &mut **p;
                 if let Some(ed) = editor.as_mut().filter(|_| embedded) {
-                    // Reserve the editor's actual pixel size on screen; the X11 child window is
-                    // moved over this rect after the graph is drawn. The editor is asked to
-                    // follow the zoom, which it does if it can scale or resize.
-                    // macOS editors count in points and handle Retina themselves.
+                    // The image stays in graph coordinates and follows this frame's layer
+                    // transform, even when no new native image arrives during a gesture.
+                    // macOS source editors count in points and handle Retina themselves.
                     let ppp = if cfg!(target_os = "macos") {
                         self.ppp / ui.ctx().native_pixels_per_point().unwrap_or(1.0)
                     } else {
                         self.ppp
                     };
                     let xf = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or_default();
-                    let rect = if ed.is_captured() {
-                        let rect = editor_view.paint(ui, ed.as_mut(), ppp);
-                        if ui.ctx().input(|input| input.modifiers.alt) && ui.ctx().pointer_latest_pos().is_some_and(|point| (xf * rect).contains(point)) {
-                            self.wants_scroll = true;
-                        }
-                        rect
-                    } else {
-                        ed.set_zoom(ppp * xf.scaling);
-                        let (w, h) = ed.size();
-                        let k = ppp * xf.scaling;
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(w as f32 / k, h as f32 / k), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 0.0, Color32::from_gray(16));
-                        rect
-                    };
+                    let rect = editor_view.paint(ui, ed.as_mut(), ppp);
+                    if ui.ctx().input(|input| input.modifiers.alt) && ui.ctx().pointer_latest_pos().is_some_and(|point| (xf * rect).contains(point)) {
+                        self.wants_scroll = true;
+                    }
                     let screen = xf * rect;
                     let clip = (xf * ui.clip_rect()).intersect(screen);
                     if clip.is_positive() {
@@ -3583,8 +3578,79 @@ fn fmt_time(secs: f64) -> String {
 #[cfg(test)]
 mod graph_zoom_tests {
     use super::*;
+    use crate::plugins::{Editor, Instance, ParamDesc};
+    use crate::plugins::surface::EditorFrame;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     const POINTER: Pos2 = egui::pos2(173.25, 149.75);
+
+    struct EditorFixture {
+        info: PluginInfo,
+        opened: Rc<RefCell<Vec<Placement>>>,
+    }
+
+    impl Instance for EditorFixture {
+        fn info(&self) -> &PluginInfo { &self.info }
+        fn params(&self) -> &[ParamDesc] { &[] }
+        fn param_value(&self, _: u32) -> f64 { 0.0 }
+        fn param_display(&self, _: u32, _: f64) -> String { String::new() }
+        fn set_param(&mut self, _: u32, _: f64) {}
+        fn save_state(&self) -> Option<Vec<u8>> { None }
+        fn load_state(&mut self, _: &[u8]) -> anyhow::Result<()> { Ok(()) }
+        fn has_editor(&self) -> bool { true }
+        fn open_editor(&mut self, placement: Placement) -> anyhow::Result<Box<dyn Editor>> {
+            self.opened.borrow_mut().push(placement);
+            if placement == Placement::Window {
+                return Ok(Box::new(StaticEditor { frame: None, placement }));
+            }
+            anyhow::bail!("fixture records placement without creating a native window")
+        }
+    }
+
+    fn editor_fixture(format: plugins::Format) -> EditorFixture {
+        EditorFixture {
+            info: PluginInfo {
+                format,
+                id: "graph-editor-fixture".into(),
+                name: "Graph editor fixture".into(),
+                vendor: String::new(),
+                category: String::new(),
+                path: PathBuf::new(),
+            },
+            opened: Rc::default(),
+        }
+    }
+
+    struct StaticEditor {
+        frame: Option<EditorFrame>,
+        placement: Placement,
+    }
+
+    impl Editor for StaticEditor {
+        fn placement(&self) -> Placement { self.placement }
+        fn size(&self) -> (u32, u32) { (320, 180) }
+        fn is_captured(&self) -> bool { matches!(self.placement, Placement::Embedded(_)) }
+        fn take_frame(&mut self) -> Option<EditorFrame> { self.frame.take() }
+        fn place(&mut self, _: Option<&plugins::Spot>) {
+            panic!("graph gestures must not place the native source")
+        }
+        fn idle(&mut self) -> bool { true }
+    }
+
+    #[test]
+    fn embedded_editors_capture_without_flags_and_popouts_open_natively() {
+        for format in [plugins::Format::Clap, plugins::Format::Vst3] {
+            let fixture = editor_fixture(format);
+            let opened = fixture.opened.clone();
+            let mut plugin = PluginNode::new(Box::new(fixture));
+            assert!(plugin.open_editor(Placement::Embedded(1)).is_err());
+            assert!(plugin.editor.is_none());
+            plugin.open_editor(Placement::Window).unwrap();
+            assert_eq!(plugin.editor.as_ref().unwrap().placement(), Placement::Window);
+            assert_eq!(*opened.borrow(), [Placement::CaptureSource, Placement::Window]);
+        }
+    }
 
     fn gesture_frames(
         initial: f32,
@@ -3594,8 +3660,24 @@ mod graph_zoom_tests {
         let context = egui::Context::default();
         let player = Player::new(48_000);
         let mut graph = Snarl::new();
+        let mut plugin = PluginNode::new(Box::new(editor_fixture(plugins::Format::Clap)));
+        // A single image must keep scaling throughout every gesture, even if the
+        // native plugin never delivers another frame.
+        plugin.editor = Some(Box::new(StaticEditor { frame: Some(EditorFrame {
+            width: 320,
+            height: 180,
+            native_size: (320, 180),
+            native_units_per_point: 1.0,
+            rgba: vec![255; 320 * 180 * 4],
+            popups: Vec::new(),
+        }), placement: Placement::Embedded(1) }));
+        let plugin_id = graph.insert_node(Pos2::ZERO, GraphNode {
+            eid: 1,
+            kind: NodeKind::Plugin(Box::new(plugin)),
+        });
         let mut zoom = initial;
         let mut samples = Vec::new();
+        let mut editor_texture = None;
         let id = egui::Id::new("zoom-regression");
         for frame in 0..60 {
             let mut events = vec![egui::Event::PointerMoved(POINTER)];
@@ -3646,8 +3728,27 @@ mod graph_zoom_tests {
                 assert_eq!(transform.scaling, zoom);
                 samples.push(transform);
             });
+            if editor_texture.is_none() {
+                editor_texture = output.textures_delta.set.iter().find_map(|(id, delta)| {
+                    delta.iter().any(|image| image.image.size() == [320, 180]).then_some(*id)
+                });
+            }
             output.textures_delta.clear();
+            let primitives = context.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+            let mesh = primitives.iter().find_map(|primitive| match &primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) if Some(mesh.texture_id) == editor_texture => Some(mesh),
+                _ => None,
+            }).expect("the embedded plugin image must be painted on every gesture frame");
+            let bounds = egui::Rect::from_points(&mesh.vertices.iter().map(|vertex| vertex.pos).collect::<Vec<_>>());
+            let expected = egui::vec2(320.0, 180.0) * zoom;
+            assert!((bounds.size() - expected).abs().max_elem() <= (zoom + 1.0) / output.pixels_per_point + 0.001,
+                "editor image lagged graph zoom on frame {frame} at DPI {ppp}: {:?} != {expected:?}", bounds.size());
+            let NodeKind::Plugin(plugin) = &graph[plugin_id].kind else { unreachable!() };
+            assert_eq!(plugin.editor.as_ref().unwrap().size(), (320, 180));
+            assert_eq!(plugin.editor_view.dimensions(), Some(((320, 180), [320, 180])));
         }
+        drop(graph);
+        context.tex_manager().write().take_delta().clear();
         samples
     }
 

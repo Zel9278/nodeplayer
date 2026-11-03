@@ -31,14 +31,12 @@ The data folder is listed in [Files and troubleshooting](files-and-troubleshooti
 - **Params** opens a list of all parameters with sliders.
 - **Bypass** lets the audio through untouched.
 
-The graph zoom is passed on to editors that can scale (LSP plugins, among others); editors
-that can only be resized get the zoomed size, and the rest keep their own size. Menus,
-windows, tooltips and nodes in front of an editor show over it, and clicks there go to them,
-not to the plugin.
-
-`--experimental-editor-capture` displays VST3/CLAP editors as images in the graph.
-The editor image, frame, and overlapping UI zoom and move together without changing the
-plugin's own UI scale. A private native host keeps the editor rendering without opening
+VST3/CLAP editors are drawn as images in the graph on macOS, Windows and Linux.
+The editor image, node frame, and overlapping UI follow every zoom and pan frame,
+including touchpad gestures, without changing the plugin's own UI scale or size.
+Scaling uses the latest image immediately, independently of the plugin's drawing rate.
+Menus, windows, tooltips and nodes in front of an editor show over it, and clicks there
+go to them. A private native host keeps the editor rendering without opening
 a second desktop window. Closing the graph editor also destroys its native host.
 Clicks and drags are forwarded to the source, and Alt+wheel forwards wheel input.
 Pointer events retain Shift, Control and Alt/Option state for modified and fine drags.
@@ -49,8 +47,8 @@ Windows layered popup bitmaps cannot be read by this capture backend; an error d
 you to **Pop out** when a plugin opens one.
 Keyboard/IME, drag-and-drop, blocking native menus, and unrelated popup windows are
 not forwarded; use **Pop out** for those interactions. Capture can
-fail for some GPU-rendered editors. The flag also works with
-`--experimental-plugin-isolation`, where capture and native input stay in the worker.
+fail for some GPU-rendered editors. With `--experimental-plugin-isolation`,
+capture and native input stay in the worker.
 On macOS, isolation requires this captured-editor mode. Linux requires X11/XWayland.
 
 JSFX nodes show the effect's visible sliders, and effects with graphics (`@gfx`) draw them in

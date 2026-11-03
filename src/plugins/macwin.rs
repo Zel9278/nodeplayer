@@ -141,9 +141,6 @@ pub struct HostWindow {
     /// The editor's own window otherwise.
     window: Option<Retained<NSWindow>>,
     pub placement: Placement,
-    /// Content scale the plugin currently draws at, and its size at scale 1.
-    pub scale: Cell<f32>,
-    pub base: Cell<(f32, f32)>,
     /// Size of `view` in points.
     size: Cell<(u32, u32)>,
     /// Where the embedded editor was last put; None = hidden.
@@ -244,8 +241,6 @@ impl HostWindow {
             container,
             window,
             placement,
-            scale: Cell::new(1.0),
-            base: Cell::new((w as f32, h as f32)),
             size: Cell::new((w, h)),
             shown: RefCell::new(None),
             closed: Cell::new(false),

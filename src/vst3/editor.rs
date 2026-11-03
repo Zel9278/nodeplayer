@@ -52,9 +52,6 @@ impl IPlugFrameTrait for PlugFrame {
             let (w, h) = ((r.right - r.left) as u32, (r.bottom - r.top) as u32);
             self.window.set_fixed_size(w, h, !self.resizable.get());
             self.window.resize(w, h);
-            // The plugin resized itself (its own resize handle, or answering a scale change).
-            let s = self.window.scale.get();
-            self.window.base.set((w as f32 / s, h as f32 / s));
             ((*(*view).vtbl).onSize)(view, new_size);
         }
         kResultOk
@@ -139,10 +136,10 @@ pub struct Editor {
     view: ComPtr<IPlugView>,
     frame: ComWrapper<PlugFrame>,
     window: Rc<HostWindow>,
+    #[cfg(not(target_os = "macos"))]
     content_scale: Option<ComPtr<IPlugViewContentScaleSupport>>,
-    /// Zoom requested by the host and when it last changed, and the zoom last applied.
-    want_zoom: (f32, Instant),
-    zoom: f32,
+    requested_display_scale: f32,
+    native_units_per_point: f32,
 }
 
 impl Editor {
@@ -181,12 +178,21 @@ impl Editor {
                 if (w2, h2) != (w, h) && w2 > 0 && h2 > 0 {
                     window.set_fixed_size(w2, h2, !resizable);
                     window.resize(w2, h2);
-                    window.base.set((w2 as f32, h2 as f32));
                 }
             }
+            log::debug!("{title}: editor {w}x{h}, resizable {resizable}");
+            #[cfg(not(target_os = "macos"))]
             let content_scale = view.cast::<IPlugViewContentScaleSupport>();
-            log::debug!("{title}: editor {w}x{h}, resizable {resizable}, content scale {}", content_scale.is_some());
-            Ok(Self { view, frame, window, content_scale, want_zoom: (1.0, Instant::now()), zoom: 1.0 })
+            let factor = crate::plugins::native_display_scale(window.handle());
+            let mut editor = Self {
+                view, frame, window,
+                #[cfg(not(target_os = "macos"))]
+                content_scale,
+                requested_display_scale: 1.0,
+                native_units_per_point: 1.0,
+            };
+            crate::plugins::Editor::set_display_scale(&mut editor, factor);
+            Ok(editor)
         }
     }
 
@@ -195,37 +201,6 @@ impl Editor {
         self.window.id
     }
 
-    fn apply_zoom(&mut self) {
-        let (f, since) = self.want_zoom;
-        if (f - self.zoom).abs() < 1e-3 || since.elapsed() < Duration::from_millis(150) {
-            return;
-        }
-        self.zoom = f;
-        let w = &self.window;
-        let (bw, bh) = w.base.get();
-        unsafe {
-            if let Some(cs) = &self.content_scale {
-                // The plugin rescales its GUI and normally answers with resizeView.
-                w.scale.set(f);
-                cs.setContentScaleFactor(f);
-                let mut r: ViewRect = std::mem::zeroed();
-                if self.view.getSize(&mut r) == kResultOk {
-                    let size = ((r.right - r.left) as u32, (r.bottom - r.top) as u32);
-                    if size != w.size() && size.0 > 0 && size.1 > 0 {
-                        w.resize(size.0, size.1);
-                    }
-                }
-            } else if self.frame.resizable.get() {
-                // No scaling support: a resizable editor at least gets the zoomed area.
-                let mut r = ViewRect { left: 0, top: 0, right: (bw * f).round() as i32, bottom: (bh * f).round() as i32 };
-                if self.view.checkSizeConstraint(&mut r) == kResultTrue {
-                    w.resize((r.right - r.left) as u32, (r.bottom - r.top) as u32);
-                    self.view.onSize(&mut r);
-                }
-            }
-        }
-        log::debug!("editor zoom {f:.2}: {:?}", self.window.size());
-    }
 }
 
 impl crate::plugins::Editor for Editor {
@@ -237,16 +212,38 @@ impl crate::plugins::Editor for Editor {
         self.window.size()
     }
 
-    fn native_handle(&self) -> Option<crate::plugins::WindowId> {
-        Some(self.window.handle())
+    fn set_display_scale(&mut self, factor: f32) {
+        if !crate::plugins::surface::valid_display_scale(factor)
+            || (factor - self.requested_display_scale).abs() < 1e-3
+        {
+            return;
+        }
+        self.requested_display_scale = factor;
+        #[cfg(not(target_os = "macos"))]
+        if let Some(content_scale) = &self.content_scale {
+            unsafe {
+                if content_scale.setContentScaleFactor(factor) == kResultOk {
+                    self.native_units_per_point = factor;
+                    let mut rect: ViewRect = std::mem::zeroed();
+                    if self.view.getSize(&mut rect) == kResultOk {
+                        let width = rect.right - rect.left;
+                        let height = rect.bottom - rect.top;
+                        if width > 0 && height > 0 {
+                            self.window.set_fixed_size(width as u32, height as u32, !self.frame.resizable.get());
+                            self.window.resize(width as u32, height as u32);
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    /// Applied once the value has settled for a moment, since re-laying out a plugin GUI is slow.
-    fn set_zoom(&mut self, factor: f32) {
-        let f = ((factor * 100.0).round() / 100.0).clamp(0.25, 4.0);
-        if (f - self.want_zoom.0).abs() > 1e-3 {
-            self.want_zoom = (f, Instant::now());
-        }
+    fn native_units_per_point(&self) -> f32 {
+        self.native_units_per_point
+    }
+
+    fn native_handle(&self) -> Option<crate::plugins::WindowId> {
+        Some(self.window.handle())
     }
 
     fn place(&mut self, spot: Option<&Spot>) {
@@ -254,8 +251,11 @@ impl crate::plugins::Editor for Editor {
     }
 
     fn idle(&mut self) -> bool {
+        #[cfg(target_os = "windows")]
+        if self.window.placement == Placement::Window {
+            self.set_display_scale(crate::plugins::native_display_scale(self.window.handle()));
+        }
         self.frame.pump();
-        self.apply_zoom();
         let mut open = true;
         for ev in self.window.poll() {
             match ev {

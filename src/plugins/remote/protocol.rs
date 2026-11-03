@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 9;
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_STATE: usize = 1024 * 1024;
 pub const MAX_PARAMS: usize = 8192;
@@ -60,7 +60,7 @@ pub enum Command {
         event: EditorPointer,
     },
     Place(u64, Option<Spot>),
-    Zoom(u64, f32),
+    DisplayScale(u64, f32),
     Close(u64),
     Shutdown,
 }

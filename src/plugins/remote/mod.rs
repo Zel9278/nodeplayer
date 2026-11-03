@@ -59,9 +59,6 @@ impl Core {
 }
 /// Reject unsupported UI embedding backends rather than silently loading locally.
 pub fn supported() -> Result<()> {
-    if cfg!(target_os = "macos") && !crate::runtime::get().experimental_editor_capture {
-        bail!("plugin isolation on macOS requires --experimental-editor-capture");
-    }
     if !cfg!(all(
         target_pointer_width = "64",
         target_has_atomic = "64",
@@ -275,8 +272,7 @@ impl Instance for RemoteInstance {
         self.editor
     }
     fn open_editor(&mut self, placement: Placement) -> Result<Box<dyn Editor>> {
-        let captured = crate::runtime::get().experimental_editor_capture
-            && matches!(placement, Placement::Embedded(_));
+        let captured = matches!(placement, Placement::Embedded(_));
         let token = self
             .core
             .next_editor
@@ -295,6 +291,8 @@ impl Instance for RemoteInstance {
             token,
             placement,
             size: (640, 480),
+            requested_display_scale: 1.0,
+            native_units_per_point: 1.0,
             opened: Instant::now(),
             seen_open: false,
             captured,
@@ -312,6 +310,8 @@ struct RemoteEditor {
     token: u64,
     placement: Placement,
     size: (u32, u32),
+    requested_display_scale: f32,
+    native_units_per_point: f32,
     opened: Instant,
     seen_open: bool,
     captured: bool,
@@ -418,6 +418,17 @@ impl Editor for RemoteEditor {
     fn size(&self) -> (u32, u32) {
         self.size
     }
+    fn set_display_scale(&mut self, factor: f32) {
+        if crate::plugins::surface::valid_display_scale(factor)
+            && (factor - self.requested_display_scale).abs() >= 1e-3
+            && self.core.enqueue(Command::DisplayScale(self.token, factor))
+        {
+            self.requested_display_scale = factor;
+        }
+    }
+    fn native_units_per_point(&self) -> f32 {
+        self.native_units_per_point
+    }
     fn is_captured(&self) -> bool {
         self.captured
     }
@@ -437,6 +448,7 @@ impl Editor for RemoteEditor {
         match surface.take_latest() {
             Ok(Some(frame)) => {
                 self.size = frame.native_size;
+                self.native_units_per_point = frame.native_units_per_point;
                 self.errors.recovered();
                 Some(frame)
             }
@@ -511,12 +523,6 @@ impl Editor for RemoteEditor {
             })
             .unwrap_or(false)
     }
-    fn set_zoom(&mut self, f: f32) {
-        if !self.captured && f.is_finite() {
-            self.core
-                .enqueue(Command::Zoom(self.token, f.clamp(0.1, 8.0)));
-        }
-    }
     fn place(&mut self, spot: Option<&Spot>) {
         // Never touch HWND/XID here: every native operation belongs to child main thread.
         if self.captured || spot.is_some_and(|s| s.visible.len() > 256) {
@@ -541,7 +547,7 @@ impl Editor for RemoteEditor {
                     );
                     if m.editor_open {
                         self.seen_open = true;
-                    } else {
+                    } else if m.editor_error.is_none() {
                         return false;
                     }
                 } else if self.seen_open || m.editor_id > self.token {
@@ -556,7 +562,7 @@ impl Editor for RemoteEditor {
             self.fail_input(format!("{error:#}"));
             return false;
         }
-        self.seen_open || self.opened.elapsed().as_secs() < 30
+        self.native_error.is_some() || self.seen_open || self.opened.elapsed().as_secs() < 30
     }
 }
 
@@ -620,6 +626,8 @@ mod tests {
                 token: 2,
                 placement: Placement::Embedded(1),
                 size: (640, 360),
+                requested_display_scale: 1.0,
+                native_units_per_point: 1.0,
                 opened: Instant::now(),
                 seen_open: true,
                 captured: true,
@@ -649,12 +657,43 @@ mod tests {
     }
 
     #[test]
-    fn captured_editor_never_sends_native_placement_or_graph_zoom() {
+    fn captured_editor_never_sends_native_placement() {
         let (mut editor, rx) = captured_editor(4);
-        editor.set_zoom(0.5);
-        editor.set_zoom(1.5);
         editor.place(None);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn display_density_retries_queue_pressure_and_only_sends_changes() {
+        let (mut editor, rx) = captured_editor(1);
+        editor.core.tx.try_send(Command::Poll).unwrap();
+        editor.set_display_scale(2.0);
+        assert!(matches!(rx.try_recv().unwrap(), Command::Poll));
+        editor.set_display_scale(2.0);
+        assert!(matches!(rx.try_recv().unwrap(), Command::DisplayScale(2, 2.0)));
+        editor.set_display_scale(2.0);
+        editor.set_display_scale(f32::NAN);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_editor_attachment_retains_error_and_allows_native_recovery() {
+        let (mut editor, _rx) = captured_editor(4);
+        {
+            let mut snapshot = editor.core.snapshot.lock().unwrap();
+            let metadata = snapshot.metadata.as_mut().unwrap();
+            metadata.editor_open = false;
+            metadata.editor_error = Some("capture backend unavailable; try Pop out".into());
+        }
+        assert!(editor.idle());
+        assert!(!editor.ready());
+        assert!(editor.capture_error().unwrap().contains("capture backend unavailable"));
+        assert!(!editor.core.stop.load(Ordering::Acquire));
+        {
+            let mut snapshot = editor.core.snapshot.lock().unwrap();
+            snapshot.metadata.as_mut().unwrap().editor_error = None;
+        }
+        assert!(!editor.idle(), "a later actual close still retires the editor");
     }
 
     #[test]
@@ -706,6 +745,7 @@ mod tests {
                 width: 2,
                 height: 1,
                 native_size: (2, 1),
+                native_units_per_point: 1.0,
                 rgba: vec![255; 8],
                 popups: Vec::new(),
             })
@@ -805,6 +845,7 @@ mod tests {
                 width: 1,
                 height: 1,
                 native_size: (1, 1),
+                native_units_per_point: 1.0,
                 rgba: vec![1, 2, 3, 255],
             })
             .unwrap();
@@ -905,6 +946,8 @@ mod tests {
             token: 2,
             placement: Placement::Window,
             size: (640, 480),
+            requested_display_scale: 1.0,
+            native_units_per_point: 1.0,
             opened: Instant::now(),
             seen_open: false,
             captured: false,

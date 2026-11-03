@@ -559,6 +559,7 @@ fn rgba_frame(bitmap: &NSBitmapImageRep, native_size: (u32, u32)) -> Result<Edit
             width,
             height,
             native_size,
+            native_units_per_point: 1.0,
             rgba,
         });
     }
@@ -578,6 +579,7 @@ fn rgba_frame(bitmap: &NSBitmapImageRep, native_size: (u32, u32)) -> Result<Edit
         width,
         height,
         native_size,
+        native_units_per_point: 1.0,
         rgba: image.into_raw(),
     })
 }

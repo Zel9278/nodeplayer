@@ -434,7 +434,12 @@ fn transact_recorded(
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     }
     let cached_state = transact(stream, core, generation, id, c)?;
-    if let Some(token) = captured_open {
+    let capture_attached = captured_open.is_some_and(|token| {
+        let snapshot = core.snapshot.lock().unwrap();
+        snapshot.metadata.as_ref()
+            .is_some_and(|metadata| metadata.editor_id == token && metadata.editor_open)
+    });
+    if let Some(token) = captured_open.filter(|_| capture_attached) {
         // Native attachment already succeeded. Create image storage away from the UI and
         // RT threads, then publish it only after the matching worker has opened it.
         let surface = Arc::new(FrameMap::create(generation, token)?);
@@ -478,7 +483,7 @@ fn coalesce(commands: Vec<Command>) -> Vec<Command> {
         // SetParam(A), Load(state), SetParam(B) must apply B after the state restore.
         let mergeable = matches!(
             &c,
-            Command::SetParam(..) | Command::Display(..) | Command::Place(..) | Command::Zoom(..)
+            Command::SetParam(..) | Command::Display(..) | Command::Place(..) | Command::DisplayScale(..)
         ) || matches!(&c, Command::Pointer { event, .. } if matches!(event.kind, PointerKind::Move));
         if !mergeable {
             compact.push(c);
@@ -495,8 +500,8 @@ fn coalesce(commands: Vec<Command>) -> Vec<Command> {
 }
 fn same_key(a: &Command, b: &Command) -> bool {
     match (a, b) {
-        (Command::Place(a, _), Command::Place(b, _))
-        | (Command::Zoom(a, _), Command::Zoom(b, _)) => a == b,
+        (Command::Place(a, _), Command::Place(b, _)) => a == b,
+        (Command::DisplayScale(a, _), Command::DisplayScale(b, _)) => a == b,
         (Command::Display(a, _), Command::Display(b, _))
         | (Command::SetParam(a, _), Command::SetParam(b, _)) => a == b,
         (
@@ -536,7 +541,7 @@ fn transact(
         Command::SetSurface(..) => "set-surface",
         Command::Pointer { .. } => "pointer",
         Command::Place(..) => "place",
-        Command::Zoom(..) => "zoom",
+        Command::DisplayScale(..) => "display-scale",
         Command::Close(..) => "close-editor",
         Command::Shutdown => "shutdown",
     };
@@ -734,6 +739,7 @@ mod tests {
             token: 88,
         })?;
         map.publish(&crate::plugins::surface::EditorFrame {
+            native_units_per_point: 1.0,
             popups: Vec::new(),
             width: 1,
             height: 1,
@@ -823,15 +829,15 @@ mod tests {
             Command::SetParam(7, 0.3),
             Command::Checkpoint,
             Command::SetParam(7, 0.4),
-            Command::Zoom(1, 1.0),
+            Command::Place(1, None),
             Command::Close(1),
             Command::Open {
                 token: 2,
                 placement: Placement::Window,
                 captured: false,
             },
-            Command::Zoom(2, 2.0),
-            Command::Zoom(2, 3.0),
+            Command::Place(2, None),
+            Command::Place(2, None),
         ];
         let expected = vec![
             Command::SetParam(7, 0.2),
@@ -839,14 +845,14 @@ mod tests {
             Command::SetParam(7, 0.3),
             Command::Checkpoint,
             Command::SetParam(7, 0.4),
-            Command::Zoom(1, 1.0),
+            Command::Place(1, None),
             Command::Close(1),
             Command::Open {
                 token: 2,
                 placement: Placement::Window,
                 captured: false,
             },
-            Command::Zoom(2, 3.0),
+            Command::Place(2, None),
         ];
         assert_eq!(encoded(coalesce(commands)), encoded(expected));
     }
@@ -869,15 +875,11 @@ mod tests {
     #[test]
     fn editor_geometry_only_coalesces_for_its_own_token() {
         let commands = vec![
-            Command::Zoom(1, 1.0),
-            Command::Zoom(2, 2.0),
-            Command::Zoom(1, 3.0),
             Command::Place(1, None),
             Command::Place(2, None),
+            Command::Place(1, None),
         ];
         let expected = vec![
-            Command::Zoom(1, 3.0),
-            Command::Zoom(2, 2.0),
             Command::Place(1, None),
             Command::Place(2, None),
         ];

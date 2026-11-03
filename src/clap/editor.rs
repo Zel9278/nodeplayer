@@ -1,7 +1,6 @@
 //! CLAP editors: the plugin's GUI (X11, Win32 or Cocoa) parented to a [`HostWindow`].
 
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use clap_sys::ext::gui::*;
@@ -43,9 +42,8 @@ pub struct ClapEditor {
     shared: *const HostShared,
     window: HostWindow,
     resizable: bool,
-    /// Zoom requested by the host and when it last changed, and the zoom last applied.
-    want_zoom: (f32, Instant),
-    zoom: f32,
+    requested_display_scale: f32,
+    native_units_per_point: f32,
 }
 
 impl ClapEditor {
@@ -93,7 +91,10 @@ impl ClapEditor {
                 f(plugin);
             }
             log::debug!("{}: CLAP GUI {w}x{h}, resizable {resizable}", info.name);
-            Ok(Self { plugin, gui, shared, window, resizable, want_zoom: (1.0, Instant::now()), zoom: 1.0 })
+            let factor = crate::plugins::native_display_scale(window.handle());
+            let mut editor = Self { plugin, gui, shared, window, resizable, requested_display_scale: 1.0, native_units_per_point: 1.0 };
+            crate::plugins::Editor::set_display_scale(&mut editor, factor);
+            Ok(editor)
         }
     }
 
@@ -119,26 +120,6 @@ impl ClapEditor {
         }
     }
 
-    fn apply_zoom(&mut self) {
-        let (f, since) = self.want_zoom;
-        if (f - self.zoom).abs() < 1e-3 || since.elapsed() < Duration::from_millis(150) {
-            return;
-        }
-        self.zoom = f;
-        let g = self.gui();
-        unsafe {
-            if g.set_scale.is_some_and(|s| s(self.plugin, f as f64)) {
-                let (mut w, mut h) = (0u32, 0u32);
-                if g.get_size.is_some_and(|s| s(self.plugin, &mut w, &mut h)) && w > 0 && h > 0 {
-                    self.window.resize(w, h);
-                }
-            } else if self.resizable {
-                let (bw, bh) = self.window.base.get();
-                self.resize_to((bw * f).round() as u32, (bh * f).round() as u32);
-            }
-        }
-        log::debug!("CLAP editor zoom {f:.2}: {:?}", self.window.size());
-    }
 }
 
 impl crate::plugins::Editor for ClapEditor {
@@ -150,15 +131,39 @@ impl crate::plugins::Editor for ClapEditor {
         self.window.size()
     }
 
-    fn native_handle(&self) -> Option<crate::plugins::WindowId> {
-        Some(self.window.handle())
+    fn set_display_scale(&mut self, factor: f32) {
+        if !crate::plugins::surface::valid_display_scale(factor)
+            || (factor - self.requested_display_scale).abs() < 1e-3
+        {
+            return;
+        }
+        self.requested_display_scale = factor;
+        // Cocoa uses logical points and manages Retina backing independently.
+        #[cfg(not(target_os = "macos"))]
+        unsafe {
+            let (set_scale, get_size) = {
+                let gui = self.gui();
+                (gui.set_scale, gui.get_size)
+            };
+            if set_scale.is_some_and(|set_scale| set_scale(self.plugin, f64::from(factor))) {
+                self.native_units_per_point = factor;
+                let (mut width, mut height) = (0, 0);
+                if get_size.is_some_and(|get_size| get_size(self.plugin, &mut width, &mut height))
+                    && width > 0 && height > 0
+                {
+                    self.window.set_fixed_size(width, height, !self.resizable);
+                    self.window.resize(width, height);
+                }
+            }
+        }
     }
 
-    fn set_zoom(&mut self, factor: f32) {
-        let f = ((factor * 100.0).round() / 100.0).clamp(0.25, 4.0);
-        if (f - self.want_zoom.0).abs() > 1e-3 {
-            self.want_zoom = (f, Instant::now());
-        }
+    fn native_units_per_point(&self) -> f32 {
+        self.native_units_per_point
+    }
+
+    fn native_handle(&self) -> Option<crate::plugins::WindowId> {
+        Some(self.window.handle())
     }
 
     fn place(&mut self, spot: Option<&Spot>) {
@@ -166,6 +171,10 @@ impl crate::plugins::Editor for ClapEditor {
     }
 
     fn idle(&mut self) -> bool {
+        #[cfg(target_os = "windows")]
+        if self.window.placement == Placement::Window {
+            self.set_display_scale(crate::plugins::native_display_scale(self.window.handle()));
+        }
         let shared = unsafe { &*self.shared };
         if shared.gui_closed.swap(false, Ordering::AcqRel) {
             return false;
@@ -176,10 +185,7 @@ impl crate::plugins::Editor for ClapEditor {
             let (w, h) = ((req >> 32) as u32, req as u32);
             self.window.set_fixed_size(w, h, !self.resizable);
             self.window.resize(w, h);
-            let s = self.zoom;
-            self.window.base.set((w as f32 / s, h as f32 / s));
         }
-        self.apply_zoom();
         let mut open = true;
         for ev in self.window.poll() {
             match ev {

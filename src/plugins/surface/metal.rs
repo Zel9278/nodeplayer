@@ -106,6 +106,7 @@ impl MetalCapture {
             width: info.width,
             height: info.height,
             native_size: (info.native_width, info.native_height),
+            native_units_per_point: 1.0,
             rgba,
             popups: Vec::new(),
         }))

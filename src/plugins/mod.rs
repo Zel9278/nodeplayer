@@ -29,6 +29,47 @@ use crate::engine::Processor;
 /// A native window: an X11 window ID, a Win32 HWND, an NSView pointer.
 pub type WindowId = usize;
 
+/// Native display density for initial editor backing. Cocoa editors use logical
+/// points; Win32/X11 editors use physical pixels. Graph zoom is never included.
+pub(crate) fn native_display_scale(window: WindowId) -> f32 {
+    #[cfg(target_os = "macos")]
+    let factor = { let _ = window; 1.0 };
+    #[cfg(target_os = "windows")]
+    let factor = {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetDpiForWindow(window: *mut std::ffi::c_void) -> u32;
+        }
+        (unsafe { GetDpiForWindow(window as *mut std::ffi::c_void) }) as f32 / 96.0
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let factor = {
+        fn x11_scale(window: WindowId) -> Option<f32> {
+            use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+            if let Some(factor) = std::env::var("WINIT_X11_SCALE_FACTOR").ok()
+                .and_then(|factor| factor.parse::<f32>().ok())
+                .filter(|factor| surface::valid_display_scale(*factor))
+            {
+                return Some(factor);
+            }
+            let (conn, _) = x11rb::connect(None).ok()?;
+            let root = conn.get_geometry(u32::try_from(window).ok()?).ok()?.reply().ok()?.root;
+            let atom = conn.intern_atom(true, b"RESOURCE_MANAGER").ok()?.reply().ok()?.atom;
+            if atom == x11rb::NONE { return None; }
+            let resource = conn.get_property(false, root, atom, AtomEnum::STRING, 0, 16 * 1024)
+                .ok()?.reply().ok()?;
+            let resources = std::str::from_utf8(&resource.value).ok()?;
+            resources.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                if key.trim() != "Xft.dpi" { return None; }
+                value.trim().parse::<f32>().ok().map(|dpi| dpi / 96.0)
+            })
+        }
+        x11_scale(window).unwrap_or(1.0)
+    };
+    if surface::valid_display_scale(factor) { factor } else { 1.0 }
+}
+
 /// Where an editor is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Placement {
@@ -298,6 +339,13 @@ pub trait Editor {
     fn placement(&self) -> Placement;
     /// Size in physical pixels.
     fn size(&self) -> (u32, u32);
+    /// Display density, independent of the graph transform. Unsupported editors keep
+    /// their existing backing density and are scaled by the canvas instead.
+    fn set_display_scale(&mut self, _factor: f32) {}
+    /// Native input units per logical point in the editor's current backing image.
+    fn native_units_per_point(&self) -> f32 {
+        1.0
+    }
     /// Native handle used only by a capture adapter in the editor's owner process.
     fn native_handle(&self) -> Option<WindowId> {
         None
@@ -319,8 +367,6 @@ pub trait Editor {
     fn first_capture_error(&self) -> Option<&str> {
         self.capture_error()
     }
-    /// Asks the editor to draw at `factor` (graph zoom × display scale), if it can.
-    fn set_zoom(&mut self, _factor: f32) {}
     /// Shows an embedded editor at `spot`, or hides it; see [`window::HostWindow::place`].
     fn place(&mut self, spot: Option<&Spot>);
     /// Pumps the editor; returns `false` once the user closed its window.
