@@ -15,9 +15,9 @@ reaches an **Output** node is what you hear.
 - **Remove**: right-click a node and pick "Remove".
 - **Fold**: ▼ at the left of a node's title hides its body.
 - **Select several**: Shift+drag a box, or Shift+click nodes.
-- **Zoom**: Ctrl+wheel. The zoom is shown in the corner; click it to go back to 100%. Text is
-  only sharp at 100%, so a zoom that ends near 100% snaps to it. Double-click empty space to
-  fit the graph.
+- **Zoom**: Ctrl+wheel or pinch on a supported touchpad. Zoom and two-finger panning preserve
+  small movements without snapping. The zoom is shown in the corner; click it to go back to
+  100%, where text is sharpest. Double-click empty space to fit the graph.
 
 Nodes that aren't connected to anything still run, so a visualizer can hang off any output
 as a dead end.
