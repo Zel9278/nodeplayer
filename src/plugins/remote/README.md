@@ -191,6 +191,10 @@ outside the desktop; the AppKit host and its child popups are ordered transparen
 without activating the source host. Plugins can observe a visible parent without
 showing a second desktop window. GPU editor capture
 remains renderer-dependent.
+On macOS, a full-editor ordinary `CAMetalLayer` using BGRA8/RGBA8 can be read back from
+completed drawables. The adapter applies only to that source layer, keeps at most one
+readback in flight, and retires its native registration before plugin GUI teardown.
+Mixed GPU/CPU view layouts and custom Metal-layer subclasses still need another adapter.
 Capture service targets 240 updates per second and skips missed deadlines after a stall.
 The worker services native UI/capture between control requests without an 8 ms blocking
 readiness poll. Parent repaint requests use the same target while a captured editor is
