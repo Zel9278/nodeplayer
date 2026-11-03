@@ -170,6 +170,7 @@ impl NativeCapture {
                 rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
             }
             Ok(EditorFrame {
+                popups: Vec::new(),
                 width,
                 height,
                 native_size: (width, height),
@@ -230,6 +231,14 @@ impl NativeCapture {
             let coordinates =
                 |p: POINT| LPARAM((u32::from(p.x as u16) | (u32::from(p.y as u16) << 16)) as isize);
             let (message, value, position) = match event.kind {
+                PointerKind::Cancel => {
+                    self.drag_target = None;
+                    let captured = GetCapture();
+                    if captured == self.hwnd || IsChild(self.hwnd, captured).as_bool() {
+                        let _ = ReleaseCapture();
+                    }
+                    return Ok(());
+                }
                 PointerKind::Move => (WM_MOUSEMOVE, WPARAM(flags as usize), coordinates(point)),
                 PointerKind::Down(button) => {
                     let message = match button {

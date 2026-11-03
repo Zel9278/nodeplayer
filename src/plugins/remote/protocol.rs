@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_STATE: usize = 1024 * 1024;
 pub const MAX_PARAMS: usize = 8192;

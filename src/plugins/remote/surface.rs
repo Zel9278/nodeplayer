@@ -14,11 +14,11 @@ use std::{
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
-use crate::plugins::surface::{EditorFrame, MAX_DIMENSION, MAX_PIXELS};
+use crate::plugins::surface::{EditorFrame, EditorPopup, MAX_DIMENSION, MAX_PIXELS, MAX_POPUPS};
 
 const MAGIC: u64 = 0x4e50_5355_5246_3031;
-// Version 2 uses uniformly sized atomic payload accesses on both sides.
-const VERSION: u32 = 2;
+// Version 3 includes bounded child-popup metadata and images in the same frame lease.
+const VERSION: u32 = 3;
 const RGBA8: u32 = 1;
 const MAX_BYTES: usize = MAX_PIXELS * 4;
 const FREE: u32 = 0;
@@ -43,6 +43,8 @@ struct Header {
     native_width: AtomicU32,
     native_height: AtomicU32,
     byte_len: AtomicU64,
+    popup_count: AtomicU32,
+    popups: [PopupHeader; MAX_POPUPS],
 }
 
 const HEADER_BYTES: usize = std::mem::size_of::<Header>();
@@ -97,7 +99,43 @@ impl Drop for Lease<'_> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+struct PopupHeader {
+    x: AtomicU64,
+    y: AtomicU64,
+    width: AtomicU32,
+    height: AtomicU32,
+    native_width: AtomicU32,
+    native_height: AtomicU32,
+    interactive: AtomicU32,
+}
+
+impl Default for PopupHeader {
+    fn default() -> Self {
+        Self {
+            x: AtomicU64::new(0),
+            y: AtomicU64::new(0),
+            width: AtomicU32::new(0),
+            height: AtomicU32::new(0),
+            native_width: AtomicU32::new(0),
+            native_height: AtomicU32::new(0),
+            interactive: AtomicU32::new(0),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PopupMetadata {
+    x: u64,
+    y: u64,
+    width: u32,
+    height: u32,
+    native_width: u32,
+    native_height: u32,
+    interactive: u32,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct FrameHeader {
     sequence: u64,
     width: u32,
@@ -105,46 +143,88 @@ struct FrameHeader {
     native_width: u32,
     native_height: u32,
     byte_len: u64,
+    popups: Vec<PopupMetadata>,
+}
+
+fn image_len(width: u32, height: u32, native_width: u32, native_height: u32) -> Result<usize> {
+    ensure!(
+        width > 0 && height > 0 && width <= MAX_DIMENSION && height <= MAX_DIMENSION,
+        "invalid shared editor image dimensions"
+    );
+    ensure!(
+        native_width > 0
+            && native_height > 0
+            && native_width <= MAX_DIMENSION
+            && native_height <= MAX_DIMENSION,
+        "invalid shared native editor dimensions"
+    );
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .context("shared editor image size overflow")?;
+    ensure!(
+        pixels <= MAX_PIXELS,
+        "shared editor image exceeds pixel limit"
+    );
+    pixels
+        .checked_mul(4)
+        .context("shared editor image byte count overflow")
 }
 
 impl FrameHeader {
-    fn read(header: &Header) -> Self {
-        Self {
+    fn read(header: &Header) -> Result<Self> {
+        let popup_count = header.popup_count.load(Ordering::Relaxed) as usize;
+        ensure!(popup_count <= MAX_POPUPS, "too many shared editor popups");
+        Ok(Self {
             sequence: header.sequence.load(Ordering::Relaxed),
             width: header.width.load(Ordering::Relaxed),
             height: header.height.load(Ordering::Relaxed),
             native_width: header.native_width.load(Ordering::Relaxed),
             native_height: header.native_height.load(Ordering::Relaxed),
             byte_len: header.byte_len.load(Ordering::Relaxed),
-        }
+            popups: header.popups[..popup_count]
+                .iter()
+                .map(|p| PopupMetadata {
+                    x: p.x.load(Ordering::Relaxed),
+                    y: p.y.load(Ordering::Relaxed),
+                    width: p.width.load(Ordering::Relaxed),
+                    height: p.height.load(Ordering::Relaxed),
+                    native_width: p.native_width.load(Ordering::Relaxed),
+                    native_height: p.native_height.load(Ordering::Relaxed),
+                    interactive: p.interactive.load(Ordering::Relaxed),
+                })
+                .collect(),
+        })
     }
 
-    fn validated_len(self) -> Result<usize> {
+    fn validated_len(&self) -> Result<usize> {
         ensure!(self.sequence != 0, "invalid editor frame sequence");
-        ensure!(
-            self.width > 0
-                && self.height > 0
-                && self.width <= MAX_DIMENSION
-                && self.height <= MAX_DIMENSION,
-            "invalid shared editor image dimensions"
-        );
-        ensure!(
-            self.native_width > 0
-                && self.native_height > 0
-                && self.native_width <= MAX_DIMENSION
-                && self.native_height <= MAX_DIMENSION,
-            "invalid shared native editor dimensions"
-        );
-        let pixels = (self.width as usize)
-            .checked_mul(self.height as usize)
-            .context("shared editor image size overflow")?;
-        ensure!(
-            pixels <= MAX_PIXELS,
-            "shared editor image exceeds pixel limit"
-        );
-        let length = pixels
-            .checked_mul(4)
-            .context("shared editor image byte count overflow")?;
+        let mut length = image_len(
+            self.width,
+            self.height,
+            self.native_width,
+            self.native_height,
+        )?;
+        for popup in &self.popups {
+            ensure!(
+                [popup.x, popup.y].iter().all(|v| {
+                    let value = f64::from_bits(*v);
+                    value.is_finite() && value.abs() <= 1_000_000.0
+                }),
+                "invalid shared editor popup origin"
+            );
+            ensure!(
+                popup.interactive <= 1,
+                "invalid shared editor popup input flag"
+            );
+            length = length
+                .checked_add(image_len(
+                    popup.width,
+                    popup.height,
+                    popup.native_width,
+                    popup.native_height,
+                )?)
+                .context("shared editor popup byte count overflow")?;
+        }
         ensure!(
             length <= MAX_BYTES && self.byte_len == length as u64,
             "invalid shared editor image byte count"
@@ -181,6 +261,8 @@ impl FrameMap {
             native_width: AtomicU32::new(0),
             native_height: AtomicU32::new(0),
             byte_len: AtomicU64::new(0),
+            popup_count: AtomicU32::new(0),
+            popups: std::array::from_fn(|_| PopupHeader::default()),
         };
         // SAFETY: mmap's page-aligned address meets Header's alignment and the
         // whole Header fits in the mapping. No other process has its descriptor.
@@ -278,8 +360,39 @@ impl FrameMap {
         h.native_width.store(frame.native_size.0, Ordering::Relaxed);
         h.native_height
             .store(frame.native_size.1, Ordering::Relaxed);
-        h.byte_len.store(frame.rgba.len() as u64, Ordering::Relaxed);
-        let (words, tail) = frame.rgba.as_chunks::<WORD_BYTES>();
+        // Keep the common no-popup path allocation-free. Popup images share the same
+        // publication lease so geometry and pixels can never come from different frames.
+        let payload = if frame.popups.is_empty() {
+            std::borrow::Cow::Borrowed(frame.rgba.as_slice())
+        } else {
+            let length =
+                frame.rgba.len() + frame.popups.iter().map(|p| p.rgba.len()).sum::<usize>();
+            let mut bytes = Vec::with_capacity(length);
+            bytes.extend_from_slice(&frame.rgba);
+            for popup in &frame.popups {
+                bytes.extend_from_slice(&popup.rgba);
+            }
+            std::borrow::Cow::Owned(bytes)
+        };
+        h.popup_count
+            .store(frame.popups.len() as u32, Ordering::Relaxed);
+        for (header, popup) in h.popups.iter().zip(&frame.popups) {
+            header.x.store(popup.origin[0].to_bits(), Ordering::Relaxed);
+            header.y.store(popup.origin[1].to_bits(), Ordering::Relaxed);
+            header.width.store(popup.width, Ordering::Relaxed);
+            header.height.store(popup.height, Ordering::Relaxed);
+            header
+                .native_width
+                .store(popup.native_size.0, Ordering::Relaxed);
+            header
+                .native_height
+                .store(popup.native_size.1, Ordering::Relaxed);
+            header
+                .interactive
+                .store(u32::from(popup.interactive), Ordering::Relaxed);
+        }
+        h.byte_len.store(payload.len() as u64, Ordering::Relaxed);
+        let (words, tail) = payload.as_chunks::<WORD_BYTES>();
         for (index, bytes) in words.iter().enumerate() {
             self.word(index)
                 .store(u64::from_ne_bytes(*bytes), Ordering::Relaxed);
@@ -316,7 +429,7 @@ impl FrameMap {
             state: &h.state,
             owned: READING,
         };
-        let metadata = FrameHeader::read(h);
+        let metadata = FrameHeader::read(h)?;
         let length = metadata.validated_len()?;
         ensure!(
             metadata.sequence > self.last_sequence.load(Ordering::Acquire),
@@ -342,10 +455,37 @@ impl FrameMap {
         }
         self.validate_header()?;
         ensure!(
-            h.state.load(Ordering::Acquire) == READING && metadata == FrameHeader::read(h),
+            h.state.load(Ordering::Acquire) == READING && metadata == FrameHeader::read(h)?,
             "editor frame changed during read"
         );
+        let root_len = image_len(
+            metadata.width,
+            metadata.height,
+            metadata.native_width,
+            metadata.native_height,
+        )?;
+        let mut cursor = root_len;
+        let mut popups = Vec::with_capacity(metadata.popups.len());
+        for popup in metadata.popups {
+            let length = image_len(
+                popup.width,
+                popup.height,
+                popup.native_width,
+                popup.native_height,
+            )?;
+            popups.push(EditorPopup {
+                origin: [f64::from_bits(popup.x), f64::from_bits(popup.y)],
+                width: popup.width,
+                height: popup.height,
+                native_size: (popup.native_width, popup.native_height),
+                rgba: rgba[cursor..cursor + length].to_vec(),
+                interactive: popup.interactive != 0,
+            });
+            cursor += length;
+        }
+        rgba.truncate(root_len);
         let frame = EditorFrame {
+            popups,
             width: metadata.width,
             height: metadata.height,
             native_size: (metadata.native_width, metadata.native_height),
@@ -437,6 +577,7 @@ mod tests {
 
     fn frame(value: u8) -> EditorFrame {
         EditorFrame {
+            popups: Vec::new(),
             width: 32,
             height: 16,
             native_size: (16, 8),
@@ -448,6 +589,7 @@ mod tests {
     fn patterned_pixels_roundtrip_including_a_partial_word() -> Result<()> {
         for (width, height) in [(1, 1), (2, 1), (3, 1), (3, 3), (17, 19)] {
             let image = EditorFrame {
+                popups: Vec::new(),
                 width,
                 height,
                 native_size: (width, height),
@@ -464,6 +606,80 @@ mod tests {
     }
 
     #[test]
+    fn popups_roundtrip_with_their_pixels_geometry_and_dismissal() -> Result<()> {
+        let map = FrameMap::create(101, 27)?;
+        let peer = FrameMap::open(&map.descriptor())?;
+        let mut image = frame(19);
+        for (origin, interactive, value) in
+            [([-40.5, 700.25], true, 37), ([120.0, -80.0], false, 91)]
+        {
+            image.popups.push(EditorPopup {
+                origin,
+                width: 3,
+                height: 1,
+                native_size: (6, 2),
+                rgba: vec![value; 12],
+                interactive,
+            });
+        }
+        assert!(peer.publish(&image)?);
+        let received = map.take_latest()?.unwrap();
+        assert_eq!(received.rgba, image.rgba);
+        assert_eq!(received.native_size, image.native_size);
+        assert_eq!(received.popups.len(), 2);
+        for (actual, expected) in received.popups.iter().zip(&image.popups) {
+            assert_eq!(actual.origin, expected.origin);
+            assert_eq!(
+                (actual.width, actual.height),
+                (expected.width, expected.height)
+            );
+            assert_eq!(actual.native_size, expected.native_size);
+            assert_eq!(actual.rgba, expected.rgba);
+            assert_eq!(actual.interactive, expected.interactive);
+        }
+        image.popups.clear();
+        assert!(peer.publish(&image)?);
+        let received = map.take_latest()?.unwrap();
+        assert!(received.popups.is_empty());
+        assert_eq!(received.rgba, image.rgba);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_popup_metadata_is_rejected_and_releases_the_frame() -> Result<()> {
+        let map = FrameMap::create(101, 27)?;
+        let mut image = frame(19);
+        image.popups.push(EditorPopup {
+            origin: [0.0, 0.0],
+            width: 1,
+            height: 1,
+            native_size: (1, 1),
+            rgba: vec![17; 4],
+            interactive: true,
+        });
+        for corrupt in 0..5 {
+            assert!(map.publish(&image)?);
+            let h = map.header();
+            match corrupt {
+                0 => h
+                    .popup_count
+                    .store(MAX_POPUPS as u32 + 1, Ordering::Relaxed),
+                1 => h.popups[0].x.store(f64::NAN.to_bits(), Ordering::Relaxed),
+                2 => h.popups[0].width.store(u32::MAX, Ordering::Relaxed),
+                3 => h.popups[0].interactive.store(2, Ordering::Relaxed),
+                _ => {
+                    h.width.store(4096, Ordering::Relaxed);
+                    h.height.store(4096, Ordering::Relaxed);
+                    h.byte_len.store(MAX_BYTES as u64 + 4, Ordering::Relaxed);
+                }
+            }
+            assert!(map.take_latest().is_err());
+            assert_eq!(h.state.load(Ordering::Acquire), FREE);
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "reports capture-sized image transfer timings; run with --nocapture"]
     fn frame_transfer_timings() -> Result<()> {
         use std::time::{Duration, Instant};
@@ -472,6 +688,7 @@ mod tests {
             let map = FrameMap::create(102, 28)?;
             let peer = FrameMap::open(&map.descriptor())?;
             let image = EditorFrame {
+                popups: Vec::new(),
                 width,
                 height,
                 native_size: (width, height),

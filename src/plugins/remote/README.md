@@ -167,14 +167,21 @@ validated before pixels become an egui texture. A retired surface cannot feed a
 replacement editor. Supervisor creates/maps storage off the UI thread, and both
 peers retry file cleanup after unmapping. The supervisor also retains cleanup paths
 until the worker is reaped, covering forced termination and failed surface setup.
+On macOS, up to 16 attached child popup windows share the root image's publication
+lease and total pixel budget. The parent draws them above the graph, preserves their
+native input coordinates through zoom and viewport clamping, and dismisses interactive
+popups on Escape, outside clicks, focus loss, or hiding the graph.
 
 Pointer messages carry the same worker generation and editor token. Adjacent moves
 may coalesce; button and wheel barriers preserve order. Transitions retry through
 queue pressure without blocking the parent. If even the bounded transition queue
 fills, a reserved close slot closes the editor rather than leaving a stuck drag.
-Keyboard/IME, drag-and-drop, and separate popup windows are not bridged. The source
+Keyboard/IME, drag-and-drop, blocking native menus, and unattached popup windows are
+not bridged. Attached child popup capture is currently macOS-only. The source
 stays alive until the graph editor closes. Windows and X11 capture hosts remain mapped
-outside the desktop; the AppKit host is never ordered on screen. GPU editor capture
+outside the desktop; the AppKit host and its child popups are ordered transparently
+without activating the source host. Plugins can observe a visible parent without
+showing a second desktop window. GPU editor capture
 remains renderer-dependent.
 Capture uses CPU readback/upload at approximately 30 updates per second; this is not
 a production bandwidth/latency qualification.

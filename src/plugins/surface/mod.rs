@@ -24,6 +24,7 @@ use windows::NativeCapture;
 
 pub const MAX_DIMENSION: u32 = 8192;
 pub const MAX_PIXELS: usize = 16 * 1024 * 1024;
+pub const MAX_POPUPS: usize = 16;
 const CAPTURE_INTERVAL: Duration = Duration::from_millis(33);
 
 #[derive(Clone, Debug)]
@@ -34,30 +35,67 @@ pub struct EditorFrame {
     pub native_size: (u32, u32),
     /// Top-left origin, tightly packed, straight-alpha RGBA8.
     pub rgba: Vec<u8>,
+    /// Child windows, ordered from back to front, in native editor coordinates.
+    pub popups: Vec<EditorPopup>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EditorPopup {
+    pub origin: [f64; 2],
+    pub width: u32,
+    pub height: u32,
+    pub native_size: (u32, u32),
+    pub rgba: Vec<u8>,
+    pub interactive: bool,
+}
+
+fn validate_image(width: u32, height: u32, native_size: (u32, u32), bytes: usize) -> Result<usize> {
+    ensure!(
+        width > 0 && height > 0 && width <= MAX_DIMENSION && height <= MAX_DIMENSION,
+        "invalid editor image dimensions"
+    );
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .context("editor image size overflow")?;
+    ensure!(
+        pixels <= MAX_PIXELS && pixels.checked_mul(4) == Some(bytes),
+        "invalid editor image byte count"
+    );
+    ensure!(
+        native_size.0 > 0
+            && native_size.1 > 0
+            && native_size.0 <= MAX_DIMENSION
+            && native_size.1 <= MAX_DIMENSION,
+        "invalid native editor dimensions"
+    );
+    Ok(pixels)
 }
 
 impl EditorFrame {
     pub fn validate(&self) -> Result<()> {
+        let mut pixels =
+            validate_image(self.width, self.height, self.native_size, self.rgba.len())?;
+        ensure!(self.popups.len() <= MAX_POPUPS, "too many editor popups");
+        for popup in &self.popups {
+            ensure!(
+                popup
+                    .origin
+                    .iter()
+                    .all(|v| v.is_finite() && v.abs() <= 1_000_000.0),
+                "invalid editor popup origin"
+            );
+            pixels = pixels
+                .checked_add(validate_image(
+                    popup.width,
+                    popup.height,
+                    popup.native_size,
+                    popup.rgba.len(),
+                )?)
+                .context("editor popup pixel count overflow")?;
+        }
         ensure!(
-            self.width > 0
-                && self.height > 0
-                && self.width <= MAX_DIMENSION
-                && self.height <= MAX_DIMENSION,
-            "invalid editor image dimensions"
-        );
-        let pixels = (self.width as usize)
-            .checked_mul(self.height as usize)
-            .context("editor image size overflow")?;
-        ensure!(
-            pixels <= MAX_PIXELS && pixels.checked_mul(4) == Some(self.rgba.len()),
-            "invalid editor image byte count"
-        );
-        ensure!(
-            self.native_size.0 > 0
-                && self.native_size.1 > 0
-                && self.native_size.0 <= MAX_DIMENSION
-                && self.native_size.1 <= MAX_DIMENSION,
-            "invalid native editor dimensions"
+            pixels <= MAX_PIXELS,
+            "editor and popups exceed pixel budget"
         );
         Ok(())
     }
@@ -68,7 +106,12 @@ pub enum PointerKind {
     Move,
     Down(u8),
     Up(u8),
-    Wheel { dx: f32, dy: f32 },
+    Wheel {
+        dx: f32,
+        dy: f32,
+    },
+    /// Dismiss transient windows and abandon any native pointer ownership.
+    Cancel,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -99,6 +142,7 @@ impl EditorPointer {
                     && dy.abs() <= 1_000_000.0,
                 "invalid editor wheel displacement"
             ),
+            PointerKind::Cancel => ensure!(self.buttons == 0, "cancel must release editor buttons"),
             PointerKind::Move => {}
         }
         Ok(())
@@ -175,6 +219,7 @@ impl Editor for CapturedEditor {
                     // GUI startup can be asynchronous. After the first painting, a uniform
                     // image is legitimate and must be allowed to replace earlier content.
                     if !self.painted
+                        && frame.popups.is_empty()
                         && frame
                             .rgba
                             .as_chunks::<4>()
@@ -248,6 +293,7 @@ mod tests {
     #[test]
     fn rejects_invalid_frames_and_input_before_native_delivery() {
         let mut frame = EditorFrame {
+            popups: Vec::new(),
             width: 2,
             height: 1,
             native_size: (1, 1),
