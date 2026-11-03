@@ -864,7 +864,13 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(request_pending(&mut worker).unwrap());
+        // TCP delivery is asynchronous even on loopback. Readiness polling must keep
+        // returning promptly until the sent frame actually reaches this socket.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !request_pending(&mut worker).unwrap() {
+            assert!(Instant::now() < deadline, "sent control frame was not delivered");
+            std::thread::yield_now();
+        }
         let request: Request = protocol::receive(&mut worker).unwrap();
         assert!(matches!(request.command, Command::Poll));
         assert_eq!(request.id, 1);
