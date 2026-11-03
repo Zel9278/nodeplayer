@@ -196,6 +196,13 @@ impl HostWindow {
                 // Closing only hides it; we notice in `poll` and the owner drops us.
                 unsafe { window.setReleasedWhenClosed(false) };
                 window.setTitle(&NSString::from_str(title));
+                window.setLevel(0);
+                window.setCollectionBehavior(
+                    NSWindowCollectionBehavior::Primary
+                        | NSWindowCollectionBehavior::Managed
+                        | NSWindowCollectionBehavior::ParticipatesInCycle,
+                );
+                log::debug!("editor window level={} collection={:?}", window.level(), window.collectionBehavior());
                 window.setContentView(Some(&view));
                 window.center();
                 window.makeKeyAndOrderFront(None);
