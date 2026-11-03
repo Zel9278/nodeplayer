@@ -2,8 +2,10 @@
 //!
 //! `PrintWindow` and the fallback DC readback are synchronous. Only the editor's UI thread
 //! may use this adapter; none of these operations belongs in the parent or audio callback.
-//! GPU-owned surfaces may not support this capture path. The DC fallback needs visible
-//! source contents, so this backend does not assume hidden-window rendering.
+//! GPU-owned surfaces may not support this capture path. Capture hosts stay mapped outside
+//! the virtual desktop so native children and timers remain active without a desktop window.
+//! Offscreen sources require PrintWindow/WM_PRINT support; a screen-DC readback cannot
+//! recover their pixels.
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -98,6 +100,10 @@ impl NativeCapture {
             let printed = PrintWindow(self.hwnd.0, bitmap.memory_dc.0, 3) != 0;
             drop(saved);
             if !printed {
+                ensure!(
+                    MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONULL) != HMONITOR::default(),
+                    "offscreen editor does not support PrintWindow capture"
+                );
                 BitBlt(
                     bitmap.memory_dc,
                     0,
@@ -401,6 +407,7 @@ mod tests {
 
     struct State {
         color: [u8; 3],
+        timer_ticks: Cell<u32>,
         down: Cell<bool>,
         clicks: Cell<u32>,
         last_move: Cell<Option<(i32, i32)>>,
@@ -428,7 +435,8 @@ mod tests {
                 return;
             }
             let [r, g, b] = if state.clicks.get() == 0 {
-                state.color
+                let [r, g, b] = state.color;
+                [r.wrapping_add((state.timer_ticks.get() % 64) as u8), g, b]
             } else {
                 [37, 171, 116]
             };
@@ -462,6 +470,11 @@ mod tests {
                         return LRESULT(0);
                     }
                     WM_ERASEBKGND => return LRESULT(1),
+                    WM_TIMER => {
+                        state.timer_ticks.set(state.timer_ticks.get() + 1);
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
                     WM_LBUTTONDOWN => {
                         state.down.set(true);
                         return LRESULT(0);
@@ -510,6 +523,7 @@ mod tests {
             .map_err(|error| anyhow::anyhow!("register adapter-test window: {error}"))?;
         let state = Box::new(State {
             color,
+            timer_ticks: Cell::new(0),
             down: Cell::new(false),
             clicks: Cell::new(0),
             last_move: Cell::new(None),
@@ -630,6 +644,138 @@ mod tests {
             unsafe { IsWindow(root.hwnd) }.as_bool(),
             "capture does not own its borrowed source window"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn capture_host_stays_off_desktop_while_redrawing_resizing_and_reopening() -> Result<()> {
+        use crate::plugins::{Placement, window::HostWindow};
+        use std::time::{Duration, Instant};
+
+        let foreground = unsafe { GetForegroundWindow() };
+        for _ in 0..2 {
+            let host = HostWindow::create(
+                Placement::CaptureSource,
+                640,
+                360,
+                "capture regression",
+                false,
+            )?;
+            host.set_fixed_size(640, 360, false);
+            let hwnd = HWND(host.handle() as *mut c_void);
+            let check_host = || -> Result<()> {
+                unsafe {
+                    let mut bounds = RECT::default();
+                    GetWindowRect(hwnd, &mut bounds)?;
+                    ensure!(
+                        bounds.right < GetSystemMetrics(SM_XVIRTUALSCREEN)
+                            && bounds.bottom < GetSystemMetrics(SM_YVIRTUALSCREEN),
+                        "capture source intersects the virtual desktop: {bounds:?}"
+                    );
+                    ensure!(
+                        IsWindowVisible(hwnd).as_bool(),
+                        "capture source must stay mapped"
+                    );
+                    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+                    ensure!(
+                        ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0
+                            == (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0
+                            && ex & WS_EX_APPWINDOW.0 == 0,
+                        "capture source entered task switching or permits activation"
+                    );
+                    ensure!(
+                        GetWindowLongW(hwnd, GWL_STYLE) as u32 & (WS_CAPTION | WS_THICKFRAME).0
+                            == 0,
+                        "capture source gained a desktop frame"
+                    );
+                    ensure!(
+                        GetForegroundWindow() == foreground,
+                        "capture source changed foreground focus"
+                    );
+                }
+                Ok(())
+            };
+            check_host()?;
+
+            let child = fixture(Some(hwnd), (20, 24), (240, 180), [38, 139, 188])?;
+            let mut capture = NativeCapture::new(host.handle())?;
+            let first = capture.capture((1, 1))?;
+            assert_eq!(first.native_size, (640, 360));
+            assert_eq!(pixel(&first, 40, 40), [38, 139, 188, 255]);
+
+            ensure!(
+                unsafe { SetTimer(child.hwnd, 1, 20, None) } != 0,
+                "start capture regression timer"
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut changed = false;
+            while Instant::now() < deadline {
+                host.poll();
+                let next = capture.capture((640, 360))?;
+                changed |= next.rgba != first.rgba;
+                if child.state.timer_ticks.get() >= 3 && changed {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            unsafe { KillTimer(child.hwnd, 1) }?;
+            ensure!(
+                child.state.timer_ticks.get() >= 3 && changed,
+                "offscreen editor animation stopped"
+            );
+            assert_eq!(
+                child.state.last_move.get(),
+                None,
+                "animation must not depend on pointer input"
+            );
+
+            capture.pointer(EditorPointer {
+                position: [40.0, 40.0],
+                kind: PointerKind::Down(1),
+                buttons: 1,
+            })?;
+            capture.pointer(EditorPointer {
+                position: [40.0, 40.0],
+                kind: PointerKind::Up(1),
+                buttons: 0,
+            })?;
+            assert_eq!(child.state.clicks.get(), 1);
+            assert_eq!(
+                pixel(&capture.capture((640, 360))?, 40, 40),
+                [37, 171, 116, 255]
+            );
+
+            host.resize(480, 300);
+            assert_eq!(capture.capture((640, 360))?.native_size, (480, 300));
+            check_host()?;
+            unsafe {
+                // A plugin reposition request and a display-layout notification must not
+                // expose the native source after its initial offscreen creation.
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )?;
+                SendMessageW(hwnd, WM_DISPLAYCHANGE, WPARAM(0), LPARAM(0));
+            }
+            check_host()?;
+            drop(capture);
+            assert!(
+                unsafe { IsWindow(hwnd) }.as_bool(),
+                "capture owns only its readback resources"
+            );
+            drop(child);
+            drop(host);
+            assert!(
+                !unsafe { IsWindow(hwnd) }.as_bool(),
+                "capture host survived editor close"
+            );
+        }
         Ok(())
     }
 }

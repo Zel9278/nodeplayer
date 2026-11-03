@@ -54,7 +54,8 @@ private notes can be kept under the ignored `.local/` directory.
 Captured editor presentation is independently enabled with `--experimental-editor-capture`.
 It works with local hosting or alongside `--experimental-plugin-isolation`; on macOS the
 latter requires capture, since native NSView parenting cannot cross a process boundary.
-The native source stays visible, and graph zoom never requests a plugin UI-scale change.
+Captured editors use a private native rendering host, and graph zoom never requests
+a plugin UI-scale change.
 See [plugins](plugins.md) for input and renderer limitations.
 
 Diagnostic GUI scenarios can wait for `editor-frame` to confirm that an actual captured

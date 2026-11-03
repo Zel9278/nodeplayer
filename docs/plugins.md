@@ -38,10 +38,11 @@ not to the plugin.
 
 `--experimental-editor-capture` displays VST3/CLAP editors as images in the graph.
 The editor image, frame, and overlapping UI zoom and move together without changing the
-plugin's own UI scale. The source editor remains in a separate visible window; closing it
-also closes its graph image. Clicks and drags are forwarded to the source, and Alt+wheel
+plugin's own UI scale. A private native host keeps the editor rendering without opening
+a second desktop window. Closing the graph editor also destroys its native host.
+Clicks and drags are forwarded to the source, and Alt+wheel
 forwards wheel input. Keyboard/IME, drag-and-drop, and separate native popup windows are
-not forwarded; use the source window or **Pop out** for those interactions. Capture can
+not forwarded; use **Pop out** for those interactions. Capture can
 fail for some GPU-rendered editors. The flag also works with
 `--experimental-plugin-isolation`, where capture and native input stay in the worker.
 On macOS, isolation requires this captured-editor mode. Linux requires X11/XWayland.

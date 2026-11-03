@@ -176,6 +176,20 @@ impl HostWindow {
                 window.makeKeyAndOrderFront(None);
                 (None, Some(window))
             }
+            Placement::CaptureSource => {
+                let window = unsafe {
+                    NSWindow::initWithContentRect_styleMask_backing_defer(
+                        NSWindow::alloc(mtm), frame, NSWindowStyleMask::Borderless,
+                        NSBackingStoreType::Buffered, false,
+                    )
+                };
+                unsafe { window.setReleasedWhenClosed(false) };
+                window.setExcludedFromWindowsMenu(true);
+                window.setContentView(Some(&view));
+                // Keep an attached native view and backing scale without ever ordering
+                // a desktop window, taking focus, or adding a Window-menu entry.
+                (None, Some(window))
+            }
             Placement::Embedded(parent) => {
                 let parent = unsafe { (parent as *const NSView).as_ref() }.context("no parent view")?;
                 let container = Container::new(mtm, frame);
@@ -228,6 +242,9 @@ impl HostWindow {
 
     /// Lets the user resize a top-level editor, or pins it to `w`×`h`.
     pub fn set_fixed_size(&self, w: u32, h: u32, fixed: bool) {
+        if self.placement == Placement::CaptureSource {
+            return;
+        }
         let Some(window) = &self.window else { return };
         if fixed {
             self.size.set((w.max(1), h.max(1)));
@@ -288,7 +305,8 @@ impl HostWindow {
     pub fn poll(&self) -> Vec<WinEvent> {
         let Some(window) = &self.window else { return Vec::new() };
         let mut events = Vec::new();
-        if !self.closed.get() && !window.isVisible() && !window.isMiniaturized() {
+        if self.placement != Placement::CaptureSource
+            && !self.closed.get() && !window.isVisible() && !window.isMiniaturized() {
             self.closed.set(true);
             events.push(WinEvent::Close);
         }

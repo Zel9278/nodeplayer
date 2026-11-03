@@ -76,10 +76,10 @@ impl PluginNode {
         self.editor = None;
         self.editor_view = Default::default();
         self.editor = Some(if crate::runtime::get().experimental_editor_capture
-            && placement != Placement::Window && self.instance.remote_status().is_none()
+            && matches!(placement, Placement::Embedded(_)) && self.instance.remote_status().is_none()
             && matches!(self.info().format, Format::Vst3 | Format::Clap)
         {
-            let source = self.instance.open_editor(Placement::Window)?;
+            let source = self.instance.open_editor(Placement::CaptureSource)?;
             crate::plugins::surface::capture(source, placement)?
         } else {
             self.instance.open_editor(placement)?

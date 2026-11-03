@@ -105,7 +105,7 @@ impl EditorPointer {
     }
 }
 
-/// The native source must have its own mapped window, rather than the graph's masked parent.
+/// The native source uses a private rendering host, separate from the graph's masked parent.
 pub fn capture(source: Box<dyn Editor>, placement: Placement) -> Result<Box<dyn Editor>> {
     let handle = source
         .native_handle()

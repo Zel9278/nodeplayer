@@ -4,6 +4,7 @@
 //! An editor is either a top-level window of its own, or embedded as a child of the app's
 //! main window. Embedded editors live in a clipping "container" window so they can be
 //! scrolled and partially covered by the host's layout.
+//! Captured editors keep a mapped, unmanaged source outside the root window instead.
 
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
@@ -17,6 +18,12 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::{Placement, Spot, WinEvent, WindowId};
+
+// X11 root coordinates are nonnegative, including multi-monitor layouts. Keep the
+// complete source outside that space while leaving room for the maximum 8192px
+// capture size and synthetic pointer coordinates in the signed X11 coordinate range.
+const CAPTURE_ORIGIN: i16 = -16384;
+const MAX_CAPTURE_DIMENSION: u32 = 8192;
 
 pub struct HostWindow {
     pub conn: RustConnection,
@@ -74,6 +81,29 @@ impl HostWindow {
                 conn.change_property32(PropMode::REPLACE, id, protocols, AtomEnum::ATOM, &[wm_delete])?;
                 (id, None)
             }
+            Placement::CaptureSource => {
+                let id = conn.generate_id()?;
+                conn.create_window(
+                    depth,
+                    id,
+                    root,
+                    CAPTURE_ORIGIN,
+                    CAPTURE_ORIGIN,
+                    w,
+                    h,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    visual,
+                    &aux.override_redirect(1).event_mask(EventMask::STRUCTURE_NOTIFY),
+                )?
+                .check()?;
+                // Stay mapped for XComposite, but never become a managed desktop
+                // window or a physical pointer target. Synthetic input is delivered
+                // directly to the plugin descendants by the capture adapter.
+                conn.shape_rectangles(shape::SO::SET, shape::SK::INPUT, ClipOrdering::UNSORTED, id, 0, 0, &[])?
+                    .check()?;
+                (id, None)
+            }
             Placement::Embedded(parent) => {
                 let container = conn.generate_id()?;
                 conn.create_window(depth, container, parent as u32, 0, 0, w, h, 0, WindowClass::INPUT_OUTPUT, visual, &aux)?;
@@ -83,7 +113,13 @@ impl HostWindow {
             }
         };
         // Embedded containers stay unmapped until the host places them.
-        conn.map_window(id)?;
+        if placement == Placement::CaptureSource {
+            // Capture attaches through another X11 connection immediately after
+            // creation, so mapping must have completed before handing it the XID.
+            conn.map_window(id)?.check()?;
+        } else {
+            conn.map_window(id)?;
+        }
         conn.flush()?;
         Ok(Self {
             conn,
@@ -111,7 +147,12 @@ impl HostWindow {
     }
 
     pub fn resize(&self, w: u32, h: u32) {
-        let (w, h) = (w.max(1), h.max(1));
+        let (w, h) = if self.placement == Placement::CaptureSource {
+            // A plugin resize must never extend the parked source onto the root.
+            (w.clamp(1, MAX_CAPTURE_DIMENSION), h.clamp(1, MAX_CAPTURE_DIMENSION))
+        } else {
+            (w.max(1), h.max(1))
+        };
         self.size.set((w, h));
         let _ = self.conn.configure_window(self.id, &ConfigureWindowAux::new().width(w).height(h));
         let _ = self.conn.flush();
@@ -119,7 +160,7 @@ impl HostWindow {
 
     /// Lets the window manager resize a top-level editor, or pins it to `w`×`h`.
     pub fn set_fixed_size(&self, w: u32, h: u32, fixed: bool) {
-        if self.container.is_some() {
+        if self.container.is_some() || self.placement == Placement::CaptureSource {
             return;
         }
         // WM_NORMAL_HINTS: flags, pad*4, min w/h, max w/h, ...
@@ -246,7 +287,7 @@ impl HostWindow {
         let mut out = Vec::new();
         while let Ok(Some(ev)) = self.conn.poll_for_event() {
             match ev {
-                Event::ClientMessage(e) if e.data.as_data32()[0] == self.wm_delete => out.push(WinEvent::Close),
+                Event::ClientMessage(e) if self.wm_delete != 0 && e.data.as_data32()[0] == self.wm_delete => out.push(WinEvent::Close),
                 Event::ConfigureNotify(e) if e.window == self.id && self.container.is_none() => {
                     let size = (e.width as u32, e.height as u32);
                     if size != self.size.get() {

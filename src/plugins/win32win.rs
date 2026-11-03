@@ -5,6 +5,8 @@
 //! main window. Embedded editors live in a clipping "container" window so they can be
 //! scrolled and partially covered by the host's layout. The windows belong to the UI thread,
 //! whose event loop (winit's) dispatches their messages.
+//! Captured editors use a mapped, borderless tool window outside the virtual desktop;
+//! it never activates or becomes a separate taskbar/Alt-Tab entry.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Once;
@@ -48,6 +50,7 @@ struct State {
     size: Cell<(u32, u32)>,
     /// The user can't resize a top-level window with this set.
     fixed: Cell<bool>,
+    capture_source: bool,
     events: RefCell<Vec<WinEvent>>,
 }
 
@@ -103,6 +106,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         s.events.borrow_mut().push(WinEvent::Resized(size.0, size.1));
                     }
                 }
+                WM_MOUSEACTIVATE if s.capture_source => return LRESULT(MA_NOACTIVATE as isize),
+                WM_WINDOWPOSCHANGING if s.capture_source => {
+                    if let Some(position) = (lparam.0 as *mut WINDOWPOS).as_mut() {
+                        let mut bounds = RECT::default();
+                        let size = if position.flags & SWP_NOSIZE == SWP_NOSIZE
+                            && GetWindowRect(hwnd, &mut bounds).is_ok()
+                        {
+                            (bounds.right - bounds.left, bounds.bottom - bounds.top)
+                        } else {
+                            (position.cx, position.cy)
+                        };
+                        (position.x, position.y) = capture_origin(size);
+                        position.flags &= !SWP_NOMOVE;
+                    }
+                    return LRESULT(0);
+                }
+                WM_DISPLAYCHANGE if s.capture_source => {
+                    let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    return LRESULT(0);
+                }
                 WM_GETMINMAXINFO if s.fixed.get() => {
                     let (w, h) = outer_size(hwnd, s.size.get());
                     let info = &mut *(lparam.0 as *mut MINMAXINFO);
@@ -130,32 +153,75 @@ fn outer_size(hwnd: HWND, (w, h): (u32, u32)) -> (i32, i32) {
     (r.right - r.left, r.bottom - r.top)
 }
 
-fn create(ex: WINDOW_EX_STYLE, title: &str, style: WINDOW_STYLE, (w, h): (i32, i32), parent: Option<HWND>) -> Result<HWND> {
+fn capture_origin((w, h): (i32, i32)) -> (i32, i32) {
+    // The virtual desktop includes monitors left of and above the primary display.
+    // Keep the complete source outside that bounding rectangle, including after resize.
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN)
+                .saturating_sub(w.max(1))
+                .saturating_sub(32),
+            GetSystemMetrics(SM_YVIRTUALSCREEN)
+                .saturating_sub(h.max(1))
+                .saturating_sub(32),
+        )
+    }
+}
+
+fn create(
+    ex: WINDOW_EX_STYLE,
+    title: &str,
+    style: WINDOW_STYLE,
+    (x, y, w, h): (i32, i32, i32, i32),
+    parent: Option<HWND>,
+) -> Result<HWND> {
     let title = HSTRING::from(title);
     unsafe {
-        CreateWindowExW(ex, CLASS, &title, style, 0, 0, w, h, parent.unwrap_or_default(), None, instance(), None)
+        CreateWindowExW(ex, CLASS, &title, style, x, y, w, h, parent.unwrap_or_default(), None, instance(), None)
             .context("can't create the editor window")
     }
 }
 
 impl HostWindow {
     /// `_announce` is for Wine editors under X11; Windows plugins run natively here.
-    pub fn create(placement: Placement, w: u32, h: u32, title: &str, _announce: bool) -> Result<Self> {
+    pub fn create(
+        placement: Placement,
+        w: u32,
+        h: u32,
+        title: &str,
+        _announce: bool,
+    ) -> Result<Self> {
         register_class();
         let (w, h) = (w.clamp(16, 8192), h.clamp(16, 8192));
-        let state = Box::new(State { size: Cell::new((w, h)), fixed: Cell::new(false), events: RefCell::new(Vec::new()) });
+        let state = Box::new(State {
+            size: Cell::new((w, h)),
+            fixed: Cell::new(false),
+            capture_source: placement == Placement::CaptureSource,
+            events: RefCell::new(Vec::new()),
+        });
         let (id, container) = match placement {
             Placement::Window => {
                 let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
-                let id = create(WINDOW_EX_STYLE::default(), title, style, (w as i32, h as i32), None)?;
+                let id = create(WINDOW_EX_STYLE::default(), title, style, (0, 0, w as i32, h as i32), None)?;
+                (id, None)
+            }
+            Placement::CaptureSource => {
+                let (x, y) = capture_origin((w as i32, h as i32));
+                let id = create(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    "",
+                    WS_POPUP | WS_CLIPCHILDREN,
+                    (x, y, w as i32, h as i32),
+                    None,
+                )?;
                 (id, None)
             }
             Placement::Embedded(parent) => {
                 let parent = HWND(parent as *mut _);
                 // Hidden until the host places it.
                 let style = WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
-                let container = create(WINDOW_EX_STYLE::default(), "", style, (w as i32, h as i32), Some(parent))?;
-                let id = match create(WINDOW_EX_STYLE::default(), "", style | WS_VISIBLE, (w as i32, h as i32), Some(container)) {
+                let container = create(WINDOW_EX_STYLE::default(), "", style, (0, 0, w as i32, h as i32), Some(parent))?;
+                let id = match create(WINDOW_EX_STYLE::default(), "", style | WS_VISIBLE, (0, 0, w as i32, h as i32), Some(container)) {
                     Ok(id) => id,
                     Err(e) => {
                         unsafe { DestroyWindow(container).ok() };
@@ -182,7 +248,14 @@ impl HostWindow {
             // The window was created with the client size as its outer size.
             win.resize(w, h);
             unsafe {
-                let _ = ShowWindow(id, SW_SHOW);
+                if placement == Placement::CaptureSource {
+                    // Map only after offscreen positioning, without the first-ShowWindow
+                    // startup-state override or an activation/visible desktop flash.
+                    SetWindowPos(id, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+                        .context("show offscreen editor capture source")?;
+                } else {
+                    let _ = ShowWindow(id, SW_SHOW);
+                }
             }
         }
         Ok(win)
@@ -215,6 +288,9 @@ impl HostWindow {
         self.state.fixed.set(fixed);
         if fixed {
             self.state.size.set((w.max(1), h.max(1)));
+        }
+        if self.placement == Placement::CaptureSource {
+            return;
         }
         unsafe {
             let mut style = GetWindowLongW(self.id, GWL_STYLE) as u32;

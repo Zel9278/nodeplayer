@@ -151,9 +151,10 @@ child embeds its editor in a parent HWND/XID or owns a top-level window.
 Cross-process HWND embedding can still induce OS-level synchronous interactions in
 the parent toolkit; this native mode does not prove GUI-hang isolation.
 
-With capture enabled, an embedded editor request instead creates the source in its
-own visible worker window. AppKit/PrintWindow/XComposite capture and native pointer
-delivery stay on the worker main thread. The parent paints the image in the ordinary
+With capture enabled, an embedded editor request instead creates the source in a
+private native host in the worker, without a second desktop window.
+AppKit/PrintWindow/XComposite capture and native pointer delivery stay on the worker
+main thread. The parent paints the image in the ordinary
 graph layer, checks coverage after all nodes/layers are known, and inverse-maps input.
 Graph movement and zoom do not move, mask, resize, or rescale the native source.
 Pop-out editors retain ordinary native behavior.
@@ -172,7 +173,9 @@ may coalesce; button and wheel barriers preserve order. Transitions retry throug
 queue pressure without blocking the parent. If even the bounded transition queue
 fills, a reserved close slot closes the editor rather than leaving a stuck drag.
 Keyboard/IME, drag-and-drop, and separate popup windows are not bridged. The source
-must stay visible/mapped, and GPU editor capture remains renderer-dependent.
+stays alive until the graph editor closes. Windows and X11 capture hosts remain mapped
+outside the desktop; the AppKit host is never ordered on screen. GPU editor capture
+remains renderer-dependent.
 Capture uses CPU readback/upload at approximately 30 updates per second; this is not
 a production bandwidth/latency qualification.
 

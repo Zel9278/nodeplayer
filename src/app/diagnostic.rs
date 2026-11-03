@@ -130,9 +130,7 @@ impl App {
                             .collect();
                         for (o, i) in inputs {
                             self.snarl.disconnect(o, i);
-                            if run.scenario.audio_file.is_some() {
-                                self.snarl.connect(o, InPinId { node: id, input: 0 });
-                            }
+                            self.snarl.connect(o, InPinId { node: id, input: 0 });
                         }
                         self.snarl.connect(
                             OutPinId {

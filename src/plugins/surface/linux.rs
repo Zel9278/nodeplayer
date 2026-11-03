@@ -2,7 +2,8 @@
 //!
 //! XComposite retains the complete hierarchy while its native source is obscured. The
 //! capture connection owns only its redirection and named pixmap; the editor's backend
-//! continues to own mapping, resizing, event pumping, and destruction.
+//! continues to own mapping, resizing, event pumping, and destruction. A capture-only
+//! host remains mapped outside the root window with physical input disabled.
 
 use anyhow::{Context, Result, bail, ensure};
 use x11rb::connection::Connection;
@@ -732,6 +733,222 @@ mod tests {
         }
         assert!(pressed && dragged && released);
         assert!(capture.pointer_target.is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an X11 display with XComposite and Shape"]
+    fn capture_source_stays_offscreen_without_focus_or_physical_input() -> Result<()> {
+        use crate::plugins::{Placement, window::HostWindow};
+        use x11rb::protocol::shape::{ConnectionExt as _, SK};
+
+        let (observer, screen) = x11rb::connect(None)?;
+        let screen = &observer.setup().roots[screen];
+        let root = screen.root;
+        let visual = screen
+            .allowed_depths
+            .iter()
+            .flat_map(|depth| &depth.visuals)
+            .find(|visual| visual.visual_id == screen.root_visual)
+            .context("capture host fixture visual")?;
+        let masks = [visual.red_mask, visual.green_mask, visual.blue_mask];
+        let focus = observer.get_input_focus()?.reply()?.focus;
+        let pointer = observer.query_pointer(root)?.reply()?;
+        let client_list = observer
+            .intern_atom(false, b"_NET_CLIENT_LIST")?
+            .reply()?
+            .atom;
+
+        // A second client redirects root children as a compositor would. Automatic
+        // per-source capture must coexist with that manual parent redirection.
+        for compositor in [false, true] {
+            if compositor {
+                observer
+                    .composite_redirect_subwindows(root, Redirect::MANUAL)?
+                    .check()?;
+            }
+            let background = observer
+                .get_image(ImageFormat::Z_PIXMAP, root, 0, 0, 32, 32, u32::MAX)?
+                .reply()?
+                .data;
+            for _ in 0..2 {
+                let host = HostWindow::create(
+                    Placement::CaptureSource,
+                    256,
+                    144,
+                    "capture source",
+                    false,
+                )?;
+                let attributes = observer.get_window_attributes(host.id)?.reply()?;
+                assert!(attributes.override_redirect);
+                assert_eq!(attributes.map_state, MapState::VIEWABLE);
+                let geometry = observer.get_geometry(host.id)?.reply()?;
+                assert!(i32::from(geometry.x) + i32::from(geometry.width) < 0);
+                assert!(i32::from(geometry.y) + i32::from(geometry.height) < 0);
+                assert!(
+                    observer
+                        .shape_get_rectangles(host.id, SK::INPUT)?
+                        .reply()?
+                        .rectangles
+                        .is_empty()
+                );
+                assert_eq!(observer.get_input_focus()?.reply()?.focus, focus);
+                let clients = observer
+                    .get_property(false, root, client_list, AtomEnum::WINDOW, 0, u32::MAX)?
+                    .reply()?;
+                assert!(
+                    !clients
+                        .value32()
+                        .into_iter()
+                        .flatten()
+                        .any(|id| id == host.id)
+                );
+                let xembed = host.conn.intern_atom(false, b"_XEMBED")?.reply()?.atom;
+                host.conn
+                    .send_event(
+                        false,
+                        host.id,
+                        EventMask::NO_EVENT,
+                        ClientMessageEvent::new(32, host.id, xembed, [0u32; 5]),
+                    )?
+                    .check()?;
+                assert!(
+                    host.poll().is_empty(),
+                    "an unrelated zero-timestamp ClientMessage must not close the source"
+                );
+
+                let gc = host.conn.generate_id()?;
+                host.conn
+                    .create_gc(gc, host.id, &CreateGCAux::new())?
+                    .check()?;
+                let paint = |width: u16, height: u16, green: u8| -> Result<()> {
+                    for (rgb, y) in [([255, green, 0], 0), ([0, green, 255], height / 2)] {
+                        let color = rgb
+                            .into_iter()
+                            .zip(masks)
+                            .fold(0, |pixel, (value, mask)| pixel | pack_channel(value, mask));
+                        host.conn
+                            .change_gc(gc, &ChangeGCAux::new().foreground(color))?
+                            .check()?;
+                        host.conn
+                            .poly_fill_rectangle(
+                                host.id,
+                                gc,
+                                &[Rectangle {
+                                    x: 0,
+                                    y: y as i16,
+                                    width,
+                                    height: height / 2,
+                                }],
+                            )?
+                            .check()?;
+                    }
+                    Ok(())
+                };
+                let mut capture = NativeCapture::new(host.handle())?;
+                paint(256, 144, 0)?;
+                let first = capture.capture(host.size())?;
+                assert_eq!(pixel(&first, 4, 4), [255, 0, 0, 255]);
+                assert_eq!(pixel(&first, 4, 140), [0, 0, 255, 255]);
+                for green in [64, 128, 192] {
+                    paint(256, 144, green)?;
+                    let frame = capture.capture(host.size())?;
+                    assert_ne!(
+                        frame.rgba, first.rgba,
+                        "offscreen source must continue producing new pixels"
+                    );
+                    assert_eq!(pixel(&frame, 4, 4), [255, green, 0, 255]);
+                }
+
+                let child = host.conn.generate_id()?;
+                host.conn
+                    .create_window(
+                        x11rb::COPY_DEPTH_FROM_PARENT,
+                        child,
+                        host.id,
+                        20,
+                        30,
+                        80,
+                        60,
+                        0,
+                        WindowClass::INPUT_OUTPUT,
+                        x11rb::COPY_FROM_PARENT,
+                        &CreateWindowAux::new()
+                            .background_pixel(0)
+                            .event_mask(EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE),
+                    )?
+                    .check()?;
+                host.conn.map_window(child)?.check()?;
+                for (kind, buttons) in [(PointerKind::Down(1), 1), (PointerKind::Up(1), 0)] {
+                    capture.pointer(EditorPointer {
+                        position: [40.0, 50.0],
+                        kind,
+                        buttons,
+                    })?;
+                }
+                host.conn.get_input_focus()?.reply()?;
+                let mut transitions = 0;
+                while let Some(event) = host.conn.poll_for_event()? {
+                    if let Event::ButtonPress(event) | Event::ButtonRelease(event) = event {
+                        assert_eq!((event.event, event.event_x, event.event_y), (child, 20, 20));
+                        transitions += 1;
+                    }
+                }
+                assert_eq!(
+                    transitions, 2,
+                    "synthetic graph input must reach the native child"
+                );
+                host.resize(320, 180);
+                paint(320, 180, 80)?;
+                let resized = capture.capture((256, 144))?;
+                assert_eq!(
+                    (resized.width, resized.height, resized.native_size),
+                    (320, 180, (320, 180))
+                );
+                assert_eq!(pixel(&resized, 4, 176), [0, 80, 255, 255]);
+                host.resize(u32::MAX, 180);
+                let bounded = host.conn.get_geometry(host.id)?.reply()?;
+                assert_eq!(bounded.width, 8192);
+                assert!(i32::from(bounded.x) + i32::from(bounded.width) < 0);
+                assert_eq!(observer.get_input_focus()?.reply()?.focus, focus);
+                let still = observer.query_pointer(root)?.reply()?;
+                assert_eq!(
+                    (still.root_x, still.root_y),
+                    (pointer.root_x, pointer.root_y)
+                );
+                assert_eq!(
+                    observer
+                        .get_image(ImageFormat::Z_PIXMAP, root, 0, 0, 32, 32, u32::MAX)?
+                        .reply()?
+                        .data,
+                    background
+                );
+                host.conn.free_gc(gc)?.check()?;
+                let id = host.id;
+                drop(capture);
+                assert_eq!(
+                    observer.get_window_attributes(id)?.reply()?.map_state,
+                    MapState::VIEWABLE
+                );
+                drop(host);
+                // Destruction is flushed on the owner's connection; the observer
+                // may briefly run first on the server's other client queue.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                while observer.get_geometry(id)?.reply().is_ok() {
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "capture source was not destroyed"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(observer.get_geometry(child)?.reply().is_err());
+            }
+            if compositor {
+                observer
+                    .composite_unredirect_subwindows(root, Redirect::MANUAL)?
+                    .check()?;
+            }
+        }
         Ok(())
     }
 }
