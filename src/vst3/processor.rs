@@ -328,6 +328,49 @@ impl Processor for Vst3Processor {
         self.process_midi(n, inputs, outputs, midi_in, midi_out);
     }
 
+    fn flush_params(&mut self) {
+        // VST3 permits parameter-only process calls with zero samples and no buses.
+        // Flush only the queue snapshot: concurrent UI edits cannot extend this work.
+        // https://steinbergmedia.github.io/vst3_dev_portal/pages/FAQ/Processing.html
+        let mut pending = self.from_ui.slots();
+        while pending != 0 {
+            self.in_changes.clear();
+            self.out_changes.clear();
+            let count = pending.min(MAX_CHANGED_PARAMS);
+            for _ in 0..count {
+                if let Ok(change) = self.from_ui.pop() {
+                    self.in_changes.push(change);
+                }
+            }
+            pending -= count;
+            let mut data = ProcessData {
+                processMode: ProcessModes_::kRealtime as i32,
+                symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+                numSamples: 0,
+                numInputs: 0,
+                numOutputs: 0,
+                inputs: std::ptr::null_mut(),
+                outputs: std::ptr::null_mut(),
+                inputParameterChanges: self
+                    .in_changes
+                    .as_com_ref::<IParameterChanges>()
+                    .unwrap()
+                    .as_ptr(),
+                outputParameterChanges: self
+                    .out_changes
+                    .as_com_ref::<IParameterChanges>()
+                    .unwrap()
+                    .as_ptr(),
+                inputEvents: std::ptr::null_mut(),
+                outputEvents: std::ptr::null_mut(),
+                processContext: &mut *self.ctx,
+            };
+            unsafe { self.audio.process(&mut data) };
+            for change in self.out_changes.iter() {
+                let _ = self.to_ui.push(change);
+            }
+        }
+    }
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
         let (i, o) = (&inputs[0], &mut outputs[0]);
         let StereoBuf { l, r } = o;
@@ -379,6 +422,7 @@ mod tests {
     struct Capture {
         blocks: Mutex<Vec<(u32, i64, i64)>>,
         processing: Mutex<Vec<bool>>,
+        flushes: Mutex<Vec<Vec<(u32, f64)>>>,
     }
     struct Plugin(Arc<Capture>);
     impl vst3::Class for Plugin {
@@ -416,12 +460,44 @@ mod tests {
             kResultOk
         }
         unsafe fn process(&self, data: *mut ProcessData) -> tresult {
-            let ctx = unsafe { &*(*data).processContext };
+            let data = unsafe { &*data };
+            let ctx = unsafe { &*data.processContext };
             self.0.blocks.lock().unwrap().push((
                 ctx.state,
                 ctx.projectTimeSamples,
                 ctx.continousTimeSamples,
             ));
+            if data.numSamples == 0 {
+                assert_eq!((data.numInputs, data.numOutputs), (0, 0));
+                assert!(data.inputs.is_null() && data.outputs.is_null());
+                assert!(data.inputEvents.is_null() && data.outputEvents.is_null());
+                let input = unsafe { vst3::ComRef::from_raw(data.inputParameterChanges) }.unwrap();
+                let output =
+                    unsafe { vst3::ComRef::from_raw(data.outputParameterChanges) }.unwrap();
+                let mut changes = Vec::new();
+                for index in 0..unsafe { input.getParameterCount() } {
+                    let queue =
+                        unsafe { vst3::ComRef::from_raw(input.getParameterData(index)) }.unwrap();
+                    let id = unsafe { queue.getParameterId() };
+                    let mut offset = -1;
+                    let mut value = 0.0;
+                    assert_eq!(
+                        unsafe { queue.getPoint(0, &mut offset, &mut value) },
+                        kResultOk
+                    );
+                    assert_eq!(offset, 0);
+                    changes.push((id, value));
+                    let echo = unsafe {
+                        vst3::ComRef::from_raw(output.addParameterData(&id, std::ptr::null_mut()))
+                    }
+                    .unwrap();
+                    assert_eq!(
+                        unsafe { echo.addPoint(0, value, std::ptr::null_mut()) },
+                        kResultOk
+                    );
+                }
+                self.0.flushes.lock().unwrap().push(changes);
+            }
             kResultOk
         }
         unsafe fn getTailSamples(&self) -> u32 {
@@ -492,4 +568,77 @@ mod tests {
         proc.deactivate();
         assert_eq!(*capture.processing.lock().unwrap(), [true, false]);
     }
+
+    #[test]
+    fn restart_flush_delivers_all_pending_edits_without_audio_or_clock_advance() {
+        for started in [false, true] {
+            let capture = Arc::new(Capture::default());
+            let audio = ComWrapper::new(Plugin(capture.clone()))
+                .to_com_ptr::<IAudioProcessor>()
+                .unwrap();
+            let count = MAX_CHANGED_PARAMS + 17;
+            let (mut tx, from_ui) = rtrb::RingBuffer::new(count);
+            let (to_ui, mut rx) = rtrb::RingBuffer::new(count);
+            let mut proc = Vst3Processor::new(
+                audio,
+                from_ui,
+                to_ui,
+                &[2],
+                &[2],
+                (true, true),
+                CcMap::new(None),
+                48_000.0,
+                64,
+            );
+            proc.ctx.projectTimeSamples = 60_000;
+            proc.ctx.continousTimeSamples = 4096;
+            if started {
+                proc.process(64, &mut [StereoBuf::new()], &mut [StereoBuf::new()]);
+            }
+            let before = (proc.ctx.projectTimeSamples, proc.ctx.continousTimeSamples);
+            proc.flush_params();
+            assert!(capture.flushes.lock().unwrap().is_empty());
+            for id in 0..count as u32 {
+                tx.push(ParamChange {
+                    id,
+                    value: id as f64 / count as f64,
+                })
+                .unwrap();
+            }
+            proc.flush_params();
+            assert_eq!(
+                (proc.ctx.projectTimeSamples, proc.ctx.continousTimeSamples),
+                before
+            );
+            assert_eq!(proc.started, started);
+            let expected: Vec<_> = (0..count as u32)
+                .map(|id| (id, id as f64 / count as f64))
+                .collect();
+            let flushes = capture.flushes.lock().unwrap();
+            assert_eq!(
+                flushes.iter().flatten().copied().collect::<Vec<_>>(),
+                expected
+            );
+            assert!(
+                flushes
+                    .iter()
+                    .all(|batch| batch.len() <= MAX_CHANGED_PARAMS)
+            );
+            drop(flushes);
+            let mut echoed = Vec::new();
+            while let Ok(change) = rx.pop() {
+                echoed.push((change.id, change.value));
+            }
+            assert_eq!(echoed, expected);
+            proc.deactivate();
+            let expected_lifecycle = if started { vec![true, false] } else { vec![] };
+            assert_eq!(*capture.processing.lock().unwrap(), expected_lifecycle);
+            // A replacement processor receives new queues after the old queue was drained.
+            assert!(proc.from_ui.pop().is_err());
+            let calls = capture.blocks.lock().unwrap().len();
+            proc.flush_params();
+            assert_eq!(capture.blocks.lock().unwrap().len(), calls);
+        }
+    }
+
 }

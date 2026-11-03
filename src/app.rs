@@ -41,6 +41,33 @@ enum ScanMsg {
     Done,
 }
 
+/// Admit a reactivated processor before it becomes eligible for audio callbacks.
+/// Preparation failure leaves the existing wrapper's continuously warmed fallback active.
+fn queue_plugin_resume(
+    eid: u32,
+    plugin: &mut PluginNode,
+    pdc: bool,
+    mut processor: Box<dyn crate::engine::Processor>,
+    mut send: impl FnMut(Command),
+    prepare: impl FnOnce(u32, u32, bool) -> anyhow::Result<crate::engine::nodes::LatencyBypass>,
+) -> anyhow::Result<()> {
+    let timing = (plugin.instance.latency(), plugin.instance.bridge_latency());
+    if pdc {
+        let bypass = match prepare(timing.0, timing.1, plugin.info().is_instrument()) {
+            Ok(bypass) => bypass,
+            Err(error) => {
+                processor.deactivate();
+                return Err(error);
+            }
+        };
+        send(Command::ConfigureBypass(eid, Box::new(bypass)));
+    }
+    send(Command::ResumePlugin(eid, processor));
+    plugin.timing = timing;
+    plugin.suspended = false;
+    Ok(())
+}
+
 /// The panels, docked side by side or as tabs as the user arranges them. The graph is always
 /// there; the others can be closed (right-click the tab) and opened again from a tab bar's "+".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -1395,10 +1422,11 @@ impl App {
         if !self.restarting.insert(eid) {
             return;
         }
-        if !matches!(node.kind, NodeKind::Plugin(_)) {
+        let NodeKind::Plugin(plugin) = &mut node.kind else {
             self.restarting.remove(&eid);
             return;
-        }
+        };
+        plugin.suspended = true;
         // Retain the wrapper, its warm dry path and the existing slot/graph histories.
         e.send(Command::SuspendPlugin(eid));
     }
@@ -1414,8 +1442,20 @@ impl App {
         let _g = guard::enter(&tag);
         match p.instance.restart(self.sample_rate as f64, MAX_BLOCK) {
             Ok(proc) => {
-                if let Some(engine) = &mut self.engine {
-                    engine.send(Command::ResumePlugin(eid, proc));
+                if let Some(engine) = &mut self.engine
+                    && let Err(error) = queue_plugin_resume(
+                        eid,
+                        p,
+                        crate::runtime::get().experimental_pdc,
+                        proc,
+                        |command| engine.send(command),
+                        crate::engine::nodes::LatencyBypass::new,
+                    )
+                {
+                    self.log(format!(
+                        "{name} restart timing rejected; retaining fallback: {error:#}"
+                    ));
+                    return;
                 }
                 self.drop_stale_wires(id);
                 self.dirty = true;
@@ -1624,7 +1664,7 @@ impl App {
                         ports_changed.push(node.eid);
                     }
                     let timing = (p.instance.latency(), p.instance.bridge_latency());
-                    if crate::runtime::get().experimental_pdc && timing != p.timing {
+                    if crate::runtime::get().experimental_pdc && !p.suspended && timing != p.timing {
                         match crate::engine::nodes::LatencyBypass::new(
                             timing.0,
                             timing.1,
@@ -3872,5 +3912,138 @@ mod graph_zoom_tests {
         assert!(samples[14..].iter().all(|sample| sample.scaling == samples[14].scaling));
         let moved = samples.last().unwrap().translation - samples[14].translation;
         assert!((moved - egui::vec2(0.0, 4.0)).length() < 0.001);
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use crate::engine::{Processor, StereoBuf};
+    use crate::plugins::{Instance, ParamDesc};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct RestartInstance {
+        info: PluginInfo,
+        latency: Arc<AtomicU32>,
+        replacement_latency: u32,
+        deactivated: Arc<AtomicU32>,
+    }
+    struct Replacement(Arc<AtomicU32>);
+    impl Processor for Replacement {
+        fn process(&mut self, _: usize, _: &mut [StereoBuf], _: &mut [StereoBuf]) {
+            panic!("rejected replacement must not process audio");
+        }
+        fn deactivate(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    impl Instance for RestartInstance {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+        fn params(&self) -> &[ParamDesc] {
+            &[]
+        }
+        fn param_value(&self, _: u32) -> f64 {
+            0.0
+        }
+        fn param_display(&self, _: u32, _: f64) -> String {
+            String::new()
+        }
+        fn set_param(&mut self, _: u32, _: f64) {}
+        fn latency(&self) -> u32 {
+            self.latency.load(Ordering::Relaxed)
+        }
+        fn save_state(&self) -> Option<Vec<u8>> {
+            None
+        }
+        fn load_state(&mut self, _: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn restart(&mut self, _: f64, _: usize) -> anyhow::Result<Box<dyn Processor>> {
+            self.latency
+                .store(self.replacement_latency, Ordering::Relaxed);
+            Ok(Box::new(Replacement(self.deactivated.clone())))
+        }
+    }
+    fn suspended_plugin(latency: u32) -> (PluginNode, Arc<AtomicU32>) {
+        let deactivated = Arc::new(AtomicU32::new(0));
+        let mut plugin = PluginNode::new(Box::new(RestartInstance {
+            info: PluginInfo {
+                format: Format::Vst3,
+                id: "restart-test".into(),
+                name: "restart-test".into(),
+                vendor: String::new(),
+                category: String::new(),
+                path: PathBuf::new(),
+            },
+            latency: Arc::new(AtomicU32::new(32)),
+            replacement_latency: latency,
+            deactivated: deactivated.clone(),
+        }));
+        plugin.suspended = true;
+        (plugin, deactivated)
+    }
+
+    #[test]
+    fn rejected_restart_keeps_admitted_graph_timing_and_never_queues_resume() {
+        for unsupported_latency in [false, true] {
+            let (mut plugin, deactivated) =
+                suspended_plugin(if unsupported_latency { u32::MAX } else { 64 });
+            let proc = plugin.instance.restart(48_000.0, MAX_BLOCK).unwrap();
+            let mut commands = Vec::new();
+            let result = queue_plugin_resume(
+                1,
+                &mut plugin,
+                true,
+                proc,
+                |command| commands.push(command),
+                |total, bridge, instrument| {
+                    if unsupported_latency {
+                        crate::engine::nodes::LatencyBypass::new(total, bridge, instrument)
+                    } else {
+                        anyhow::bail!("injected bypass allocation budget exhaustion")
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert!(commands.is_empty());
+            assert_eq!(deactivated.load(Ordering::Relaxed), 1);
+            assert!(plugin.suspended);
+            assert_eq!(plugin.timing, (32, 0));
+            let mut snarl = Snarl::new();
+            snarl.insert_node(
+                pos2(0.0, 0.0),
+                GraphNode {
+                    eid: 1,
+                    kind: NodeKind::Plugin(Box::new(plugin)),
+                },
+            );
+            // Even an unrelated graph edit must continue to use the admitted timing.
+            assert!(graph::compile_with_timing(&snarl, true).is_ok());
+        }
+    }
+
+    #[test]
+    fn admitted_restart_configures_bypass_before_resuming() {
+        let (mut plugin, deactivated) = suspended_plugin(64);
+        let proc = plugin.instance.restart(48_000.0, MAX_BLOCK).unwrap();
+        let mut commands = Vec::new();
+        queue_plugin_resume(
+            1,
+            &mut plugin,
+            true,
+            proc,
+            |command| commands.push(command),
+            crate::engine::nodes::LatencyBypass::new,
+        )
+        .unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::ConfigureBypass(1, _), Command::ResumePlugin(1, _)]
+        ));
+        assert_eq!(plugin.timing, (64, 0));
+        assert!(!plugin.suspended);
+        assert_eq!(deactivated.load(Ordering::Relaxed), 0);
     }
 }

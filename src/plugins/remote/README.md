@@ -17,8 +17,8 @@ in the parent. JSFX / Native are not routed here.
 - Worker uses `Host::default().create_local`, avoiding recursive isolation.
 - Optional instance hooks: `remote_status`, `request_remote_restart`, `bridge_latency`,
   `remote_counters` (underrun blocks, overflow events/slot submissions).
-- `idle` adopts metadata; `wants_restart` signals port/latency/parameter topology
-  changes. `restart` returns a new *proxy*, not a new child.
+- `idle` adopts latency, parameter and MIDI-port metadata without replacing the live
+  processor. Graph routing and prepared dry-path timing update independently.
 - `Editor::ready` is a cached acknowledgement that child open completed, not merely
   that parent enqueued a request. Each editor has a monotonic token; acknowledgements,
   geometry and close requests cannot accidentally affect a replacement editor.
@@ -29,7 +29,8 @@ Native 64-bit targets with 32/64-bit atomics only. The file-backed memmap contai
 no process addresses, Rust containers, rtrb endpoints or ownership pointers. Header
 checks validate protocol version, layout size, immutable worker generation, quantum
 and capacities. An independently advanced processing epoch invalidates samples on
-state changes, checkpoint quiescence and local plugin restart.
+destructive state load. Warm plugin activation preserves the epoch and queued audio;
+manual worker recreation supplies a new mapping generation.
 
 Current **provisional**, not performance-qualified values:
 
@@ -116,19 +117,33 @@ Unix/macOS-specific parent-death primitives are not installed.
 ## Ownership and state
 
 RemoteInstance alone owns worker stop intent. Deactivating or dropping an old
-RemoteProcessor during graph port/latency replacement does **not** stop a child.
+RemoteProcessor does **not** stop a child.
 The supervisor remains the final Core owner until instance, editor and processor
 proxies retire. Retired generations are reclaimed on the supervisor thread once
 no processor references remain. Shared Drop unmaps before unlink (important on
 Windows). This favors safety over early cleanup if the engine leaks a proxy.
 
 Child DSP thread alone calls old Processor::deactivate. State load and plugin-requested
-restart park DSP, invalidate the epoch, invoke the main-thread instance operation,
-and send the replacement processor back to the same child audio thread. A child-only
-join guard ensures DSP exits before plugin Instance/module teardown; if a plugin hangs
-here the parent supervisor kills/reaps it. Before plugin-requested restart, a discarded
-silent Q-frame quantum drains queued parameter writes. State load skips that drain.
+restart park DSP, invoke the main-thread instance operation, and send the replacement
+processor back to the same child audio thread. State load invalidates the processing
+epoch; a warm restart retains real queued input and the parent dry/wet histories.
+A child-only join guard ensures DSP exits before plugin Instance/module teardown; if a
+plugin hangs here the parent supervisor kills/reaps it. Before plugin-requested restart,
+pending VST3 and CLAP parameter changes flush on the audio thread without synthesizing
+input or advancing the audio clock. VST3 uses zero-sample parameter-only processing;
+CLAP uses its parameter flush extension. State load skips that flush.
 Checkpoints save the live instance on the worker's main thread without restarting DSP.
+
+Local plugin restarts also retain the engine slot and processor wrapper while replacing
+only its suspended inner processor. The delayed dry path keeps 131072 frames of real
+input history, or the initial requested delay if larger, within a shared 128 MiB budget
+for live, queued and retired plugin bypass storage. A latency increase beyond the retained
+history needs new input to fill that additional span. Graph delay-plan changes transfer
+prepared history pages on the audio thread and retire unused storage on the control thread.
+Replacement latency and bypass storage must be admitted before the inner processor resumes.
+Rejected restarts retain the suspended fallback and its last admitted graph timing.
+Engine shutdown waits for an explicit audio-thread completion before plugin state save
+and teardown; a bounded shutdown timeout retains in-process plugin owners until exit.
 
 Parent parameter/editor operations use caches and bounded enqueue. Queue-full
 `load_state` returns an error; parameter/native-placement writes may be dropped and

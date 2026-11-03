@@ -46,6 +46,8 @@ pub struct PluginNode {
     pub instance: Box<dyn Instance>,
     /// Last control-side timing accepted for the prepared bypass/graph plan.
     pub timing: (u32, u32),
+    /// Keep the accepted timing while restart admission retains the warm fallback.
+    pub suspended: bool,
     pub bypass: bool,
     pub show_params: bool,
     pub param_filter: String,
@@ -61,6 +63,7 @@ impl PluginNode {
             editor_view: Default::default(),
             instance,
             timing,
+            suspended: false,
             bypass: false,
             show_params: false,
             param_filter: String::new(),
@@ -385,11 +388,8 @@ impl Flat {
             let (audio_inputs, audio_outputs) = node.kind.engine_ports();
             let timing = if enabled {
                 if let NodeKind::Plugin(plugin) = &node.kind {
-                    // Control-side getter only. latency() is TOTAL, including future bridges.
-                    NodeTiming::from_total(
-                        plugin.instance.latency(),
-                        plugin.instance.bridge_latency(),
-                    )?
+                    // Use admitted timing, including while a rejected restart stays suspended.
+                    NodeTiming::from_total(plugin.timing.0, plugin.timing.1)?
                 } else {
                     NodeTiming::default()
                 }

@@ -56,8 +56,11 @@ the node, with the mouse, wheel, keys and `gfx_showmenu` menus working. Hidden s
 
 Plugin state is saved with the session and presets, as is whether each editor was open.
 
-When a plugin changes its ports or latency (some do when a setting changes), it is restarted:
-the audio passes through while it is, and wires to pins that no longer exist are dropped.
+When a plugin requests a restart, its instance stays alive while processing pauses for
+reactivation. Effects pass audio through during the handoff; with delay compensation
+enabled, that fallback uses continuously warmed input history. Wires to pins that no
+longer exist are dropped. An isolated worker's latency and parameter metadata updates
+preserve the existing audio bridge and its history.
 
 On macOS, popped-out editors use regular primary windows that participate in Stage Manager,
 Spaces and window cycling. CLAP host resizes update the parent window before calling the
