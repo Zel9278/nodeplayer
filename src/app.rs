@@ -1051,8 +1051,7 @@ impl App {
     }
 
     fn stop(&mut self) {
-        self.player.set_playing(false);
-        self.player.seek(0.0);
+        self.player.stop();
         self.misskey.stopped(&self.player.status());
         self.discord.stopped();
     }

@@ -56,6 +56,13 @@ sample MIDI order uses source sequence and event index. Input must be time-sorte
 (as guaranteed by the engine MidiBuf). Future-out-of-current-block input MIDI is
 not clamped into the present.
 
+Each input quantum includes the player's transport state and song position at its first
+sample. A partial quantum retains that snapshot across parent callbacks; subsequent
+quanta advance song time only while playing. The child applies the snapshot with the
+audio, independent of when the worker catches up. Engine sample time continues through
+pause/stop and remains separate from song position. Transport changes take effect at
+child quantum boundaries, at most 256 input frames after a parent block boundary.
+
 Slot ownership is `FREE -> INPUT -> WORKING -> OUTPUT -> FREE`, with release
 publication/acquire consumption. Only parent writes FREE and reads OUTPUT; only
 child reads INPUT and writes WORKING. An obsolete epoch INPUT may be discarded by

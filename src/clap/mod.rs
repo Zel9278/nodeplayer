@@ -37,7 +37,7 @@ use clap_sys::process::*;
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::CLAP_VERSION;
 
-use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf};
+use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf, Transport};
 use crate::plugins::dylib::{self, Library};
 use crate::plugins::{self, Format, ParamDesc, Placement, PluginInfo};
 
@@ -1019,6 +1019,7 @@ pub struct ClapProcessor {
     ins: Buses,
     outs: Buses,
     steady_time: i64,
+    transport: clap_event_transport,
     max_block: usize,
     note_in: Option<Dialect>,
 }
@@ -1045,6 +1046,7 @@ impl ClapProcessor {
             ins: Buses::new(in_ch, max_block),
             outs: Buses::new(out_ch, max_block),
             steady_time: 0,
+            transport: transport_event(Transport::default()),
             max_block,
             note_in,
         }
@@ -1133,7 +1135,7 @@ impl ClapProcessor {
         let process = clap_process {
             steady_time: self.steady_time,
             frames_count: n as u32,
-            transport: std::ptr::null(),
+            transport: &self.transport,
             audio_inputs: self.ins.bufs.as_ptr(),
             audio_outputs: self.outs.bufs.as_mut_ptr(),
             audio_inputs_count: self.ins.bufs.len() as u32,
@@ -1143,7 +1145,7 @@ impl ClapProcessor {
         };
         let status = unsafe { (*self.plugin).process.map_or(CLAP_PROCESS_ERROR, |p| p(self.plugin, &process)) };
         self.out_events.midi = std::ptr::null_mut();
-        self.steady_time += n as i64;
+        self.steady_time = self.steady_time.saturating_add(n as i64);
 
         match (status != CLAP_PROCESS_ERROR, self.outs.data.first()) {
             (true, Some(bus)) if !bus.is_empty() => {
@@ -1157,6 +1159,23 @@ impl ClapProcessor {
 }
 
 impl Processor for ClapProcessor {
+    fn set_transport(&mut self, transport: Transport) {
+        self.transport = transport_event(transport);
+    }
+
+    fn process_timed(
+        &mut self,
+        first_sample: u64,
+        n: usize,
+        inputs: &mut [StereoBuf],
+        outputs: &mut [StereoBuf],
+        midi_in: &[MidiEvent],
+        midi_out: &mut MidiBuf,
+    ) {
+        self.steady_time = first_sample.min(i64::MAX as u64) as i64;
+        self.process_midi(n, inputs, outputs, midi_in, midi_out);
+    }
+
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
         self.run(n, inputs, outputs, &[], std::ptr::null_mut());
     }
@@ -1183,6 +1202,32 @@ impl Processor for ClapProcessor {
     }
 }
 
+fn transport_event(transport: Transport) -> clap_event_transport {
+    clap_event_transport {
+        header: header::<clap_event_transport>(CLAP_EVENT_TRANSPORT, 0),
+        flags: CLAP_TRANSPORT_HAS_SECONDS_TIMELINE
+            | if transport.is_playing() {
+                CLAP_TRANSPORT_IS_PLAYING
+            } else {
+                0
+            },
+        song_pos_seconds: (transport.position_seconds
+            * clap_sys::fixedpoint::CLAP_SECTIME_FACTOR as f64)
+            .round() as i64,
+        song_pos_beats: 0,
+        tempo: 0.0,
+        tempo_inc: 0.0,
+        loop_start_beats: 0,
+        loop_end_beats: 0,
+        loop_start_seconds: 0,
+        loop_end_seconds: 0,
+        bar_start: 0,
+        bar_number: 0,
+        tsig_num: 0,
+        tsig_denom: 0,
+    }
+}
+
 impl Drop for ClapProcessor {
     fn drop(&mut self) {
         // Normally stopped by `deactivate` on the audio thread; when the whole engine goes
@@ -1197,10 +1242,100 @@ impl Drop for ClapProcessor {
     }
 }
 
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn process_receives_transport_and_keeps_running_while_paused() {
+        use crate::engine::PlaybackState;
+        #[derive(Default)]
+        struct Capture {
+            blocks: Vec<(i64, Option<clap_event_transport>)>,
+            stops: usize,
+        }
+        unsafe extern "C" fn process(
+            plugin: *const clap_plugin,
+            process: *const clap_process,
+        ) -> clap_process_status {
+            let capture = unsafe { &mut *((*plugin).plugin_data as *mut Capture) };
+            let process = unsafe { &*process };
+            capture.blocks.push((
+                process.steady_time,
+                unsafe { process.transport.as_ref() }.copied(),
+            ));
+            CLAP_PROCESS_CONTINUE
+        }
+        unsafe extern "C" fn stop(plugin: *const clap_plugin) {
+            unsafe { &mut *((*plugin).plugin_data as *mut Capture) }.stops += 1;
+        }
+        let mut capture = Capture::default();
+        // All callback and descriptor pointers in clap_plugin are nullable.
+        let mut plugin: clap_plugin = unsafe { std::mem::zeroed() };
+        plugin.plugin_data = (&mut capture as *mut Capture).cast();
+        plugin.process = Some(process);
+        plugin.stop_processing = Some(stop);
+        let (_tx, from_ui) = rtrb::RingBuffer::new(1);
+        let (to_ui, _rx) = rtrb::RingBuffer::new(1);
+        let mut proc = ClapProcessor::new(&plugin, from_ui, to_ui, &[2], &[2], None, 64);
+        let mut inputs = [StereoBuf::new()];
+        let mut outputs = [StereoBuf::new()];
+        let mut midi = MidiBuf::new();
+        let states = [
+            PlaybackState::Playing,
+            PlaybackState::Paused,
+            PlaybackState::Paused,
+            PlaybackState::Stopped,
+        ];
+        for (i, state) in states.into_iter().enumerate() {
+            proc.set_transport(Transport {
+                state,
+                position_seconds: if state == PlaybackState::Stopped {
+                    0.0
+                } else {
+                    1.25
+                },
+                seconds_per_frame: 1.0 / 48_000.0,
+            });
+            proc.process_timed(
+                1000 + i as u64 * 64,
+                64,
+                &mut inputs,
+                &mut outputs,
+                &[],
+                &mut midi,
+            );
+        }
+        assert_eq!(capture.stops, 0);
+        assert_eq!(capture.blocks.len(), 4);
+        for (i, (clock, transport)) in capture.blocks.iter().enumerate() {
+            let transport = transport.as_ref().expect("CLAP transport must be supplied");
+            assert_eq!(*clock, 1000 + i as i64 * 64);
+            assert_eq!(transport.header.type_, CLAP_EVENT_TRANSPORT);
+            assert_eq!(transport.header.time, 0);
+            assert_eq!(
+                transport.header.size as usize,
+                std::mem::size_of::<clap_event_transport>()
+            );
+            assert_eq!(
+                transport.flags,
+                CLAP_TRANSPORT_HAS_SECONDS_TIMELINE
+                    | if i == 0 { CLAP_TRANSPORT_IS_PLAYING } else { 0 }
+            );
+            assert_eq!(
+                transport.song_pos_seconds,
+                if i == 3 {
+                    0
+                } else {
+                    clap_sys::fixedpoint::CLAP_SECTIME_FACTOR * 5 / 4
+                }
+            );
+        }
+        proc.deactivate();
+        assert_eq!(capture.stops, 1);
+    }
+
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn finds_the_binary_in_a_bundle_folder() {
         let root = std::env::temp_dir().join(format!("np-clap-test-{}", std::process::id()));

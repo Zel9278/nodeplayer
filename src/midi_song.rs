@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::engine::nodes::MidiQueue;
 use crate::engine::{MidiBuf, MidiEvent};
-use crate::midifile::{MidiOut, MidiPlayer, MidiSettings, Timed, group_digits};
+use crate::midifile::{MidiClock, MidiOut, MidiPlayer, MidiSettings, Timed, group_digits};
 
 pub const MIDI_EXTS: &[&str] = &["mid", "midi"];
 
@@ -43,6 +43,7 @@ impl MidiSong {
     /// The audio-thread end of the queue.
     pub fn feed(&self, sample_rate: f32) -> MidiFeed {
         MidiFeed {
+            clock: self.player.clock(),
             rx: self.rx.clone(),
             pending: None,
             next_block: None,
@@ -119,6 +120,7 @@ impl MidiSong {
 
 /// The audio-thread side: puts each message in the block it is due in.
 pub struct MidiFeed {
+    pub clock: MidiClock,
     rx: MidiQueue<rtrb::Consumer<Timed>>,
     /// A message taken from the queue that belongs to a later block.
     pending: Option<Timed>,
@@ -372,7 +374,15 @@ mod tests {
     fn plays_messages_at_their_frame() {
         let (out, rx) = MidiOut::new(64);
         let node_rx = Arc::new(Mutex::new(rx));
-        let mut p = MidiFeed { rx: node_rx, pending: None, next_block: None, sample_rate: 48_000.0, late: Arc::default(), pitch: PitchShift::new() };
+        let mut p = MidiFeed {
+            clock: MidiSong::new().player.clock(),
+            rx: node_rx,
+            pending: None,
+            next_block: None,
+            sample_rate: 48_000.0,
+            late: Arc::default(),
+            pitch: PitchShift::new(),
+        };
         let mut buf = MidiBuf::new();
         // Prime the clock, then send a note 5 ms into the next block and one 30 ms out.
         p.run(480, &mut buf, 1.0);

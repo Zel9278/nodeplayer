@@ -21,7 +21,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTag, StandardVisualKey};
 use symphonia::core::units::{Time, TimeBase};
 
-use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf};
+use crate::engine::{MidiBuf, MidiEvent, PlaybackState, Processor, StereoBuf, Transport};
 use crate::midi_song::{MidiFeed, MidiSong, is_midi_file};
 
 const RING_SECONDS: f32 = 0.5;
@@ -41,6 +41,8 @@ const LOOP_FADE: f64 = 0.005;
 #[derive(Default)]
 struct Shared {
     playing: AtomicBool,
+    paused: AtomicBool,
+    midi_active: AtomicBool,
     /// Set by the decoder after a seek/load; the source discards buffered audio and clears it.
     flush: AtomicBool,
     /// Decoder has pushed everything for the current file.
@@ -67,8 +69,12 @@ struct Shared {
 impl Shared {
     /// The playing position in the file, in seconds.
     fn position(&self, device_rate: u32) -> f64 {
-        let played = self.frames_played.load(Ordering::Acquire);
         let wraps = self.wraps.lock().unwrap();
+        let played = if self.flush.load(Ordering::Acquire) {
+            0
+        } else {
+            self.frames_played.load(Ordering::Acquire)
+        };
         match wraps.iter().rev().find(|(at, _)| *at <= played) {
             Some(&(from, secs)) => secs + (played - from) as f64 / device_rate as f64,
             // Still in the resampler's delay.
@@ -168,7 +174,15 @@ impl Player {
         let (prod, cons) = rtrb::RingBuffer::new(len);
         let _ = self.tx.send(Cmd::Attach(prod));
         let midi = self.midi.lock().unwrap().feed(self.device_rate as f32);
-        PlayerSource { ring: cons, shared: self.shared.clone(), varispeed: Varispeed::new(), midi }
+        PlayerSource {
+            ring: cons,
+            shared: self.shared.clone(),
+            varispeed: Varispeed::new(),
+            midi,
+            device_rate: self.device_rate,
+            position_anchor: (0, 0.0),
+            transport: Transport::default(),
+        }
     }
 
     pub fn is_midi(&self) -> bool {
@@ -219,6 +233,10 @@ impl Player {
 
     pub fn load(&self, path: &Path) {
         self.set_loop(None);
+        self.shared.paused.store(false, Ordering::Release);
+        self.shared
+            .midi_active
+            .store(is_midi_file(path), Ordering::Release);
         // Clear a stale end-of-file now so the source doesn't stop again before the decoder
         // gets to the command.
         self.shared.eof.store(false, Ordering::Release);
@@ -254,6 +272,7 @@ impl Player {
 
     /// Starting again after the file played to the end restarts it from the top.
     pub fn set_playing(&self, on: bool) {
+        self.shared.paused.store(!on, Ordering::Release);
         if self.is_midi() {
             let mut m = self.midi();
             if !m.player.play_when_loaded(on) {
@@ -265,6 +284,12 @@ impl Player {
             self.seek(0.0);
         }
         self.shared.playing.store(on, Ordering::Release);
+    }
+
+    pub fn stop(&self) {
+        self.set_playing(false);
+        self.seek(0.0);
+        self.shared.paused.store(false, Ordering::Release);
     }
 
     pub fn is_playing(&self) -> bool {
@@ -628,7 +653,6 @@ impl Worker {
                 self.decoder_done = true;
                 self.path = None;
                 *self.status.lock().unwrap() = Status::default();
-                self.shared.base_secs.store(0f64.to_bits(), Ordering::Release);
             }
             Cmd::Load(path) => {
                 log::info!("load {}", path.display());
@@ -670,7 +694,6 @@ impl Worker {
                         self.shared.playing.store(false, Ordering::Release);
                     }
                 }
-                self.shared.base_secs.store(0f64.to_bits(), Ordering::Release);
             }
             Cmd::Seek(secs) => {
                 log::debug!("seek {secs:.2}");
@@ -700,7 +723,6 @@ impl Worker {
                 self.reset_stream(at);
                 self.mark_start(at);
                 self.decoder_done = false;
-                self.shared.base_secs.store(at.to_bits(), Ordering::Release);
             }
             Cmd::Loop(region) => {
                 self.loop_region = region;
@@ -789,7 +811,14 @@ impl Worker {
         self.stretch = (0, at);
         self.fade.clear();
         self.faded = 0;
-        self.shared.wraps.lock().unwrap().clear();
+        {
+            let mut wraps = self.shared.wraps.lock().unwrap();
+            wraps.clear();
+            self.shared.base_secs.store(at.to_bits(), Ordering::Release);
+            self.shared
+                .flush
+                .store(self.ring.is_some(), Ordering::Release);
+        }
         self.acc.clear();
         self.pending.clear();
         if let Some(r) = &mut self.resampler {
@@ -797,15 +826,14 @@ impl Worker {
         }
         self.shared.eof.store(false, Ordering::Release);
         if self.ring.is_some() {
-            self.shared.flush.store(true, Ordering::Release);
             let deadline = Instant::now() + Duration::from_millis(300);
             while self.shared.flush.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
             // If the source isn't running, stale samples are simply played later.
-            self.shared.flush.store(false, Ordering::Release);
         }
         self.shared.frames_played.store(0, Ordering::Release);
+        self.shared.flush.store(false, Ordering::Release);
         self.shared.packets.lock().unwrap().clear();
     }
 
@@ -952,6 +980,10 @@ pub struct PlayerSource {
     shared: Arc<Shared>,
     varispeed: Varispeed,
     midi: MidiFeed,
+    device_rate: u32,
+    /// Last known loop/resampler anchor, used if the decoder is updating the marks.
+    position_anchor: (u64, f64),
+    transport: Transport,
 }
 
 /// The rate shift: a sinc resampler between the ring and the output whose ratio follows the
@@ -1110,6 +1142,56 @@ impl Varispeed {
 }
 
 impl Processor for PlayerSource {
+    fn transport(&mut self) -> Option<Transport> {
+        let s = &self.shared;
+        let (playing, position_seconds, seconds_per_frame) =
+            if s.midi_active.load(Ordering::Acquire) {
+                let Some((playing, position, speed)) = self.midi.clock.try_snapshot() else {
+                    return Some(self.transport);
+                };
+                (playing, position, speed / self.device_rate as f64)
+            } else {
+                // Never take the decoder's mutex with a blocking lock on the audio thread.
+                // If it is busy, the previous anchor still tracks frames consumed from the ring.
+                let wraps = s.wraps.try_lock().ok();
+                let flushing = s.flush.load(Ordering::Acquire);
+                let played = if flushing {
+                    0
+                } else {
+                    s.frames_played.load(Ordering::Acquire)
+                };
+                if flushing {
+                    self.position_anchor = (0, f64::from_bits(s.base_secs.load(Ordering::Acquire)));
+                } else if let Some(wraps) = wraps.as_ref() {
+                    self.position_anchor = wraps
+                        .iter()
+                        .rev()
+                        .find(|(at, _)| *at <= played)
+                        .or_else(|| wraps.front())
+                        .copied()
+                        .unwrap_or((0, f64::from_bits(s.base_secs.load(Ordering::Acquire))));
+                }
+                let (from, seconds) = self.position_anchor;
+                (
+                    s.playing.load(Ordering::Acquire),
+                    seconds + played.saturating_sub(from) as f64 / self.device_rate as f64,
+                    f32::from_bits(s.rate.load(Ordering::Acquire)) as f64 / self.device_rate as f64,
+                )
+            };
+        self.transport = Transport {
+            state: if playing {
+                PlaybackState::Playing
+            } else if s.paused.load(Ordering::Acquire) {
+                PlaybackState::Paused
+            } else {
+                PlaybackState::Stopped
+            },
+            position_seconds,
+            seconds_per_frame: if playing { seconds_per_frame } else { 0.0 },
+        };
+        Some(self.transport)
+    }
+
     fn process_midi(
         &mut self,
         n: usize,
@@ -1121,6 +1203,7 @@ impl Processor for PlayerSource {
         self.process(n, inputs, outputs);
         let rate = f32::from_bits(self.shared.rate.load(Ordering::Acquire));
         self.midi.run(n, midi_out, rate);
+        self.transport = self.transport.at_offset(n);
     }
 
     fn process(&mut self, n: usize, _inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
@@ -1186,6 +1269,67 @@ impl Processor for PlayerSource {
 mod tests {
     use super::*;
 
+    #[test]
+    fn transport_follows_pause_seek_stop_and_eof() {
+        let path = ramp_wav("transport", 0.2);
+        let player = Player::new(48_000);
+        let mut src = player.make_source();
+        let mut out = [StereoBuf::new()];
+        assert_eq!(src.transport().unwrap(), Transport::default());
+        player.load(&path);
+        let _ = pull(&mut src, &player, 512);
+        let playing = src.transport().unwrap();
+        assert_eq!(playing.state, PlaybackState::Playing);
+        assert_eq!(playing.position_seconds, player.position());
+        player.set_playing(false);
+        let paused = src.transport().unwrap();
+        for _ in 0..3 {
+            src.process(512, &mut [], &mut out);
+            assert_eq!(src.transport().unwrap(), paused);
+        }
+        assert_eq!(paused.state, PlaybackState::Paused);
+        player.seek(0.1);
+        assert!(wait_for(|| {
+            src.process(512, &mut [], &mut out);
+            src.transport().unwrap().position_seconds == 0.1
+        }));
+        assert_eq!(src.transport().unwrap().state, PlaybackState::Paused);
+        player.stop();
+        assert!(wait_for(|| {
+            src.process(512, &mut [], &mut out);
+            let transport = src.transport().unwrap();
+            transport.state == PlaybackState::Stopped && transport.position_seconds == 0.0
+        }));
+        player.set_playing(true);
+        play_to_end(&mut src, &player);
+        let ended = src.transport().unwrap();
+        assert_eq!(ended.state, PlaybackState::Stopped);
+        assert!((ended.position_seconds - 0.2).abs() < 1.0 / 48_000.0);
+        src.process(512, &mut [], &mut out);
+        assert_eq!(src.transport().unwrap(), ended);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn transport_tracks_loop_marks_without_waiting_for_the_decoder() {
+        let player = Player::new(48_000);
+        let mut src = player.make_source();
+        let shared = src.shared.clone();
+        shared.playing.store(true, Ordering::Release);
+        shared.frames_played.store(12_000, Ordering::Release);
+        shared
+            .wraps
+            .lock()
+            .unwrap()
+            .extend([(0, 0.0), (12_000, 0.05)]);
+        let transport = src.transport().unwrap();
+        assert_eq!(transport.position_seconds, 0.05);
+        // Holding the decoder's lock cannot stall the audio callback.
+        let _lock = shared.wraps.lock().unwrap();
+        shared.frames_played.store(12_480, Ordering::Release);
+        assert!((src.transport().unwrap().position_seconds - 0.06).abs() < 1e-12);
+    }
+
     /// A source playing a 1 kHz sine from a full ring at `rate`; returns the output and the
     /// position it reports.
     fn play(rate: f32, blocks: usize) -> (Vec<f32>, f64) {
@@ -1208,7 +1352,15 @@ mod tests {
         }
         let shared = Arc::new(Shared { rate: AtomicU32::new(rate.to_bits()), ..Default::default() });
         shared.playing.store(true, Ordering::Release);
-        let mut src = PlayerSource { ring: cons, shared: shared.clone(), varispeed: Varispeed::new(), midi: MidiSong::new().feed(sr) };
+        let mut src = PlayerSource {
+            ring: cons,
+            shared: shared.clone(),
+            varispeed: Varispeed::new(),
+            midi: MidiSong::new().feed(sr),
+            device_rate: sr as u32,
+            position_anchor: (0, 0.0),
+            transport: Transport::default(),
+        };
         let mut out = vec![StereoBuf::new()];
         let mut l = Vec::new();
         for b in 0..blocks {
@@ -1554,13 +1706,30 @@ mod tests {
         assert!(!player.is_playing());
         assert!((player.position() - 0.25).abs() < 1e-6);
 
+        let mut source = player.make_source();
+        assert!(wait_for(|| {
+            let transport = source.transport().unwrap();
+            transport.state == PlaybackState::Paused && transport.position_seconds == 0.25
+        }));
+
         player.set_playing(true);
         assert!(player.is_playing());
+        assert!(wait_for(|| source.transport().unwrap().is_playing()));
         assert!(wait_for(|| player.take_ended()), "the end is told");
         assert!(player.finished() && !player.is_playing());
+        assert!(wait_for(|| {
+            let transport = source.transport().unwrap();
+            transport.state == PlaybackState::Stopped
+                && (transport.position_seconds - 0.5).abs() < 1e-6
+        }));
         // Played again, it starts over.
         player.set_playing(true);
         assert!(player.is_playing() && player.position() < 0.25);
+        player.stop();
+        assert!(wait_for(|| {
+            let transport = source.transport().unwrap();
+            transport.state == PlaybackState::Stopped && transport.position_seconds == 0.0
+        }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

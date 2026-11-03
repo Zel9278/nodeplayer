@@ -143,9 +143,52 @@ impl Default for MidiBuf {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlaybackState {
+    #[default]
+    Stopped,
+    Playing,
+    Paused,
+}
+
+/// Song time at the start of an audio block, separate from the engine's sample clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Transport {
+    pub state: PlaybackState,
+    pub position_seconds: f64,
+    /// File seconds per output frame (includes varispeed); zero while seeking or paused.
+    pub seconds_per_frame: f64,
+}
+
+impl Transport {
+    pub fn is_playing(self) -> bool {
+        self.state == PlaybackState::Playing
+    }
+
+    pub fn at_offset(self, frames: usize) -> Self {
+        Self {
+            position_seconds: self.position_seconds
+                + if self.is_playing() {
+                    frames as f64 * self.seconds_per_frame
+                } else {
+                    0.0
+                },
+            ..self
+        }
+    }
+}
+
 /// A DSP node running on the audio thread. All audio ports are stereo; a node has at most one
 /// MIDI input and one MIDI output.
 pub trait Processor: Send {
+    /// Source nodes provide the block's song clock. Must never wait for another thread.
+    fn transport(&mut self) -> Option<Transport> {
+        None
+    }
+
+    /// Called before processing, including while paused/stopped so tails and live MIDI run.
+    fn set_transport(&mut self, _transport: Transport) {}
+
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]);
 
     /// [`process`](Self::process) for nodes with MIDI ports. `midi_out` starts out empty.
@@ -363,6 +406,14 @@ impl AudioState {
     }
 
     fn run_block(&mut self, n: usize) {
+        // Read the source before any node runs, so graph order cannot move the playhead by
+        // a block or give disconnected plugins a different playback state.
+        let transport = self
+            .schedule
+            .steps
+            .iter()
+            .find_map(|step| self.slots[step.node as usize].as_mut()?.proc.transport())
+            .unwrap_or_default();
         for (step_index, step) in self.schedule.steps.iter().enumerate() {
             let Some(mut slot) = self.slots[step.node as usize].take() else {
                 continue;
@@ -438,6 +489,7 @@ impl AudioState {
                 midi_in.events()
             };
             let _g = tag.as_deref().map(crate::plugins::guard::enter_borrowed);
+            proc.set_transport(transport);
             proc.process_timed(self.sample_clock, n, ins, outs, input, midi_out);
             self.slots[step.node as usize] = Some(slot);
         }
@@ -774,6 +826,101 @@ mod tests {
             state.slots[id as usize] = Some(slot);
         }
         state
+    }
+
+    #[test]
+    fn transport_is_shared_before_sources_run_and_through_plugin_bypass() {
+        struct Source(Arc<std::sync::Mutex<Transport>>);
+        impl Processor for Source {
+            fn transport(&mut self) -> Option<Transport> {
+                Some(*self.0.lock().unwrap())
+            }
+            fn process(&mut self, _: usize, _: &mut [StereoBuf], _: &mut [StereoBuf]) {
+                let mut transport = self.0.lock().unwrap();
+                *transport = transport.at_offset(64);
+            }
+        }
+        struct Capture(Arc<std::sync::Mutex<Vec<Transport>>>, Transport);
+        impl Processor for Capture {
+            fn set_transport(&mut self, transport: Transport) {
+                self.1 = transport;
+            }
+            fn process(&mut self, _: usize, _: &mut [StereoBuf], _: &mut [StereoBuf]) {
+                self.0.lock().unwrap().push(self.1);
+            }
+        }
+        let clock = Arc::new(std::sync::Mutex::new(Transport {
+            state: PlaybackState::Playing,
+            position_seconds: 3.0,
+            seconds_per_frame: 1.0 / 48_000.0,
+        }));
+        let before = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let after = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut wrapped = nodes::PluginProc::with_latency(
+            Box::new(Capture(after.clone(), Transport::default())),
+            0,
+            0,
+            false,
+        )
+        .unwrap();
+        wrapped.set_param(0, 1.0);
+        let schedule = Schedule {
+            steps: (0..3)
+                .map(|node| Step {
+                    node,
+                    inputs: vec![],
+                    midi: vec![],
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut state = offline_state(
+            schedule,
+            vec![
+                (
+                    0,
+                    NodeSlot::new(
+                        Box::new(Capture(before.clone(), Transport::default())),
+                        0,
+                        0,
+                    ),
+                ),
+                (1, NodeSlot::new(Box::new(Source(clock.clone())), 0, 0)),
+                (2, NodeSlot::new(Box::new(wrapped), 0, 1)),
+            ],
+        );
+        for playback in [
+            PlaybackState::Playing,
+            PlaybackState::Paused,
+            PlaybackState::Stopped,
+        ] {
+            *clock.lock().unwrap() = Transport {
+                state: playback,
+                position_seconds: if playback == PlaybackState::Stopped {
+                    0.0
+                } else {
+                    3.0
+                },
+                seconds_per_frame: 1.0 / 48_000.0,
+            };
+            state.run_block(64);
+        }
+        let seen = before.lock().unwrap();
+        assert_eq!(*seen, *after.lock().unwrap());
+        assert_eq!(
+            seen.iter()
+                .map(|t| (t.state, t.position_seconds))
+                .collect::<Vec<_>>(),
+            [
+                (PlaybackState::Playing, 3.0),
+                (PlaybackState::Paused, 3.0),
+                (PlaybackState::Stopped, 0.0),
+            ]
+        );
+        drop(seen);
+        state.slots[1] = None;
+        state.run_block(64);
+        assert_eq!(after.lock().unwrap().last(), Some(&Transport::default()));
     }
 
     fn timing_schedule(nodes: &[timing::NodeSpec], edges: &[timing::EdgeKey]) -> Schedule {

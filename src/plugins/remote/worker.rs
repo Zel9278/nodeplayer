@@ -645,6 +645,10 @@ fn audio_loop(
                     ctl.failed.store(true, Ordering::Release);
                     return;
                 }
+                let Some(transport) = p.transport.decode() else {
+                    ctl.failed.store(true, Ordering::Release);
+                    return;
+                };
                 inputs[0].l[..Q].copy_from_slice(&p.left);
                 inputs[0].r[..Q].copy_from_slice(&p.right);
                 outputs[0].clear(Q);
@@ -658,7 +662,15 @@ fn audio_loop(
                         });
                     }
                 }
-                proc.process_midi(Q, &mut inputs, &mut outputs, &input_midi, &mut output_midi);
+                proc.set_transport(transport);
+                proc.process_timed(
+                    p.first_sample,
+                    Q,
+                    &mut inputs,
+                    &mut outputs,
+                    &input_midi,
+                    &mut output_midi,
+                );
                 p.left.copy_from_slice(&outputs[0].l[..Q]);
                 p.right.copy_from_slice(&outputs[0].r[..Q]);
                 let mut count = 0;
@@ -886,6 +898,87 @@ mod tests {
                 "closed control socket was not detected"
             );
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn audio_worker_applies_transport_from_each_queued_quantum() {
+        use crate::engine::{PlaybackState, Transport};
+        struct Capture(crossbeam_channel::Sender<(u64, Transport)>, Transport);
+        impl Processor for Capture {
+            fn set_transport(&mut self, transport: Transport) {
+                self.1 = transport;
+            }
+            fn process(&mut self, _: usize, _: &mut [StereoBuf], _: &mut [StereoBuf]) {}
+            fn process_timed(
+                &mut self,
+                clock: u64,
+                _: usize,
+                _: &mut [StereoBuf],
+                _: &mut [StereoBuf],
+                _: &[MidiEvent],
+                _: &mut MidiBuf,
+            ) {
+                self.0.send((clock, self.1)).unwrap();
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "nodeplayer-worker-transport-{}",
+            std::process::id()
+        ));
+        let map = Arc::new(Shared::create(path, 1).unwrap());
+        let states = [
+            Transport {
+                state: PlaybackState::Playing,
+                position_seconds: 2.0,
+                seconds_per_frame: 1.0 / 48_000.0,
+            },
+            Transport {
+                state: PlaybackState::Paused,
+                position_seconds: 2.5,
+                seconds_per_frame: 0.0,
+            },
+            Transport::default(),
+        ];
+        // Physical slot order differs from the queued processing order.
+        for (i, index) in [2, 0, 1].into_iter().enumerate() {
+            let slot = map.slot(index);
+            let p = unsafe { slot.payload() };
+            p.generation = map.epoch();
+            p.sequence = i as u64;
+            p.first_sample = 1000 + i as u64 * Q as u64;
+            p.frames = Q as u32;
+            p.midi_count = 0;
+            p.transport = states[i].into();
+            slot.state.store(INPUT, Ordering::Release);
+        }
+        let ctl = Arc::new(AudioControl {
+            park: AtomicBool::new(false),
+            parked: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            gate: AtomicU32::new(0),
+        });
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (_control_tx, control_rx) = crossbeam_channel::unbounded();
+        let child_map = map.clone();
+        let child_ctl = ctl.clone();
+        let handle = std::thread::spawn(move || {
+            audio_loop(
+                Box::new(Capture(tx, Transport::default())),
+                child_map,
+                child_ctl,
+                control_rx,
+            );
+        });
+        let received: Vec<_> = (0..3)
+            .map(|_| rx.recv_timeout(Duration::from_secs(5)))
+            .collect();
+        ctl.stop.store(true, Ordering::Release);
+        handle.join().unwrap();
+        assert!(!ctl.failed.load(Ordering::Acquire));
+        for (i, received) in received.into_iter().enumerate() {
+            assert_eq!(received.unwrap(), (1000 + i as u64 * Q as u64, states[i]));
         }
     }
 }

@@ -63,6 +63,13 @@ On macOS, popped-out editors use regular primary windows that participate in Sta
 Spaces and window cycling. CLAP host resizes update the parent window before calling the
 plugin, keeping autoresized child views and their rendered content at the accepted size.
 
+VST3, CLAP and JSFX receive the player's playback state and song position for audio and MIDI
+files. Pause holds the position; Stop returns it to zero. At the end of a file, the position
+stays at the end. VST3 and CLAP expose playing/not playing; JSFX also distinguishes paused
+from stopped. Processing continues while paused or stopped, including effect tails and live
+MIDI. VST3 and CLAP do not advertise a musical tempo, beat position or time signature; JSFX
+keeps its default 120 BPM and 4/4.
+
 ## When a plugin crashes
 
 Plugins run inside nodeplayer, so one that crashes takes the app with it. nodeplayer notes
