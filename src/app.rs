@@ -2790,7 +2790,15 @@ impl eframe::App for App {
                 NodeKind::Plugin(p) => p.instance.animating(),
                 _ => false,
             });
-        ctx.request_repaint_after(Duration::from_millis(if animate { 16 } else { 30 }));
+        let captured = self.snarl.nodes().any(|node| {
+            matches!(&node.kind, NodeKind::Plugin(plugin)
+                if plugin.editor.as_ref().is_some_and(|editor| editor.is_captured()))
+        });
+        ctx.request_repaint_after(if captured {
+            crate::plugins::surface::CAPTURE_INTERVAL
+        } else {
+            Duration::from_millis(if animate { 16 } else { 30 })
+        });
     }
 }
 

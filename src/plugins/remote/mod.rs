@@ -470,7 +470,10 @@ impl Editor for RemoteEditor {
         if self.pending_input.len() >= Self::MAX_PENDING_INPUT {
             // Moves and wheel deltas are disposable under pressure; button ordering is not.
             self.pending_input.retain(|(_, event)| {
-                matches!(event.kind, PointerKind::Down(_) | PointerKind::Up(_) | PointerKind::Cancel)
+                matches!(
+                    event.kind,
+                    PointerKind::Down(_) | PointerKind::Up(_) | PointerKind::Cancel
+                )
             });
         }
         if self.pending_input.len() >= Self::MAX_PENDING_INPUT {
@@ -619,7 +622,12 @@ mod tests {
 
     fn pointer(kind: PointerKind, x: f64, buttons: u8) -> EditorPointer {
         EditorPointer {
-            click_count: if matches!(kind, PointerKind::Down(_) | PointerKind::Up(_)) { 1 } else { 0 },
+            modifiers: 0,
+            click_count: if matches!(kind, PointerKind::Down(_) | PointerKind::Up(_)) {
+                1
+            } else {
+                0
+            },
             position: [x, 90.0],
             kind,
             buttons,
@@ -668,8 +676,10 @@ mod tests {
         let (mut editor, rx) = captured_editor(1);
         editor.core.tx.try_send(Command::Poll).unwrap();
         for (kind, count, buttons) in [
-            (PointerKind::Down(1), 1, 1), (PointerKind::Up(1), 1, 0),
-            (PointerKind::Down(1), 2, 1), (PointerKind::Up(1), 2, 0),
+            (PointerKind::Down(1), 1, 1),
+            (PointerKind::Up(1), 1, 0),
+            (PointerKind::Down(1), 2, 1),
+            (PointerKind::Up(1), 2, 0),
         ] {
             let mut event = pointer(kind, 10.0, buttons);
             event.click_count = count;
@@ -679,7 +689,11 @@ mod tests {
         for expected in [1, 1, 2, 2] {
             editor.flush_input().unwrap();
             let encoded = serde_json::to_vec(&rx.try_recv().unwrap()).unwrap();
-            let Command::Pointer { event, .. } = serde_json::from_slice::<Command>(&encoded).unwrap() else { panic!("expected pointer") };
+            let Command::Pointer { event, .. } =
+                serde_json::from_slice::<Command>(&encoded).unwrap()
+            else {
+                panic!("expected pointer")
+            };
             assert_eq!(event.click_count, expected);
             event.validate().unwrap();
         }

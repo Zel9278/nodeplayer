@@ -526,6 +526,21 @@ fn transact(
     id: &mut u64,
     c: Command,
 ) -> Result<bool> {
+    let command = match &c {
+        Command::Poll => "poll",
+        Command::SetParam(..) => "set-param",
+        Command::Display(..) => "display",
+        Command::Load(..) => "load",
+        Command::Checkpoint => "checkpoint",
+        Command::Open { .. } => "open-editor",
+        Command::SetSurface(..) => "set-surface",
+        Command::Pointer { .. } => "pointer",
+        Command::Place(..) => "place",
+        Command::Zoom(..) => "zoom",
+        Command::Close(..) => "close-editor",
+        Command::Shutdown => "shutdown",
+    };
+    let started = Instant::now();
     *id = id
         .checked_add(1)
         .context("control request sequence overflow")?;
@@ -541,11 +556,33 @@ fn transact(
             id: *id,
             command: c,
         },
-    )?;
-    let reply: Reply = protocol::receive(stream)?;
-    validate(&reply, generation, *id)?;
+    )
+    .with_context(|| {
+        format!(
+            "worker generation={generation} request={} command={command} stage=send",
+            *id
+        )
+    })?;
+    let reply: Reply = protocol::receive(stream).with_context(|| {
+        format!(
+            "worker generation={generation} request={} command={command} stage=reply elapsed_ms={}",
+            *id,
+            started.elapsed().as_millis()
+        )
+    })?;
+    validate(&reply, generation, *id).with_context(|| {
+        format!(
+            "worker generation={generation} request={} command={command} stage=validate",
+            *id
+        )
+    })?;
     let cached_state = reply.state.is_some();
-    apply(core, reply)?;
+    apply(core, reply).with_context(|| {
+        format!(
+            "worker generation={generation} request={} command={command} stage=apply",
+            *id
+        )
+    })?;
     if quiesce {
         core.ready.store(true, Ordering::Release);
     }
@@ -865,7 +902,12 @@ mod tests {
             generation,
             token: 3,
             event: EditorPointer {
-                click_count: if matches!(kind, PointerKind::Down(_) | PointerKind::Up(_)) { 1 } else { 0 },
+                modifiers: 0,
+                click_count: if matches!(kind, PointerKind::Down(_) | PointerKind::Up(_)) {
+                    1
+                } else {
+                    0
+                },
                 position: [x, 20.0],
                 kind,
                 buttons,
