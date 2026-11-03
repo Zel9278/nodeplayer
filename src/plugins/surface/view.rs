@@ -13,9 +13,11 @@ pub struct EditorView {
     native_size: Option<(u32, u32)>,
     screen: Option<Rect>,
     buttons: u8,
+    modifiers: egui::Modifiers,
     last_position: Option<Pos2>,
     frames: u64,
     first_frame_at: Option<Instant>,
+    last_frame_at: Option<Instant>,
     changed_frames: u64,
     last_frame_hash: Option<ring::digest::Digest>,
     popups: Vec<PopupTexture>,
@@ -150,7 +152,9 @@ struct PopupMapping {
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct EditorFrameStats {
-    frames: u64,
+    pub frames: u64,
+    /// Age since the newest image reached texture staging, not display presentation.
+    pub frame_age_seconds: f64,
     elapsed_seconds: f64,
     frames_per_second: f64,
     changed_frames: Option<u64>,
@@ -165,6 +169,7 @@ impl EditorView {
         let elapsed_seconds = self.first_frame_at?.elapsed().as_secs_f64();
         Some(EditorFrameStats {
             frames: self.frames,
+            frame_age_seconds: self.last_frame_at?.elapsed().as_secs_f64(),
             elapsed_seconds,
             frames_per_second: self.frames.saturating_sub(1) as f64
                 / elapsed_seconds.max(f64::EPSILON),
@@ -218,6 +223,7 @@ impl EditorView {
 
     fn update_texture(&mut self, context: &egui::Context, frame: EditorFrame) {
         self.frames = self.frames.saturating_add(1);
+        self.last_frame_at = Some(Instant::now());
         self.first_frame_at.get_or_insert_with(Instant::now);
         // Diagnostics must distinguish repeated captures from actual plugin redraws.
         // Keep hashing off the ordinary editor path.
@@ -400,14 +406,23 @@ impl EditorView {
                 })
         };
         for event in events {
-            let (position, kind) = match event {
-                egui::Event::PointerMoved(position) => (position, PointerKind::Move),
+            let (position, kind, modifiers) = match event {
+                egui::Event::ModifiersChanged(modifiers) => {
+                    self.modifiers = modifiers;
+                    continue;
+                }
+                egui::Event::PointerMoved(position) => (
+                    position,
+                    PointerKind::Move,
+                    self.modifiers,
+                ),
                 egui::Event::PointerButton {
                     pos,
                     button,
                     pressed,
-                    ..
+                    modifiers,
                 } => {
+                    self.modifiers = modifiers;
                     let button = match button {
                         egui::PointerButton::Primary => 1,
                         egui::PointerButton::Secondary => 2,
@@ -421,6 +436,7 @@ impl EditorView {
                         } else {
                             PointerKind::Up(button)
                         },
+                        modifiers,
                     )
                 }
                 egui::Event::MouseWheel {
@@ -429,6 +445,7 @@ impl EditorView {
                     modifiers,
                     ..
                 } if modifiers.alt || owns_popup => {
+                    self.modifiers = modifiers;
                     let Some(position) = context.pointer_latest_pos() else {
                         continue;
                     };
@@ -443,6 +460,7 @@ impl EditorView {
                             dx: delta.x * multiplier,
                             dy: delta.y * multiplier,
                         },
+                        modifiers,
                     )
                 }
                 _ => continue,
@@ -498,6 +516,7 @@ impl EditorView {
                 _ => 0,
             };
             editor.pointer(EditorPointer {
+                modifiers: modifier_mask(modifiers),
                 click_count,
                 position: self.native_position(screen, size, position, popup),
                 kind,
@@ -517,6 +536,7 @@ impl EditorView {
                 let bit = 1 << (button - 1);
                 if self.buttons & bit != 0 {
                     editor.pointer(EditorPointer {
+                        modifiers: 0,
                         click_count: 0,
                         position: self.native_position(screen, size, position, None),
                         kind: PointerKind::Up(button),
@@ -529,6 +549,7 @@ impl EditorView {
         }
         if !focused || spot.is_none() {
             self.clicks = ClickTracker::default();
+            self.modifiers = egui::Modifiers::default();
         }
         Ok(())
     }
@@ -575,6 +596,7 @@ impl EditorView {
             let bit = 1 << (button - 1);
             if self.buttons & bit != 0 {
                 editor.pointer(EditorPointer {
+                    modifiers: 0,
                     click_count: 0,
                     position,
                     kind: PointerKind::Up(button),
@@ -584,6 +606,7 @@ impl EditorView {
             }
         }
         editor.pointer(EditorPointer {
+            modifiers: 0,
             click_count: 0,
             position,
             kind: PointerKind::Cancel,
@@ -597,6 +620,13 @@ impl EditorView {
         self.clicks = ClickTracker::default();
         Ok(())
     }
+}
+
+fn modifier_mask(modifiers: egui::Modifiers) -> u8 {
+    (u8::from(modifiers.shift) * super::MOD_SHIFT)
+        | (u8::from(modifiers.ctrl) * super::MOD_CONTROL)
+        | (u8::from(modifiers.alt) * super::MOD_ALT)
+        | (u8::from(modifiers.mac_cmd) * super::MOD_SUPER)
 }
 
 fn native_from_screen(screen: Rect, native_size: (u32, u32), position: Pos2) -> [f64; 2] {
@@ -685,6 +715,54 @@ mod tests {
             self.0.push(event);
             Ok(())
         }
+    }
+
+    #[test]
+    fn pointer_modifiers_are_recorded_before_native_or_worker_delivery() {
+        use crate::plugins::PxRect;
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 100.0));
+        let mut view = EditorView { screen: Some(screen), ..Default::default() };
+        view.update_texture(&context, EditorFrame {
+            width: 2,
+            height: 1,
+            native_size: (400, 200),
+            rgba: vec![255; 8],
+            popups: Vec::new(),
+        });
+        let spot = Spot {
+            clip: PxRect { x: 0, y: 0, w: 200, h: 100 },
+            origin: (0, 0),
+            visible: vec![PxRect { x: 0, y: 0, w: 200, h: 100 }],
+        };
+        let mut editor = RecordingEditor(Vec::new());
+        let mut output = context.run_ui(egui::RawInput {
+            focused: true,
+            events: vec![
+                egui::Event::PointerButton {
+                    pos: egui::pos2(20.0, 30.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers { ctrl: true, ..Default::default() },
+                },
+                egui::Event::ModifiersChanged(egui::Modifiers { shift: true, ..Default::default() }),
+                egui::Event::PointerMoved(egui::pos2(40.0, 30.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(40.0, 30.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers { alt: true, ..Default::default() },
+                },
+            ],
+            ..Default::default()
+        }, |ui| view.dispatch(ui.ctx(), &mut editor, Some(&spot), 1.0).unwrap());
+        output.textures_delta.clear();
+        assert_eq!(editor.0.iter().map(|event| event.modifiers).collect::<Vec<_>>(),
+            [super::super::MOD_CONTROL, super::super::MOD_SHIFT, super::super::MOD_ALT]);
+        assert!((editor.0[1].position[0] - 80.0).abs() < 0.001);
+        assert!((editor.0[1].position[1] - 60.0).abs() < 0.001);
+        drop(view);
+        context.tex_manager().write().take_delta().clear();
     }
 
     #[test]

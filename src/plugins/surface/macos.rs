@@ -282,7 +282,7 @@ impl NativeCapture {
                 dx.is_finite() && dy.is_finite(),
                 "non-finite wheel displacement"
             );
-            return forward_wheel(&target_window, &target, location, dx, dy);
+            return forward_wheel(&target_window, &target, location, dx, dy, pointer.modifiers);
         }
         // NSButton::mouseDown enters a blocking tracking loop. Release-time performClick
         // invokes the normal action without waiting for events from the graph window.
@@ -325,7 +325,7 @@ impl NativeCapture {
             PointerKind::Cancel => unreachable!(),
         };
         let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-            event_type, location, NSEventModifierFlags::empty(),
+            event_type, location, native_modifiers(pointer.modifiers),
             unsafe { CACurrentMediaTime() }, target_window.windowNumber(), None, 0, isize::from(pointer.click_count),
             if matches!(pointer.kind, PointerKind::Up(_)) { 0.0 } else { 1.0 },
         ).context("AppKit could not create forwarded pointer event")?;
@@ -425,6 +425,7 @@ fn forward_wheel(
     location: NSPoint,
     dx: f32,
     dy: f32,
+    modifiers: u8,
 ) -> Result<()> {
     // Populate real wheel delta fields, but deliver directly to the target view instead
     // of posting global input or moving the user's physical desktop pointer.
@@ -438,6 +439,7 @@ fn forward_wheel(
         ) -> *mut CGEvent;
         fn CGEventSetLocation(event: *mut CGEvent, point: NSPoint);
         fn CGEventSetIntegerValueField(event: *mut CGEvent, field: u32, value: i64);
+        fn CGEventSetFlags(event: *mut CGEvent, flags: u64);
         fn CGMainDisplayID() -> u32;
         fn CGDisplayBounds(display: u32) -> NSRect;
     }
@@ -459,12 +461,26 @@ fn forward_wheel(
         CGEventSetLocation(cg, NSPoint::new(screen.x, primary.size.height - screen.y));
         CGEventSetIntegerValueField(cg, 91, window.windowNumber() as i64);
         CGEventSetIntegerValueField(cg, 92, window.windowNumber() as i64);
+        CGEventSetFlags(cg, native_modifiers(modifiers).bits() as u64);
         let event: Option<Retained<NSEvent>> = msg_send![NSEvent::class(), eventWithCGEvent: cg];
         CFRelease(cg.cast());
         let event = event.context("AppKit could not wrap wheel event")?;
         target.scrollWheel(&event);
     }
     Ok(())
+}
+
+fn native_modifiers(modifiers: u8) -> NSEventModifierFlags {
+    let mut flags = NSEventModifierFlags::empty();
+    for (bit, flag) in [
+        (super::MOD_SHIFT, NSEventModifierFlags::Shift),
+        (super::MOD_CONTROL, NSEventModifierFlags::Control),
+        (super::MOD_ALT, NSEventModifierFlags::Option),
+        (super::MOD_SUPER, NSEventModifierFlags::Command),
+    ] {
+        if modifiers & bit != 0 { flags |= flag; }
+    }
+    flags
 }
 
 fn rgba_frame(bitmap: &NSBitmapImageRep, native_size: (u32, u32)) -> Result<EditorFrame> {

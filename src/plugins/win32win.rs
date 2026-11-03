@@ -9,21 +9,495 @@
 //! it never activates or becomes a separate taskbar/Alt-Tab entry.
 
 use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
 use std::sync::Once;
 
-use anyhow::{Context, Result};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use anyhow::{Context, Result, ensure};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BLACK_BRUSH, CombineRgn, CreateRectRgn, DeleteObject, GetStockObject, HBRUSH, HRGN, RDW_ALLCHILDREN, RDW_UPDATENOW, RGN_OR,
+    BLACK_BRUSH, ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, GetStockObject, HBRUSH, HRGN, RDW_ALLCHILDREN, RDW_UPDATENOW, RGN_OR,
     RedrawWindow, SetWindowRgn,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetCapture, GetFocus, ReleaseCapture, SetCapture, SetFocus,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, w};
 
 use super::{Placement, Spot, WinEvent, WindowId};
 
 const CLASS: PCWSTR = w!("nodeplayer-plugin-editor");
+
+type SubclassProc =
+    Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT>;
+
+// These helpers need no common-controls widgets or process-wide initialization. They
+// coexist with a plugin's own subclass chain and can only be used on the owner thread.
+#[link(name = "comctl32")]
+unsafe extern "system" {
+    fn SetWindowSubclass(
+        hwnd: HWND,
+        callback: SubclassProc,
+        id: usize,
+        data: usize,
+    ) -> windows::Win32::Foundation::BOOL;
+    fn RemoveWindowSubclass(
+        hwnd: HWND,
+        callback: SubclassProc,
+        id: usize,
+    ) -> windows::Win32::Foundation::BOOL;
+    fn DefSubclassProc(hwnd: HWND, message: u32, value: WPARAM, position: LPARAM) -> LRESULT;
+}
+
+thread_local! {
+    static CAPTURE_INPUTS: RefCell<Vec<Weak<CaptureInput>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Graph input owns physical capture/focus. The private editor sees native ownership
+/// while its callbacks run, and retains logical ownership between forwarded events.
+pub(crate) struct CaptureInput {
+    root: HWND,
+    capture: Cell<HWND>,
+    focus: Cell<HWND>,
+    depth: Cell<u32>,
+    suppress_capture: Cell<HWND>,
+    suppress_focus: Cell<HWND>,
+    returning_capture: Cell<HWND>,
+    returning_focus: Cell<HWND>,
+    hooks: RefCell<Vec<HWND>>,
+    popup_origins: RefCell<Vec<(HWND, POINT)>>,
+    creation_hook: Cell<HHOOK>,
+}
+
+impl CaptureInput {
+    pub(crate) fn new(root: HWND) -> Result<Rc<Self>> {
+        let input = Rc::new(Self {
+            root,
+            capture: Cell::new(HWND::default()),
+            focus: Cell::new(HWND::default()),
+            depth: Cell::new(0),
+            suppress_capture: Cell::new(HWND::default()),
+            suppress_focus: Cell::new(HWND::default()),
+            returning_capture: Cell::new(HWND::default()),
+            returning_focus: Cell::new(HWND::default()),
+            hooks: RefCell::new(Vec::new()),
+            popup_origins: RefCell::new(Vec::new()),
+            creation_hook: Cell::new(HHOOK::default()),
+        });
+        input.refresh()?;
+        CAPTURE_INPUTS.with(|inputs| {
+            let mut inputs = inputs.borrow_mut();
+            inputs.retain(|input| input.strong_count() != 0);
+            inputs.push(Rc::downgrade(&input));
+        });
+        input.creation_hook.set(
+            unsafe {
+                SetWindowsHookExW(
+                    WH_CBT,
+                    Some(capture_create_proc),
+                    HINSTANCE::default(),
+                    windows::Win32::System::Threading::GetCurrentThreadId(),
+                )
+            }
+            .context("watch captured editor popup creation")?,
+        );
+        // The plugin may create tooltip/owned windows before the capture adapter attaches.
+        let mut top = unsafe { GetTopWindow(HWND::default()) }.ok();
+        for _ in 0..4096 {
+            let Some(hwnd) = top else {
+                break;
+            };
+            top = unsafe { GetWindow(hwnd, GW_HWNDNEXT) }.ok();
+            if hwnd != root && input.owns(hwnd) {
+                input.hook(hwnd)?;
+                let mut bounds = RECT::default();
+                unsafe { GetWindowRect(hwnd, &mut bounds) }
+                    .context("read captured popup origin")?;
+                input.remember_popup(
+                    hwnd,
+                    POINT {
+                        x: bounds.left,
+                        y: bounds.top,
+                    },
+                );
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        capture_origin((bounds.right - bounds.left, bounds.bottom - bounds.top)).0,
+                        capture_origin((bounds.right - bounds.left, bounds.bottom - bounds.top)).1,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                }
+                .context("keep captured popup off desktop")?;
+            }
+        }
+        Ok(input)
+    }
+
+    fn owns(&self, hwnd: HWND) -> bool {
+        if hwnd.0.is_null() || !unsafe { IsWindow(hwnd) }.as_bool() {
+            return false;
+        }
+        if hwnd == self.root || unsafe { IsChild(self.root, hwnd) }.as_bool() {
+            return true;
+        }
+        let mut top = unsafe { GetAncestor(hwnd, GA_ROOT) };
+        for _ in 0..16 {
+            let Ok(owner) = (unsafe { GetWindow(top, GW_OWNER) }) else {
+                return false;
+            };
+            if owner == self.root || unsafe { IsChild(self.root, owner) }.as_bool() {
+                return true;
+            }
+            top = owner;
+        }
+        false
+    }
+
+    fn hook(&self, hwnd: HWND) -> Result<()> {
+        if self.hooks.borrow().contains(&hwnd) {
+            return Ok(());
+        }
+        let ptr = self as *const Self as usize;
+        ensure!(
+            unsafe { SetWindowSubclass(hwnd, Some(capture_input_proc), ptr, ptr) }.as_bool(),
+            "subclass captured editor input"
+        );
+        self.hooks.borrow_mut().push(hwnd);
+        Ok(())
+    }
+
+    pub(crate) fn refresh(&self) -> Result<()> {
+        self.hooks
+            .borrow_mut()
+            .retain(|hwnd| unsafe { IsWindow(*hwnd).as_bool() });
+        self.hook(self.root)?;
+        let mut pending = vec![self.root];
+        pending.extend(self.popup_origins.borrow().iter().filter_map(|(window, _)| {
+            self.owns(*window).then_some(*window)
+        }));
+        let mut count = 0;
+        while let Some(parent) = pending.pop() {
+            let mut child = unsafe { GetWindow(parent, GW_CHILD) }.ok();
+            while let Some(hwnd) = child {
+                count += 1;
+                ensure!(count <= 512, "captured editor has too many native children");
+                self.hook(hwnd)?;
+                pending.push(hwnd);
+                child = unsafe { GetWindow(hwnd, GW_HWNDNEXT) }.ok();
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn popups(&self) -> Result<Vec<(HWND, POINT)>> {
+        let mut result = Vec::new();
+        let mut root_origin = POINT::default();
+        ensure!(unsafe { ClientToScreen(self.root, &mut root_origin) }.as_bool(), "locate captured popup host");
+        for &(hwnd, origin) in self.popup_origins.borrow().iter() {
+            if self.owns(hwnd) && unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                ensure!(result.len() < 16, "too many captured editor popups");
+                result.push((hwnd, POINT {
+                    x: root_origin.x.saturating_add(origin.x),
+                    y: root_origin.y.saturating_add(origin.y),
+                }));
+            }
+        }
+        // GW_HWNDPREV counts windows above this one. Paint the lowest owned popup first.
+        result.sort_by_cached_key(|(hwnd, _)| {
+            let mut above = 0usize;
+            let mut next = *hwnd;
+            while let Ok(previous) = unsafe { GetWindow(next, GW_HWNDPREV) } {
+                above += 1;
+                if above >= 4096 {
+                    break;
+                }
+                next = previous;
+            }
+            std::cmp::Reverse(above)
+        });
+        Ok(result)
+    }
+
+    fn remember_popup(&self, hwnd: HWND, origin: POINT) {
+        let mut root_origin = POINT::default();
+        if !unsafe { ClientToScreen(self.root, &mut root_origin) }.as_bool() {
+            return;
+        }
+        let origin = POINT {
+            x: origin.x.saturating_sub(root_origin.x),
+            y: origin.y.saturating_sub(root_origin.y),
+        };
+        let mut origins = self.popup_origins.borrow_mut();
+        if let Some((_, previous)) = origins.iter_mut().find(|(window, _)| *window == hwnd) {
+            *previous = origin;
+        } else {
+            origins.push((hwnd, origin));
+        }
+    }
+
+    pub(crate) fn owner(&self) -> Option<HWND> {
+        self.owns(self.capture.get()).then(|| self.capture.get())
+    }
+
+    pub(crate) fn contains(&self, hwnd: HWND) -> bool {
+        self.owns(hwnd)
+    }
+
+    pub(crate) fn cancel(&self) {
+        let capture = self.capture.replace(HWND::default());
+        let focus = self.focus.replace(HWND::default());
+        unsafe {
+            let target = if self.owns(capture) { capture } else { focus };
+            if self.owns(target) {
+                SendMessageW(target, WM_CANCELMODE, WPARAM(0), LPARAM(0));
+                // Logical capture was released between callbacks. Deliver the actual
+                // cancellation even though there may be no physical Win32 capture now.
+                SendMessageW(target, WM_CAPTURECHANGED, WPARAM(0), LPARAM(0));
+            }
+            if self.owns(GetCapture()) {
+                let _ = ReleaseCapture();
+            }
+        }
+    }
+
+    pub(crate) fn enter(&self) -> CaptureInputScope<'_> {
+        let depth = self.depth.get();
+        self.depth.set(depth + 1);
+        let mut scope = CaptureInputScope {
+            input: self,
+            previous_capture: HWND::default(),
+            previous_focus: HWND::default(),
+            temporary: Vec::new(),
+            outer: depth == 0,
+        };
+        if depth != 0 {
+            return scope;
+        }
+        unsafe {
+            scope.previous_capture = GetCapture();
+            scope.previous_focus = GetFocus();
+            self.returning_capture.set(scope.previous_capture);
+            self.returning_focus.set(scope.previous_focus);
+            for hwnd in [scope.previous_capture, scope.previous_focus] {
+                if !hwnd.0.is_null() && !self.owns(hwnd) && !scope.temporary.contains(&hwnd) {
+                    let ptr = self as *const Self as usize;
+                    if SetWindowSubclass(hwnd, Some(capture_input_proc), ptr, ptr).as_bool() {
+                        scope.temporary.push(hwnd);
+                    }
+                }
+            }
+            if let Some(owner) = self.owner().filter(|owner| *owner != GetCapture()) {
+                SetCapture(owner);
+            }
+            if self.owns(self.focus.get()) && self.focus.get() != GetFocus() {
+                let _ = SetFocus(self.focus.get());
+            }
+        }
+        scope
+    }
+}
+
+pub(crate) struct CaptureInputScope<'a> {
+    input: &'a CaptureInput,
+    previous_capture: HWND,
+    previous_focus: HWND,
+    temporary: Vec<HWND>,
+    outer: bool,
+}
+
+impl Drop for CaptureInputScope<'_> {
+    fn drop(&mut self) {
+        let input = self.input;
+        if self.outer {
+            unsafe {
+                let captured = GetCapture();
+                if input.owns(captured) {
+                    input.capture.set(captured);
+                    input.suppress_capture.set(captured);
+                    let _ = ReleaseCapture();
+                    input.suppress_capture.set(HWND::default());
+                }
+                if !self.previous_capture.0.is_null()
+                    && !input.owns(self.previous_capture)
+                    && IsWindow(self.previous_capture).as_bool()
+                    && GetCapture().0.is_null()
+                {
+                    SetCapture(self.previous_capture);
+                }
+                let focused = GetFocus();
+                if input.owns(focused) {
+                    input.focus.set(focused);
+                    input.suppress_focus.set(focused);
+                    let _ = SetFocus(self.previous_focus);
+                    input.suppress_focus.set(HWND::default());
+                }
+                let ptr = input as *const CaptureInput as usize;
+                for hwnd in &self.temporary {
+                    let _ = RemoveWindowSubclass(*hwnd, Some(capture_input_proc), ptr);
+                }
+            }
+            input.returning_capture.set(HWND::default());
+            input.returning_focus.set(HWND::default());
+        }
+        input.depth.set(input.depth.get().saturating_sub(1));
+    }
+}
+
+unsafe extern "system" fn capture_input_proc(
+    hwnd: HWND,
+    message: u32,
+    value: WPARAM,
+    position: LPARAM,
+    id: usize,
+    data: usize,
+) -> LRESULT {
+    // NativeCapture retains the Rc until every subclass is removed. All access and
+    // destruction are confined to this HWND's thread; no Rust mutable borrow spans a call.
+    let input = unsafe { &*(data as *const CaptureInput) };
+    let next = HWND(position.0 as *mut _);
+    if message == WM_WINDOWPOSCHANGING
+        && hwnd != input.root
+        && !unsafe { IsChild(input.root, hwnd) }.as_bool()
+        && input.owns(hwnd)
+        && let Some(change) = unsafe { (position.0 as *mut WINDOWPOS).as_mut() }
+    {
+        let mut bounds = RECT::default();
+        let size = if change.flags & SWP_NOSIZE == SWP_NOSIZE
+            && unsafe { GetWindowRect(hwnd, &mut bounds) }.is_ok()
+        {
+            (bounds.right - bounds.left, bounds.bottom - bounds.top)
+        } else {
+            (change.cx, change.cy)
+        };
+        let actual = capture_origin(size);
+        if change.flags & SWP_NOMOVE != SWP_NOMOVE && (change.x, change.y) != actual {
+            input.remember_popup(
+                hwnd,
+                POINT {
+                    x: change.x,
+                    y: change.y,
+                },
+            );
+        }
+        (change.x, change.y) = actual;
+        change.flags &= !SWP_NOMOVE;
+    }
+    if message == WM_CAPTURECHANGED {
+        if hwnd == input.suppress_capture.get() && next.0.is_null()
+            || hwnd == input.returning_capture.get() && input.depth.get() != 0 && input.owns(next)
+        {
+            return LRESULT(0);
+        }
+        if input.capture.get() == hwnd && next != hwnd {
+            input.capture.set(if input.owns(next) {
+                next
+            } else {
+                HWND::default()
+            });
+        }
+    }
+    if message == WM_KILLFOCUS {
+        let next = HWND(value.0 as *mut _);
+        if hwnd == input.suppress_focus.get() && next == input.returning_focus.get()
+            || hwnd == input.returning_focus.get() && input.depth.get() != 0 && input.owns(next)
+        {
+            return LRESULT(0);
+        }
+        if input.focus.get() == hwnd {
+            input.focus.set(HWND::default());
+            input.capture.set(HWND::default());
+        }
+    }
+    if message == WM_CANCELMODE && input.owns(hwnd) {
+        input.capture.set(HWND::default());
+    }
+    if message == WM_NCDESTROY {
+        if input.capture.get() == hwnd {
+            input.capture.set(HWND::default());
+        }
+        if input.focus.get() == hwnd {
+            input.focus.set(HWND::default());
+        }
+        input
+            .popup_origins
+            .borrow_mut()
+            .retain(|(window, _)| *window != hwnd);
+        input.hooks.borrow_mut().retain(|window| *window != hwnd);
+        unsafe {
+            let _ = RemoveWindowSubclass(hwnd, Some(capture_input_proc), id);
+        }
+    }
+    let _scope = (input.owns(hwnd)
+        && matches!(message, WM_TIMER | WM_PAINT | WM_PRINT | WM_PRINTCLIENT))
+    .then(|| input.enter());
+    unsafe { DefSubclassProc(hwnd, message, value, position) }
+}
+
+unsafe extern "system" fn capture_create_proc(
+    code: i32,
+    value: WPARAM,
+    position: LPARAM,
+) -> LRESULT {
+    if code == HCBT_CREATEWND as i32
+        && let Some(create) = unsafe { (position.0 as *mut CBT_CREATEWNDW).as_mut() }
+        && let Some(details) = unsafe { create.lpcs.as_mut() }
+        && details.style as u32 & WS_CHILD.0 == 0
+    {
+        let input = CAPTURE_INPUTS.with(|inputs| {
+            inputs
+                .borrow()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|input| input.owns(details.hwndParent))
+        });
+        if let Some(input) = input {
+            let hwnd = HWND(value.0 as *mut _);
+            if input.hook(hwnd).is_ok() {
+                input.remember_popup(
+                    hwnd,
+                    POINT {
+                        x: details.x,
+                        y: details.y,
+                    },
+                );
+                (details.x, details.y) = capture_origin((details.cx, details.cy));
+            }
+        }
+    }
+    unsafe { CallNextHookEx(HHOOK::default(), code, value, position) }
+}
+
+impl Drop for CaptureInput {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = UnhookWindowsHookEx(self.creation_hook.get());
+        }
+        self.cancel();
+        let ptr = self as *const Self as usize;
+        for hwnd in self.hooks.get_mut().drain(..) {
+            unsafe {
+                let _ = RemoveWindowSubclass(hwnd, Some(capture_input_proc), ptr);
+            }
+        }
+    }
+}
+
+fn with_capture_input<T>(hwnd: HWND, operation: impl FnOnce() -> T) -> T {
+    let input = CAPTURE_INPUTS.with(|inputs| {
+        inputs
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|input| input.owns(hwnd))
+    });
+    let _scope = input.as_ref().map(|input| input.enter());
+    operation()
+}
 
 /// Cuts `container` to the parts of it nothing covers. A window region clips drawing, the
 /// plugin's child windows included, and hit testing, so clicks in the holes reach the app.
@@ -253,6 +727,7 @@ impl HostWindow {
                     // startup-state override or an activation/visible desktop flash.
                     SetWindowPos(id, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW)
                         .context("show offscreen editor capture source")?;
+                    ensure!(IsWindowVisible(id).as_bool(), "offscreen capture source did not map");
                 } else {
                     let _ = ShowWindow(id, SW_SHOW);
                 }
@@ -339,9 +814,9 @@ impl HostWindow {
     /// plugin's windows here, directly, skips that queue (and does nothing when none needs it).
     pub fn poll(&self) -> Vec<WinEvent> {
         pump_timers();
-        unsafe {
+        if self.placement != Placement::CaptureSource { unsafe {
             let _ = RedrawWindow(self.container.unwrap_or(self.id), None, HRGN::default(), RDW_UPDATENOW | RDW_ALLCHILDREN);
-        }
+        } }
         // Embedded windows are sized by the host only.
         let events = std::mem::take(&mut *self.state.events.borrow_mut());
         if self.container.is_some() { events.into_iter().filter(|e| matches!(e, WinEvent::Close)).collect() } else { events }
@@ -360,7 +835,7 @@ fn pump_timers() {
             if !PeekMessageW(&mut msg, None, WM_TIMER, WM_TIMER, PM_REMOVE).as_bool() {
                 break;
             }
-            DispatchMessageW(&msg);
+            with_capture_input(msg.hwnd, || DispatchMessageW(&msg));
         }
     }
 }

@@ -25,7 +25,13 @@ use windows::NativeCapture;
 pub const MAX_DIMENSION: u32 = 8192;
 pub const MAX_PIXELS: usize = 16 * 1024 * 1024;
 pub const MAX_POPUPS: usize = 16;
-const CAPTURE_INTERVAL: Duration = Duration::from_millis(33);
+pub const MOD_SHIFT: u8 = 1;
+pub const MOD_CONTROL: u8 = 2;
+pub const MOD_ALT: u8 = 4;
+pub const MOD_SUPER: u8 = 8;
+/// Capture service budget; presentation is paced independently by the viewport/display.
+pub const CAPTURE_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 240);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct EditorFrame {
@@ -120,6 +126,9 @@ pub struct EditorPointer {
     pub kind: PointerKind,
     /// Bit 0 primary, bit 1 secondary, bit 2 middle.
     pub buttons: u8,
+    /// Shift, Control, Alt/Option and Super/Command at the input event boundary.
+    #[serde(default)]
+    pub modifiers: u8,
     /// Click sequence on a button transition; zero for motion, wheel, or cancellation.
     pub click_count: u8,
 }
@@ -133,6 +142,7 @@ impl EditorPointer {
             "invalid editor pointer coordinates"
         );
         ensure!(self.buttons & !7 == 0, "invalid editor buttons");
+        ensure!(self.modifiers & !15 == 0, "invalid editor modifiers");
         ensure!(
             matches!(self.kind, PointerKind::Down(_) | PointerKind::Up(_)) || self.click_count == 0,
             "click count on a non-button editor event"
@@ -170,6 +180,7 @@ pub fn capture(source: Box<dyn Editor>, placement: Placement) -> Result<Box<dyn 
         placement,
         pending: None,
         next_capture: Instant::now(),
+        opened_at: Instant::now(),
         painted: false,
         error: None,
     }))
@@ -182,6 +193,7 @@ struct CapturedEditor {
     placement: Placement,
     pending: Option<EditorFrame>,
     next_capture: Instant,
+    opened_at: Instant,
     painted: bool,
     error: Option<String>,
 }
@@ -236,6 +248,9 @@ impl Editor for CapturedEditor {
                             .windows(2)
                             .all(|p| p[0] == p[1])
                     {
+                        if self.opened_at.elapsed() >= STARTUP_TIMEOUT {
+                            self.error = Some("Editor capture produced no image within 5 seconds; try Pop out".into());
+                        }
                         return true;
                     }
                     self.painted = true;
@@ -252,8 +267,7 @@ impl Editor for CapturedEditor {
 }
 
 fn next_capture_deadline(previous: Instant, now: Instant) -> Instant {
-    // Keep the cadence when a UI tick arrives slightly late. Resetting from `now`
-    // makes a 30 ms UI poll miss every other 33 ms capture. Skip missed intervals
+    // Keep the cadence when a UI tick arrives slightly late. Skip missed intervals
     // after a stall rather than issuing a burst of catch-up captures.
     let next = previous + CAPTURE_INTERVAL;
     if next > now {
@@ -281,16 +295,16 @@ mod tests {
         let start = Instant::now();
         let mut deadline = start;
         let mut frames = 0;
-        for tick in 0..=33 {
-            let now = start + Duration::from_millis(tick * 30);
+        for tick in 0..=1000 {
+            let now = start + Duration::from_millis(tick);
             if now >= deadline {
                 frames += 1;
                 deadline = next_capture_deadline(deadline, now);
             }
         }
         assert_eq!(
-            frames, 31,
-            "a roughly one-second run keeps the 33 ms cadence"
+            frames, 241,
+            "a one-second run services the 240 Hz target without polling drift"
         );
         let resumed = start + Duration::from_secs(10);
         assert_eq!(
@@ -315,6 +329,7 @@ mod tests {
         frame.rgba.pop();
         assert!(frame.validate().is_err());
         let mut event = EditorPointer {
+            modifiers: 0,
             click_count: 1,
             position: [0.0, 0.0],
             kind: PointerKind::Down(1),
@@ -324,6 +339,10 @@ mod tests {
         event.position[0] = f64::NAN;
         assert!(event.validate().is_err());
         event.position[0] = 0.0;
+        event.modifiers = 16;
+        assert!(event.validate().is_err());
+        event.modifiers = MOD_SHIFT | MOD_CONTROL | MOD_ALT | MOD_SUPER;
+        assert!(event.validate().is_ok());
         event.kind = PointerKind::Up(4);
         assert!(event.validate().is_err());
         event.kind = PointerKind::Down(1);

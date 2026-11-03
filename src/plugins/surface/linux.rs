@@ -22,9 +22,7 @@ pub struct NativeCapture {
     root: Window,
     window: Window,
     pixmap: Option<Pixmap>,
-    size: (u32, u32),
     masks: [u32; 3],
-    renew_pixmap: bool,
     pointer_target: Option<Window>,
 }
 
@@ -90,9 +88,7 @@ impl NativeCapture {
             root: geometry.root,
             window,
             pixmap: None,
-            size: (u32::from(geometry.width), u32::from(geometry.height)),
             masks,
-            renew_pixmap: true,
             pointer_target: None,
         };
         capture.rename_pixmap()?;
@@ -110,7 +106,6 @@ impl NativeCapture {
             .check()
             .context("name the editor pixmap (its native source must remain mapped)")?;
         self.pixmap = Some(pixmap);
-        self.renew_pixmap = false;
         Ok(())
     }
 
@@ -125,16 +120,6 @@ impl NativeCapture {
                 Event::Error(error) => bail!("editor capture X11 request failed: {error:?}"),
                 Event::DestroyNotify(event) if event.window == self.window => {
                     bail!("editor capture source was destroyed")
-                }
-                Event::MapNotify(event) if event.window == self.window => self.renew_pixmap = true,
-                Event::UnmapNotify(event) if event.window == self.window => {
-                    self.renew_pixmap = true
-                }
-                Event::ConfigureNotify(event)
-                    if event.window == self.window
-                        && self.size != (u32::from(event.width), u32::from(event.height)) =>
-                {
-                    self.renew_pixmap = true;
                 }
                 _ => {}
             }
@@ -153,13 +138,12 @@ impl NativeCapture {
         let geometry = self.conn.get_geometry(self.window)?.reply()?;
         let size = (u32::from(geometry.width), u32::from(geometry.height));
         let pixels = validate_size(size)?;
-        if size != self.size {
-            self.size = size;
-            self.renew_pixmap = true;
-        }
-        if self.renew_pixmap || self.pixmap.is_none() {
-            self.rename_pixmap()?;
-        }
+        // A compositor can replace offscreen storage while taking over redirection
+        // without resizing or remapping this window. A retained name then keeps
+        // reading the abandoned image forever, even while the editor repaints.
+        // Resolve the current storage for every frame rather than relying on
+        // source-structure events to invalidate the previous pixmap.
+        self.rename_pixmap()?;
         let reply = self
             .conn
             .get_image(
@@ -267,7 +251,15 @@ impl NativeCapture {
                 return Err(error);
             }
         };
-        let state = button_mask(event.buttons);
+        let mut state = button_mask(event.buttons);
+        for (bit, mask) in [
+            (super::MOD_SHIFT, KeyButMask::SHIFT),
+            (super::MOD_CONTROL, KeyButMask::CONTROL),
+            (super::MOD_ALT, KeyButMask::MOD1),
+            (super::MOD_SUPER, KeyButMask::MOD4),
+        ] {
+            if event.modifiers & bit != 0 { state |= mask; }
+        }
         match event.kind {
             PointerKind::Cancel => {
                 self.pointer_target = None;
@@ -506,8 +498,8 @@ mod tests {
                 x11rb::COPY_DEPTH_FROM_PARENT,
                 window,
                 root,
-                25,
-                30,
+                -16384,
+                -16384,
                 640,
                 360,
                 0,
@@ -515,6 +507,7 @@ mod tests {
                 x11rb::COPY_FROM_PARENT,
                 &CreateWindowAux::new()
                     .background_pixel(0)
+                    .override_redirect(1)
                     .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
             )?
             .check()?;
@@ -596,14 +589,16 @@ mod tests {
                 x11rb::COPY_DEPTH_FROM_PARENT,
                 cover,
                 source.root,
-                0,
-                0,
+                -16384,
+                -16384,
                 1600,
                 1000,
                 0,
                 WindowClass::INPUT_OUTPUT,
                 x11rb::COPY_FROM_PARENT,
-                &CreateWindowAux::new().background_pixel(0xff0000),
+                &CreateWindowAux::new()
+                    .background_pixel(0xff0000)
+                    .override_redirect(1),
             )?
             .check()?;
         source.conn.map_window(cover)?.check()?;
@@ -690,18 +685,21 @@ mod tests {
         assert_eq!(pixel(&frame, 80, 90), [0, 204, 136, 255]);
         for event in [
             EditorPointer {
+                modifiers: 0,
                 click_count: 1,
                 position: [80.0, 90.0],
                 kind: PointerKind::Down(1),
                 buttons: 1,
             },
             EditorPointer {
+                modifiers: 0,
                 click_count: 0,
                 position: [300.0, 90.0],
                 kind: PointerKind::Move,
                 buttons: 1,
             },
             EditorPointer {
+                modifiers: 0,
                 click_count: 1,
                 position: [300.0, 90.0],
                 kind: PointerKind::Up(1),
@@ -750,6 +748,7 @@ mod tests {
         use x11rb::protocol::shape::{ConnectionExt as _, SK};
 
         let (observer, screen) = x11rb::connect(None)?;
+        observer.composite_query_version(0, 4)?.reply()?;
         let screen = &observer.setup().roots[screen];
         let root = screen.root;
         let visual = screen
@@ -766,18 +765,20 @@ mod tests {
             .reply()?
             .atom;
 
-        // A second client redirects root children as a compositor would. Automatic
-        // per-source capture must coexist with that manual parent redirection.
+        // Simulate a compositor only on this fixture's source. Taking manual
+        // redirection of the desktop root would conflict with a real compositor
+        // and change unrelated windows during a native-session test.
         for compositor in [false, true] {
-            if compositor {
-                observer
-                    .composite_redirect_subwindows(root, Redirect::MANUAL)?
-                    .check()?;
-            }
             let background = observer
                 .get_image(ImageFormat::Z_PIXMAP, root, 0, 0, 32, 32, u32::MAX)?
-                .reply()?
-                .data;
+                .reply()
+                .ok()
+                .map(|reply| reply.data);
+            if background.is_none() {
+                eprintln!(
+                    "X11 root pixels unavailable; checking source geometry, input, and focus directly"
+                );
+            }
             for _ in 0..2 {
                 let host = HostWindow::create(
                     Placement::CaptureSource,
@@ -786,6 +787,25 @@ mod tests {
                     "capture source",
                     false,
                 )?;
+                let simulated_compositor = if compositor {
+                    match observer
+                        .composite_redirect_window(host.id, Redirect::MANUAL)?
+                        .check()
+                    {
+                        Ok(()) => true,
+                        // A real compositor may already own manual redirection of
+                        // root children. Its source redirection is the same case
+                        // this fixture simulates; leave that ownership intact.
+                        Err(x11rb::errors::ReplyError::X11Error(error))
+                            if error.error_kind == x11rb::protocol::ErrorKind::Access =>
+                        {
+                            false
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    false
+                };
                 let attributes = observer.get_window_attributes(host.id)?.reply()?;
                 assert!(attributes.override_redirect);
                 assert_eq!(attributes.map_state, MapState::VIEWABLE);
@@ -853,15 +873,39 @@ mod tests {
                     Ok(())
                 };
                 let mut capture = NativeCapture::new(host.handle())?;
-                paint(256, 144, 0)?;
-                let first = capture.capture(host.size())?;
+                let paint_and_capture = |capture: &mut NativeCapture,
+                                         width: u16,
+                                         height: u16,
+                                         green: u8,
+                                         metadata: (u32, u32)|
+                 -> Result<EditorFrame> {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    loop {
+                        // Taking over redirection can discard a just-painted
+                        // backing store. A real editor repaints on its next tick.
+                        paint(width, height, green)?;
+                        let frame = capture.capture(metadata)?;
+                        if frame.width == u32::from(width)
+                            && frame.height == u32::from(height)
+                            && pixel(&frame, 4, 4) == [255, green, 0, 255]
+                            && pixel(&frame, 4, usize::from(height) - 4) == [0, green, 255, 255]
+                        {
+                            return Ok(frame);
+                        }
+                        ensure!(
+                            std::time::Instant::now() < deadline,
+                            "offscreen source did not publish its repainted backing store"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                };
+                let first = paint_and_capture(&mut capture, 256, 144, 0, host.size())?;
                 assert_eq!(pixel(&first, 4, 4), [255, 0, 0, 255]);
                 assert_eq!(pixel(&first, 4, 140), [0, 0, 255, 255]);
                 for green in [64, 128, 192] {
-                    paint(256, 144, green)?;
-                    let frame = capture.capture(host.size())?;
-                    assert_ne!(
-                        frame.rgba, first.rgba,
+                    let frame = paint_and_capture(&mut capture, 256, 144, green, host.size())?;
+                    assert!(
+                        frame.rgba != first.rgba,
                         "offscreen source must continue producing new pixels"
                     );
                     assert_eq!(pixel(&frame, 4, 4), [255, green, 0, 255]);
@@ -888,6 +932,7 @@ mod tests {
                 host.conn.map_window(child)?.check()?;
                 for (kind, buttons) in [(PointerKind::Down(1), 1), (PointerKind::Up(1), 0)] {
                     capture.pointer(EditorPointer {
+                        modifiers: 0,
                         click_count: if matches!(kind, PointerKind::Down(_) | PointerKind::Up(_)) {
                             1
                         } else {
@@ -911,8 +956,7 @@ mod tests {
                     "synthetic graph input must reach the native child"
                 );
                 host.resize(320, 180);
-                paint(320, 180, 80)?;
-                let resized = capture.capture((256, 144))?;
+                let resized = paint_and_capture(&mut capture, 320, 180, 80, (256, 144))?;
                 assert_eq!(
                     (resized.width, resized.height, resized.native_size),
                     (320, 180, (320, 180))
@@ -928,13 +972,15 @@ mod tests {
                     (still.root_x, still.root_y),
                     (pointer.root_x, pointer.root_y)
                 );
-                assert_eq!(
-                    observer
-                        .get_image(ImageFormat::Z_PIXMAP, root, 0, 0, 32, 32, u32::MAX)?
-                        .reply()?
-                        .data,
-                    background
-                );
+                if let Some(background) = &background {
+                    assert_eq!(
+                        observer
+                            .get_image(ImageFormat::Z_PIXMAP, root, 0, 0, 32, 32, u32::MAX)?
+                            .reply()?
+                            .data,
+                        *background
+                    );
+                }
                 host.conn.free_gc(gc)?.check()?;
                 let id = host.id;
                 drop(capture);
@@ -942,6 +988,11 @@ mod tests {
                     observer.get_window_attributes(id)?.reply()?.map_state,
                     MapState::VIEWABLE
                 );
+                if simulated_compositor {
+                    observer
+                        .composite_unredirect_window(id, Redirect::MANUAL)?
+                        .check()?;
+                }
                 drop(host);
                 // Destruction is flushed on the owner's connection; the observer
                 // may briefly run first on the server's other client queue.
@@ -954,11 +1005,6 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 assert!(observer.get_geometry(child)?.reply().is_err());
-            }
-            if compositor {
-                observer
-                    .composite_unredirect_subwindows(root, Redirect::MANUAL)?
-                    .check()?;
             }
         }
         Ok(())
