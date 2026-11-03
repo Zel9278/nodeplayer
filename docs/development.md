@@ -66,13 +66,23 @@ An optional `audio_file` names a local GUI-test input, resolved relative to the 
 It plays through the ordinary player and diagnostic plugin graph; output remains null
 unless the scenario explicitly selects device audio. Offline fixtures cannot use it.
 The `engine-progress` and `screenshot` events include `editor_frame_stats` with the
-delivered frame count, elapsed seconds, and average delivery rate for the current
-editor open. Diagnostic capture also counts `changed_frames` by comparing image hashes,
+delivered frame count, age of the newest delivered frame, elapsed seconds, and average
+delivery rate for the current editor open. These count texture staging, not compositor
+presentation. Diagnostic capture also counts `changed_frames` by comparing image hashes,
 including the initial image. Delivery includes identical images; use the change count
 to check that a stationary-cursor animation actually produces new pixels.
 For steady delivery measurements, use the periodic progress events before a screenshot,
 since PNG encoding pauses the diagnostic UI. The ignored `frame_transfer_timings` test
 reports shared-memory publish/read costs separately from capture and rendering.
+
+Captured `open-editor` steps wait for the first delivered image. A worker fault, capture
+error, missing startup frame, or stale delivery fails the run even if its later steps
+finish. The scenario's optional `health` object sets `capture_startup_timeout_ms`
+(default 5000) and `capture_max_frame_age_ms` (default 2000), each between 1 and 60000.
+Intentional fixture `fault` steps require the fault to occur and an explicit successful
+`restart-host` before passing. Set the fault step's `recover` to `false` only for a
+fixture that deliberately ends with its worker faulted. `summary.json` records the
+health evidence and the requested outcome separately from the authoritative result.
 
 ## Releases
 

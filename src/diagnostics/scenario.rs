@@ -66,6 +66,9 @@ pub enum Step {
     /// Fixture-only fault request; actual support must be negotiated with the fixture/worker.
     Fault {
         kind: String,
+        /// Faults require a successful explicit restart unless this fixture ends faulted.
+        #[serde(default = "yes")]
+        recover: bool,
     },
     Finish,
 }
@@ -111,6 +114,29 @@ fn amplitude() -> f32 {
     0.01
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthPolicy {
+    #[serde(default = "capture_startup_timeout")]
+    pub capture_startup_timeout_ms: u64,
+    #[serde(default = "capture_max_frame_age")]
+    pub capture_max_frame_age_ms: u64,
+}
+fn capture_startup_timeout() -> u64 {
+    5000
+}
+fn capture_max_frame_age() -> u64 {
+    2000
+}
+impl Default for HealthPolicy {
+    fn default() -> Self {
+        Self {
+            capture_startup_timeout_ms: capture_startup_timeout(),
+            capture_max_frame_age_ms: capture_max_frame_age(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scenario {
@@ -130,6 +156,8 @@ pub struct Scenario {
     pub steps: Vec<Step>,
     #[serde(default)]
     pub expected_events: Vec<String>,
+    #[serde(default)]
+    pub health: HealthPolicy,
     #[serde(default)]
     pub offline: Option<OfflineFixture>,
 }
@@ -177,6 +205,11 @@ impl Scenario {
         if self.steps.len() > 1024 || self.expected_events.len() > 128 {
             bail!("too many scenario steps/events");
         }
+        if !(1..=60_000).contains(&self.health.capture_startup_timeout_ms)
+            || !(1..=60_000).contains(&self.health.capture_max_frame_age_ms)
+        {
+            bail!("capture health deadlines must be between 1 and 60000 ms");
+        }
         for event in &self.expected_events {
             validate_event_name(event)?;
         }
@@ -213,7 +246,7 @@ impl Scenario {
                 Step::AssertStatus { contains } if contains.is_empty() || contains.len() > 256 => {
                     bail!("invalid status assertion")
                 }
-                Step::Fault { kind }
+                Step::Fault { kind, .. }
                     if !matches!(
                         kind.as_str(),
                         "crash" | "dsp-hang" | "gui-hang" | "state-hang" | "drop-hang" | "late"
@@ -308,6 +341,33 @@ mod tests {
         )
         .unwrap();
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn health_deadlines_are_bounded_and_fixture_recovery_is_explicit() {
+        let mut scenario: Scenario = serde_json::from_str(
+            r#"{"version":1,"name":"health","steps":[{"action":"fault","kind":"crash"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(scenario.health.capture_startup_timeout_ms, 5000);
+        assert_eq!(scenario.health.capture_max_frame_age_ms, 2000);
+        assert!(matches!(
+            scenario.steps[0],
+            Step::Fault { recover: true, .. }
+        ));
+        scenario.health.capture_startup_timeout_ms = 0;
+        assert!(scenario.validate().is_err());
+        scenario.health.capture_startup_timeout_ms = 5000;
+        scenario.health.capture_max_frame_age_ms = 60_001;
+        assert!(scenario.validate().is_err());
+        let terminal: Scenario = serde_json::from_str(
+            r#"{"version":1,"name":"terminal","steps":[{"action":"fault","kind":"crash","recover":false}]}"#,
+        ).unwrap();
+        assert!(terminal.validate().is_ok());
+        assert!(matches!(
+            terminal.steps[0],
+            Step::Fault { recover: false, .. }
+        ));
     }
 
     #[test]
