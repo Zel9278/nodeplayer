@@ -11,6 +11,7 @@ use crate::plugins::{Editor, Spot};
 pub struct EditorView {
     texture: Option<egui::TextureHandle>,
     native_size: Option<(u32, u32)>,
+    native_units_per_point: Option<f32>,
     screen: Option<Rect>,
     buttons: u8,
     modifiers: egui::Modifiers,
@@ -181,13 +182,16 @@ impl EditorView {
         &mut self,
         ui: &mut egui::Ui,
         editor: &mut dyn Editor,
-        native_units_per_point: f32,
+        display_scale: f32,
     ) -> Rect {
+        editor.set_display_scale(display_scale);
         if let Some(frame) = editor.take_frame().filter(|frame| frame.validate().is_ok()) {
             self.update_texture(ui.ctx(), frame);
         }
         let size = self.native_size.unwrap_or_else(|| editor.size());
-        let units = native_units_per_point.max(f32::EPSILON);
+        // Density belongs to the delivered image. A pending monitor-DPI request must
+        // not resize an older texture while the replacement image is still in flight.
+        let units = self.native_units_per_point.unwrap_or_else(|| editor.native_units_per_point());
         let desired = egui::vec2(size.0 as f32 / units, size.1 as f32 / units);
         let rect = if let Some(texture) = &self.texture {
             ui.add(
@@ -244,6 +248,7 @@ impl EditorView {
             let _ = run.event("editor-frame", serde_json::json!({"native_size":frame.native_size,"capture_size":[frame.width,frame.height]}));
         }
         self.native_size = Some(frame.native_size);
+        self.native_units_per_point = Some(frame.native_units_per_point);
         self.popups.truncate(frame.popups.len());
         if frame.popups.is_empty() {
             self.cancel_popup = false;
@@ -647,6 +652,51 @@ mod tests {
     use egui::Vec2;
 
     #[test]
+    fn display_density_changes_wait_for_matching_pixels_and_preserve_logical_size() {
+        struct DensityEditor {
+            frame: Option<EditorFrame>,
+            density: f32,
+        }
+        impl Editor for DensityEditor {
+            fn placement(&self) -> crate::plugins::Placement {
+                crate::plugins::Placement::Embedded(1)
+            }
+            fn size(&self) -> (u32, u32) {
+                ((320.0 * self.density) as u32, (180.0 * self.density) as u32)
+            }
+            fn set_display_scale(&mut self, factor: f32) { self.density = factor; }
+            fn native_units_per_point(&self) -> f32 { self.density }
+            fn take_frame(&mut self) -> Option<EditorFrame> { self.frame.take() }
+            fn place(&mut self, _: Option<&Spot>) {}
+            fn idle(&mut self) -> bool { true }
+        }
+        let image = |width, height, density| EditorFrame {
+            width,
+            height,
+            native_size: (width, height),
+            native_units_per_point: density,
+            rgba: vec![255; width as usize * height as usize * 4],
+            popups: Vec::new(),
+        };
+        let context = egui::Context::default();
+        let mut editor = DensityEditor { frame: Some(image(320, 180, 1.0)), density: 1.0 };
+        let mut view = EditorView::default();
+        for frame in 0..4 {
+            if frame == 2 { editor.frame = Some(image(640, 360, 2.0)); }
+            if frame == 3 { editor.frame = Some(image(800, 400, 2.0)); }
+            let mut size = Vec2::ZERO;
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                size = view.paint(ui, &mut editor, if frame == 0 { 1.0 } else { 2.0 }).size();
+            });
+            output.textures_delta.clear();
+            let expected = if frame == 3 { egui::vec2(400.0, 200.0) } else { egui::vec2(320.0, 180.0) };
+            assert!((size - expected).length() < 0.01, "density transition resized an older image on frame {frame}");
+        }
+        drop(view);
+        context.tex_manager().write().take_delta().clear();
+    }
+
+    #[test]
     fn click_sequences_count_double_and_triple_clicks_on_press() {
         let limits = ClickLimits {
             interval: 0.5,
@@ -731,6 +781,7 @@ mod tests {
             width: 2,
             height: 1,
             native_size: (400, 200),
+            native_units_per_point: 1.0,
             rgba: vec![255; 8],
             popups: Vec::new(),
         });
@@ -786,6 +837,7 @@ mod tests {
                 width: 2,
                 height: 1,
                 native_size: (640, 360),
+                native_units_per_point: 1.0,
                 rgba: vec![255; 8],
                 popups: Vec::new(),
             },
@@ -868,6 +920,7 @@ mod tests {
                 width: 2,
                 height: 1,
                 native_size: (640, 360),
+                native_units_per_point: 1.0,
                 rgba: vec![255; 8],
             },
         );
@@ -952,6 +1005,7 @@ mod tests {
                 width: 2,
                 height: 1,
                 native_size: (640, 360),
+                native_units_per_point: 1.0,
                 rgba: vec![255; 8],
                 popups: vec![EditorPopup {
                     origin: [600.0, -40.0],
@@ -1037,6 +1091,7 @@ mod tests {
                     width: 2,
                     height: 1,
                     native_size: (640, 360),
+                    native_units_per_point: 1.0,
                     rgba: vec![255; 8],
                     popups: vec![EditorPopup {
                         origin: [1000.0, 400.0],
@@ -1133,6 +1188,7 @@ mod tests {
             width: 2,
             height: 1,
             native_size: (640, 360),
+            native_units_per_point: 1.0,
             rgba: vec![255; 8],
             popups: if open {
                 vec![EditorPopup {
@@ -1222,6 +1278,7 @@ mod tests {
                 width: 2,
                 height: 1,
                 native_size: (640, 360),
+                native_units_per_point: 1.0,
                 rgba: vec![255; 8],
                 popups: vec![EditorPopup {
                     origin: [20.0, 20.0],

@@ -145,18 +145,15 @@ are required before considering this backend production-ready.
 
 ## Editors and supported displays
 
-Parent RemoteEditor performs **no native window operations**. Without
-`--experimental-editor-capture`, it queues Open, Place(Spot), Zoom and Close; the
-child embeds its editor in a parent HWND/XID or owns a top-level window.
-Cross-process HWND embedding can still induce OS-level synchronous interactions in
-the parent toolkit; this native mode does not prove GUI-hang isolation.
-
-With capture enabled, an embedded editor request instead creates the source in a
-private native host in the worker, without a second desktop window.
+Parent RemoteEditor performs **no native window operations**. Every embedded editor
+request creates its source in a private native host in the worker, without a second
+desktop window. Popped-out editors use native top-level windows.
 AppKit/Win32 printing/XComposite capture and native pointer delivery stay on the worker
 main thread. The parent paints the image in the ordinary
 graph layer, checks coverage after all nodes/layers are known, and inverse-maps input.
-Graph movement and zoom do not move, mask, resize, or rescale the native source.
+Graph movement and zoom transform the latest image on every parent frame, including
+frames without a new capture. They do not move, mask, resize, or rescale the native source.
+The editor API and worker protocol carry no graph-scale requests.
 Pop-out editors retain ordinary native behavior.
 Windows layered popup windows require compositor bitmap capture, which this Win32
 printing backend does not provide. They produce an explicit capture error directing

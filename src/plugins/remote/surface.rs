@@ -17,8 +17,8 @@ use std::{
 use crate::plugins::surface::{EditorFrame, EditorPopup, MAX_DIMENSION, MAX_PIXELS, MAX_POPUPS};
 
 const MAGIC: u64 = 0x4e50_5355_5246_3031;
-// Version 3 includes bounded child-popup metadata and images in the same frame lease.
-const VERSION: u32 = 3;
+// Version 4 publishes display density with the pixels and child-popup geometry.
+const VERSION: u32 = 4;
 const RGBA8: u32 = 1;
 const MAX_BYTES: usize = MAX_PIXELS * 4;
 const FREE: u32 = 0;
@@ -42,6 +42,7 @@ struct Header {
     height: AtomicU32,
     native_width: AtomicU32,
     native_height: AtomicU32,
+    native_units_per_point_bits: AtomicU32,
     byte_len: AtomicU64,
     popup_count: AtomicU32,
     popups: [PopupHeader; MAX_POPUPS],
@@ -142,6 +143,7 @@ struct FrameHeader {
     height: u32,
     native_width: u32,
     native_height: u32,
+    native_units_per_point_bits: u32,
     byte_len: u64,
     popups: Vec<PopupMetadata>,
 }
@@ -180,6 +182,7 @@ impl FrameHeader {
             height: header.height.load(Ordering::Relaxed),
             native_width: header.native_width.load(Ordering::Relaxed),
             native_height: header.native_height.load(Ordering::Relaxed),
+            native_units_per_point_bits: header.native_units_per_point_bits.load(Ordering::Relaxed),
             byte_len: header.byte_len.load(Ordering::Relaxed),
             popups: header.popups[..popup_count]
                 .iter()
@@ -198,6 +201,8 @@ impl FrameHeader {
 
     fn validated_len(&self) -> Result<usize> {
         ensure!(self.sequence != 0, "invalid editor frame sequence");
+        ensure!(crate::plugins::surface::valid_display_scale(f32::from_bits(self.native_units_per_point_bits)),
+            "invalid shared editor display density");
         let mut length = image_len(
             self.width,
             self.height,
@@ -260,6 +265,7 @@ impl FrameMap {
             height: AtomicU32::new(0),
             native_width: AtomicU32::new(0),
             native_height: AtomicU32::new(0),
+            native_units_per_point_bits: AtomicU32::new(1.0f32.to_bits()),
             byte_len: AtomicU64::new(0),
             popup_count: AtomicU32::new(0),
             popups: std::array::from_fn(|_| PopupHeader::default()),
@@ -360,6 +366,7 @@ impl FrameMap {
         h.native_width.store(frame.native_size.0, Ordering::Relaxed);
         h.native_height
             .store(frame.native_size.1, Ordering::Relaxed);
+        h.native_units_per_point_bits.store(frame.native_units_per_point.to_bits(), Ordering::Relaxed);
         // Keep the common no-popup path allocation-free. Popup images share the same
         // publication lease so geometry and pixels can never come from different frames.
         let payload = if frame.popups.is_empty() {
@@ -489,6 +496,7 @@ impl FrameMap {
             width: metadata.width,
             height: metadata.height,
             native_size: (metadata.native_width, metadata.native_height),
+            native_units_per_point: f32::from_bits(metadata.native_units_per_point_bits),
             rgba,
         };
         frame.validate()?;
@@ -581,6 +589,7 @@ mod tests {
             width: 32,
             height: 16,
             native_size: (16, 8),
+            native_units_per_point: 1.0,
             rgba: vec![value; 32 * 16 * 4],
         }
     }
@@ -593,6 +602,7 @@ mod tests {
                 width,
                 height,
                 native_size: (width, height),
+                native_units_per_point: 1.0,
                 rgba: (0..width as usize * height as usize * 4)
                     .map(|index| index.wrapping_mul(37) as u8)
                     .collect(),
@@ -646,6 +656,25 @@ mod tests {
     }
 
     #[test]
+    fn frame_density_roundtrips_with_its_pixels_and_rejects_invalid_values() -> Result<()> {
+        let map = FrameMap::create(101, 27)?;
+        let peer = FrameMap::open(&map.descriptor())?;
+        let mut image = frame(19);
+        for density in [1.0, 1.25, 1.5, 2.0] {
+            image.native_units_per_point = density;
+            assert!(peer.publish(&image)?);
+            let received = map.take_latest()?.unwrap();
+            assert_eq!(received.native_units_per_point, density);
+            assert_eq!(received.rgba, image.rgba);
+        }
+        for density in [f32::NAN, f32::INFINITY, 0.0, -1.0, 100.0] {
+            image.native_units_per_point = density;
+            assert!(peer.publish(&image).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn malformed_popup_metadata_is_rejected_and_releases_the_frame() -> Result<()> {
         let map = FrameMap::create(101, 27)?;
         let mut image = frame(19);
@@ -692,6 +721,7 @@ mod tests {
                 width,
                 height,
                 native_size: (width, height),
+                native_units_per_point: 1.0,
                 rgba: vec![123; width as usize * height as usize * 4],
             };
             let mut publish = Duration::ZERO;

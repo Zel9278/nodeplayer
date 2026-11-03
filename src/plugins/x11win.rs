@@ -33,9 +33,6 @@ pub struct HostWindow {
     pub container: Option<u32>,
     pub placement: Placement,
     size: Cell<(u32, u32)>,
-    /// Content scale the plugin currently draws at, and its size at scale 1.
-    pub scale: Cell<f32>,
-    pub base: Cell<(f32, f32)>,
     wm_delete: u32,
     /// Where the embedded editor was last put; None = hidden.
     shown: RefCell<Option<Spot>>,
@@ -135,8 +132,6 @@ impl HostWindow {
             container,
             placement,
             size: Cell::new((w as u32, h as u32)),
-            scale: Cell::new(1.0),
-            base: Cell::new((w as f32, h as f32)),
             wm_delete,
             shown: RefCell::new(None),
             announce,

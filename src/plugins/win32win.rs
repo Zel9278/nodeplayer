@@ -31,6 +31,28 @@ const CLASS: PCWSTR = w!("nodeplayer-plugin-editor");
 // The Win32 bindings group this core mouse message under the optional Controls API.
 const WM_MOUSELEAVE: u32 = 0x02a3;
 
+/// Match winit's DPI policy in a standalone worker before a plugin creates any HWNDs.
+/// Worker processes bypass the main application's winit initialization.
+pub(crate) fn initialize_worker_dpi() -> Result<()> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetProcessDpiAwarenessContext(context: isize) -> windows::Win32::Foundation::BOOL;
+        fn GetThreadDpiAwarenessContext() -> isize;
+        fn GetAwarenessFromDpiAwarenessContext(context: isize) -> i32;
+    }
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2. This must precede native editor
+    // creation so the worker receives physical client sizes instead of DPI virtualization.
+    if unsafe { SetProcessDpiAwarenessContext(-4) }.as_bool() {
+        return Ok(());
+    }
+    // An executable manifest or an earlier initialization may already establish it.
+    ensure!(
+        unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) } == 2,
+        "plugin worker could not enable per-monitor DPI awareness"
+    );
+    Ok(())
+}
+
 type SubclassProc =
     Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT>;
 
@@ -546,9 +568,6 @@ pub struct HostWindow {
     /// Clipping parent of `id` when embedded.
     container: Option<HWND>,
     pub placement: Placement,
-    /// Content scale the plugin currently draws at, and its size at scale 1.
-    pub scale: Cell<f32>,
-    pub base: Cell<(f32, f32)>,
     /// Where the embedded editor was last put; None = hidden.
     shown: RefCell<Option<Spot>>,
     state: Box<State>,
@@ -725,8 +744,6 @@ impl HostWindow {
             id,
             container,
             placement,
-            scale: Cell::new(1.0),
-            base: Cell::new((w as f32, h as f32)),
             shown: RefCell::new(None),
             state,
         };

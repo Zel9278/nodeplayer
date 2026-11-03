@@ -348,6 +348,7 @@ impl NativeCapture {
             width: size.0,
             height: size.1,
             native_size: size,
+            native_units_per_point: 1.0,
             rgba,
         })
     }

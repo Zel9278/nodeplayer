@@ -153,6 +153,7 @@ impl NativeCapture {
                 width,
                 height,
                 native_size: (width, height),
+                native_units_per_point: 1.0,
                 rgba,
             };
             let mut previous = std::mem::take(&mut self.popups);

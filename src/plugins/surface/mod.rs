@@ -39,6 +39,8 @@ pub struct EditorFrame {
     pub height: u32,
     /// Native input units, independent of captured pixels (points on Cocoa).
     pub native_size: (u32, u32),
+    /// Native input units per logical editor point, published with these pixels.
+    pub native_units_per_point: f32,
     /// Top-left origin, tightly packed, straight-alpha RGBA8.
     pub rgba: Vec<u8>,
     /// Child windows, ordered from back to front, in native editor coordinates.
@@ -79,6 +81,7 @@ fn validate_image(width: u32, height: u32, native_size: (u32, u32), bytes: usize
 
 impl EditorFrame {
     pub fn validate(&self) -> Result<()> {
+        ensure!(valid_display_scale(self.native_units_per_point), "invalid editor display density");
         let mut pixels =
             validate_image(self.width, self.height, self.native_size, self.rgba.len())?;
         ensure!(self.popups.len() <= MAX_POPUPS, "too many editor popups");
@@ -105,6 +108,10 @@ impl EditorFrame {
         );
         Ok(())
     }
+}
+
+pub(crate) fn valid_display_scale(factor: f32) -> bool {
+    factor.is_finite() && (0.25..=8.0).contains(&factor)
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -260,6 +267,12 @@ impl Editor for CapturedEditor {
     fn size(&self) -> (u32, u32) {
         self.source.size()
     }
+    fn set_display_scale(&mut self, factor: f32) {
+        self.source.set_display_scale(factor);
+    }
+    fn native_units_per_point(&self) -> f32 {
+        self.source.native_units_per_point()
+    }
     fn ready(&self) -> bool {
         self.source.ready()
     }
@@ -289,7 +302,8 @@ impl Editor for CapturedEditor {
         let now = Instant::now();
         if now >= self.next_capture {
             self.next_capture = next_capture_deadline(self.next_capture, now);
-            let captured = self.native.capture(self.source.size()).and_then(|frame| {
+            let captured = self.native.capture(self.source.size()).and_then(|mut frame| {
+                frame.native_units_per_point = self.source.native_units_per_point();
                 frame.validate()?;
                 Ok(frame)
             });
@@ -408,6 +422,7 @@ mod tests {
             width: 2,
             height: 1,
             native_size: (1, 1),
+            native_units_per_point: 1.0,
             rgba: vec![255; 8],
         };
         assert!(frame.validate().is_ok());
