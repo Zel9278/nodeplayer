@@ -315,6 +315,10 @@ pub trait Editor {
     fn capture_error(&self) -> Option<&str> {
         None
     }
+    /// First capture failure for this editor open, retained after visible recovery.
+    fn first_capture_error(&self) -> Option<&str> {
+        self.capture_error()
+    }
     /// Asks the editor to draw at `factor` (graph zoom × display scale), if it can.
     fn set_zoom(&mut self, _factor: f32) {}
     /// Shows an embedded editor at `spot`, or hides it; see [`window::HostWindow::place`].

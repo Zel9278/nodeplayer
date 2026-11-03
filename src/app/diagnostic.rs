@@ -197,7 +197,7 @@ impl App {
                 run.observe_editor_capture(
                     stats.map_or(0, |stats| stats.frames),
                     stats.map(|stats| stats.frame_age_seconds),
-                    editor.capture_error(),
+                    editor.first_capture_error(),
                 )?;
             }
             if !diagnostic.editor_reported && plugin.editor.as_ref().is_some_and(|e| e.ready()) {

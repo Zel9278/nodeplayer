@@ -465,7 +465,11 @@ unsafe extern "system" fn capture_create_proc(
         });
         if let Some(input) = input {
             let hwnd = HWND(value.0 as *mut _);
-            if input.hook(hwnd).is_ok() {
+            // Every capture source installs this thread-wide callback. Later hook
+            // invocations see the already parked creation structure; retain the first
+            // logical origin recorded for this HWND.
+            let first_attachment = !input.hooks.borrow().contains(&hwnd);
+            if first_attachment && input.hook(hwnd).is_ok() {
                 input.remember_popup(
                     hwnd,
                     POINT {

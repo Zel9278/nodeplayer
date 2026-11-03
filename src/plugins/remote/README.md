@@ -123,15 +123,6 @@ here the parent supervisor kills/reaps it. Before plugin-requested restart, a di
 silent Q-frame quantum drains queued parameter writes. State load skips that drain.
 Checkpoints save the live instance on the worker's main thread without restarting DSP.
 
-Local plugin restarts also retain the engine slot and processor wrapper while replacing
-only its suspended inner processor. The delayed dry path keeps 131072 frames of real
-input history, or the initial requested delay if larger, within a shared 128 MiB budget
-for live, queued and retired plugin bypass storage. A latency increase beyond the retained
-history needs new input to fill that additional span. Graph delay-plan changes transfer
-prepared history pages on the audio thread and retire unused storage on the control thread.
-Engine shutdown waits for an explicit audio-thread completion before plugin state save
-and teardown; a bounded shutdown timeout retains in-process plugin owners until exit.
-
 Parent parameter/editor operations use caches and bounded enqueue. Queue-full
 `load_state` returns an error; parameter/native-placement writes may be dropped and
 retried by normal UI updates. Captured button transitions have a separate bounded
@@ -207,6 +198,9 @@ visible. CPU readback/upload, plugin rendering, viewport scheduling and the disp
 each limit the measured rate; capture publication and parent delivery do not establish
 compositor presentation FPS. A blank startup that produces no usable image within five
 seconds exposes a capture error.
+Each editor open retains its first capture failure, bounded to 1024 characters, separately
+from the recoverable UI message. Worker metadata carries this history so diagnostic health
+cannot miss a failure that recovers between polls. Reopening starts fresh capture history.
 
 Windows pumps bounded native message batches and initializes COM. macOS requires
 captured mode for isolation, initializes AppKit in the worker, and pumps events even

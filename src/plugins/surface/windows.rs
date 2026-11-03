@@ -1124,6 +1124,8 @@ mod tests {
     fn captures_owned_popup_without_exposing_it_on_the_desktop() -> Result<()> {
         let root = fixture(None, (-1400, -1000), (400, 300), [23, 28, 38])?;
         let mut capture = NativeCapture::new(root.hwnd.0 as usize)?;
+        let second = fixture(None, (-2400, -1800), (400, 300), [30, 40, 50])?;
+        let _second_capture = NativeCapture::new(second.hwnd.0 as usize)?;
         let mut state = Box::new(State {
             color: [180, 90, 30],
             timer_ticks: Cell::new(0),

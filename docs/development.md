@@ -85,7 +85,9 @@ reports shared-memory publish/read costs separately from capture and rendering.
 
 Captured `open-editor` steps wait for the first delivered image. A worker fault, capture
 error, missing startup frame, or stale delivery fails the run even if its later steps
-finish. The scenario's optional `health` object sets `capture_startup_timeout_ms`
+finish. Capture errors remain diagnostic evidence for the current editor open after frame
+delivery recovers, even when the visible error clears. The scenario's optional `health`
+object sets `capture_startup_timeout_ms`
 (default 5000) and `capture_max_frame_age_ms` (default 2000), each between 1 and 60000.
 Intentional fixture `fault` steps require the fault to occur and an explicit successful
 `restart-host` before passing. Set the fault step's `recover` to `false` only for a
