@@ -301,7 +301,9 @@ pub struct App {
     selected: Vec<NodeId>,
     /// The zoom button was clicked: back to 100% on the next frame.
     reset_zoom: bool,
-    /// The graph's zoom last frame.
+    /// A background double-click fitted the graph; cap that fit at 100% next frame.
+    fit_zoom: bool,
+    /// Last rendered graph zoom, also recorded in diagnostic screenshots.
     zoom: f32,
     /// Preset (or "" for resetting the graph) waiting for a second click to confirm.
     confirm: Option<(String, bool)>,
@@ -406,6 +408,7 @@ impl App {
             naming: None,
             selected: Vec::new(),
             reset_zoom: false,
+            fit_zoom: false,
             zoom: 1.0,
             confirm: None,
             restored_track: None,
@@ -2114,9 +2117,8 @@ impl App {
             selected: self.selected.len(),
             view: ui.max_rect(),
             zoom: 1.0,
-            last_zoom: self.zoom,
-            zooming: ui.input(|i| (i.zoom_delta() - 1.0).abs() > 1e-4),
             reset_zoom: std::mem::take(&mut self.reset_zoom),
+            fit_zoom: std::mem::take(&mut self.fit_zoom),
             diagnostic_zoom: self.diagnostic.as_ref().and_then(|d| d.editor_zoom),
             diagnostic_target: self.diagnostic.as_ref().and_then(|d| d.node),
             node_presets: &self.node_presets,
@@ -2130,7 +2132,8 @@ impl App {
         if !std::mem::replace(&mut self.graph_shown, true) {
             style.max_scale = Some(1.0);
         }
-        SnarlWidget::new().id_salt(salt).style(style).show(&mut self.snarl, &mut viewer, ui);
+        let response = SnarlWidget::new().id_salt(salt).style(style).show(&mut self.snarl, &mut viewer, ui);
+        self.fit_zoom = response.double_clicked();
         self.selected = SnarlWidget::new().id_salt(salt).get_selected_nodes(ui);
         // Zoom readout; clicking it goes back to 100% (where text is sharp).
         let zoom = viewer.zoom;
@@ -2949,14 +2952,11 @@ struct Viewer<'a> {
     wants_scroll: bool,
     /// How many nodes are selected.
     selected: usize,
-    /// The graph's screen area, the zoom shown this frame, whether the user is zooming now,
-    /// and a request to go back to 100%.
+    /// The graph's screen area, zoom shown this frame, and explicit view reset requests.
     view: egui::Rect,
     zoom: f32,
-    /// The zoom of the previous frame.
-    last_zoom: f32,
-    zooming: bool,
     reset_zoom: bool,
+    fit_zoom: bool,
     diagnostic_zoom: Option<f32>,
     diagnostic_target: Option<NodeId>,
     node_presets: &'a [String],
@@ -2990,9 +2990,8 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         node.kind.title()
     }
 
-    /// The graph is drawn as a scaled picture, so text is only sharp at exactly 100% and on
-    /// whole pixels: zoom snaps to 100% when it ends up near it (or when asked), and panning
-    /// stays on the pixel grid.
+    /// Preserve the scene's continuous, pointer-anchored gesture transform. Pixel alignment
+    /// belongs to an explicit 100% reset, rather than every intermediate zoom/pan frame.
     fn current_transform(&mut self, to_global: &mut egui::emath::TSTransform, snarl: &mut Snarl<GraphNode>) {
         if let Some(zoom) = self.diagnostic_zoom {
             to_global.scaling = zoom;
@@ -3002,18 +3001,18 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
             self.zoom = zoom;
             return;
         }
-        let near = (to_global.scaling - 1.0).abs() < 0.08;
         // Fitting the graph into view (double-click) doesn't zoom in past 100%.
-        let fitted_in = !self.zooming && to_global.scaling > 1.0 && (to_global.scaling - self.last_zoom).abs() > 1e-4;
-        if self.reset_zoom || fitted_in || (near && !self.zooming && to_global.scaling != 1.0) {
+        if self.reset_zoom || (self.fit_zoom && to_global.scaling > 1.0) {
             // Keep the point at the middle of the view where it is.
             let c = self.view.center().to_vec2();
             let local = (c - to_global.translation) / to_global.scaling;
             to_global.scaling = 1.0;
             to_global.translation = c - local;
         }
-        let ppp = self.ppp;
-        to_global.translation = (to_global.translation * ppp).round() / ppp;
+        if (self.reset_zoom || self.fit_zoom) && to_global.scaling == 1.0 {
+            let ppp = self.ppp;
+            to_global.translation = (to_global.translation * ppp).round() / ppp;
+        }
         self.zoom = to_global.scaling;
     }
 
@@ -3579,4 +3578,175 @@ fn native_window_id(frame: &eframe::Frame) -> Option<crate::plugins::WindowId> {
 fn fmt_time(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
     format!("{}:{:02}", s / 60, s % 60)
+}
+
+#[cfg(test)]
+mod graph_zoom_tests {
+    use super::*;
+
+    const POINTER: Pos2 = egui::pos2(173.25, 149.75);
+
+    fn gesture_frames(
+        initial: f32,
+        ppp: f32,
+        gesture: impl Fn(usize) -> Vec<egui::Event>,
+    ) -> Vec<egui::emath::TSTransform> {
+        let context = egui::Context::default();
+        let player = Player::new(48_000);
+        let mut graph = Snarl::new();
+        let mut zoom = initial;
+        let mut samples = Vec::new();
+        let id = egui::Id::new("zoom-regression");
+        for frame in 0..60 {
+            let mut events = vec![egui::Event::PointerMoved(POINTER)];
+            events.extend(gesture(frame));
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                time: Some(frame as f64 / 120.0),
+                events,
+                ..Default::default()
+            };
+            input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(ppp);
+            let mut output = context.run_ui(input, |ui| {
+                let mut actions = Vec::new();
+                let mut viewer = Viewer {
+                    engine: None,
+                    player: &player,
+                    actions: &mut actions,
+                    plugins: &[],
+                    has_player: false,
+                    errors: Vec::new(),
+                    embed_parent: None,
+                    sample_rate: 48_000.0,
+                    ppp: context.pixels_per_point(),
+                    placements: HashMap::new(),
+                    node_rects: Vec::new(),
+                    scroll: egui::Vec2::ZERO,
+                    wants_scroll: false,
+                    selected: 0,
+                    view: ui.max_rect(),
+                    zoom,
+                    reset_zoom: false,
+                    fit_zoom: false,
+                    diagnostic_zoom: None,
+                    diagnostic_target: None,
+                    node_presets: &[],
+                    in_group: false,
+                    group_io: (false, false),
+                };
+                SnarlWidget::new().id(id).style(SnarlStyle {
+                    min_scale: Some(if frame == 0 { initial } else { 0.2 }),
+                    max_scale: Some(if frame == 0 { initial } else { 2.0 }),
+                    ..SnarlStyle::new()
+                }).show(&mut graph, &mut viewer, ui);
+                zoom = viewer.zoom;
+                let layer = egui::LayerId::new(ui.layer_id().order, id);
+                // egui omits identity transforms from the layer map.
+                let transform = context.layer_transform_to_global(layer).unwrap_or_default();
+                assert_eq!(transform.scaling, zoom);
+                samples.push(transform);
+            });
+            output.textures_delta.clear();
+        }
+        samples
+    }
+
+    fn wheel(unit: egui::MouseWheelUnit, delta: egui::Vec2, phase: egui::TouchPhase, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::MouseWheel { unit, delta, phase, modifiers }
+    }
+
+    #[test]
+    fn precision_zoom_above_one_does_not_reset_to_one() {
+        let samples = gesture_frames(1.75, 1.0, |frame| {
+            if frame == 4 { vec![egui::Event::Zoom(1.00009)] } else { Vec::new() }
+        });
+        assert!(samples.iter().all(|sample| sample.scaling >= 1.75));
+        assert!(samples.last().unwrap().scaling > 1.75);
+    }
+
+    #[test]
+    fn windows_wheel_zoom_settles_without_a_snap_to_one() {
+        let samples = gesture_frames(0.98, 1.0, |frame| {
+            if frame == 4 {
+                vec![wheel(egui::MouseWheelUnit::Line, egui::vec2(0.0, -0.1), egui::TouchPhase::Move, egui::Modifiers::CTRL)]
+            } else { Vec::new() }
+        });
+        assert!(samples.windows(2).all(|pair| pair[1].scaling <= pair[0].scaling + 1e-6));
+        assert!(samples.last().unwrap().scaling < 0.98);
+    }
+
+    #[test]
+    fn touchpad_pinch_reversal_preserves_the_pointer_anchor_at_each_dpi() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let samples = gesture_frames(1.25, ppp, |frame| {
+                match frame {
+                    4..=12 => vec![egui::Event::Zoom(1.01)],
+                    13..=21 => vec![egui::Event::Zoom(1.0 / 1.01)],
+                    _ => Vec::new(),
+                }
+            });
+            let anchor = samples[3].inverse() * POINTER;
+            for sample in &samples[4..] {
+                assert!((*sample * anchor).distance(POINTER) < 0.001, "pinch anchor drift at {ppp} pixels per point");
+            }
+            assert!((samples.last().unwrap().scaling - 1.25).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn touchpad_pan_accumulates_subpixel_motion_and_stops_on_end_or_cancel() {
+        for phase in [egui::TouchPhase::End, egui::TouchPhase::Cancel] {
+            for ppp in [1.0, 1.25, 1.5, 2.0] {
+                let delta = egui::vec2(0.125, -0.1875);
+                let samples = gesture_frames(1.0, ppp, |frame| {
+                    let (delta, phase) = match frame {
+                        4 => (egui::Vec2::ZERO, egui::TouchPhase::Start),
+                        5..=20 => (delta, egui::TouchPhase::Move),
+                        21 => (egui::Vec2::ZERO, phase),
+                        _ => return Vec::new(),
+                    };
+                    vec![wheel(egui::MouseWheelUnit::Point, delta, phase, egui::Modifiers::NONE)]
+                });
+                assert!(samples.iter().all(|sample| sample.scaling == 1.0));
+                let moved = samples.last().unwrap().translation - samples[3].translation;
+                assert!((moved - delta * 16.0).length() < 0.001, "lost touchpad motion at {ppp} pixels per point: {moved:?}");
+                assert!(samples[23..].iter().all(|sample| sample.translation == samples[23].translation));
+            }
+        }
+    }
+
+    #[test]
+    fn windows_precision_wheel_preserves_fractional_line_movements() {
+        let context = egui::Context::default();
+        let speed = context.options(|options| options.input_options.line_scroll_speed);
+        let delta = egui::vec2(-1.0 / 120.0, 1.0 / 120.0);
+        let samples = gesture_frames(1.0, 1.25, |frame| {
+            if (4..20).contains(&frame) {
+                vec![wheel(egui::MouseWheelUnit::Line, delta, egui::TouchPhase::Move, egui::Modifiers::NONE)]
+            } else { Vec::new() }
+        });
+        let moved = samples.last().unwrap().translation - samples[3].translation;
+        assert!((moved - delta * speed * 16.0).length() < 0.001, "lost Windows wheel motion: {moved:?}");
+        assert!(samples.iter().all(|sample| sample.scaling == 1.0));
+    }
+
+    #[test]
+    fn touchpad_pinch_ends_before_the_next_pan_gesture() {
+        let samples = gesture_frames(1.25, 1.0, |frame| {
+            let (phase, modifiers, delta) = match frame {
+                4 => (egui::TouchPhase::Start, egui::Modifiers::CTRL, egui::Vec2::ZERO),
+                5..=12 => (egui::TouchPhase::Move, egui::Modifiers::CTRL, egui::vec2(0.0, 0.5)),
+                13 => (egui::TouchPhase::End, egui::Modifiers::CTRL, egui::Vec2::ZERO),
+                14 => (egui::TouchPhase::Start, egui::Modifiers::NONE, egui::Vec2::ZERO),
+                15..=22 => (egui::TouchPhase::Move, egui::Modifiers::NONE, egui::vec2(0.0, 0.5)),
+                23 => (egui::TouchPhase::End, egui::Modifiers::NONE, egui::Vec2::ZERO),
+                _ => return Vec::new(),
+            };
+            vec![egui::Event::ModifiersChanged(modifiers), wheel(egui::MouseWheelUnit::Point, delta, phase, modifiers)]
+        });
+        assert!(samples[14].scaling > 1.25);
+        assert!(samples[14..].iter().all(|sample| sample.scaling == samples[14].scaling));
+        let moved = samples.last().unwrap().translation - samples[14].translation;
+        assert!((moved - egui::vec2(0.0, 4.0)).length() < 0.001);
+    }
 }
