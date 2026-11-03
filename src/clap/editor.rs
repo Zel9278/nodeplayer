@@ -109,8 +109,12 @@ impl ClapEditor {
             if let Some(adjust) = g.adjust_size {
                 adjust(self.plugin, &mut w, &mut h);
             }
-            if g.set_size.is_some_and(|f| f(self.plugin, w, h)) {
-                self.window.resize(w, h);
+            let previous = self.window.size();
+            // NSView children may autoresize when their parent changes. Size the parent
+            // first so the plugin's callback observes the final bounds and lays out once.
+            self.window.resize(w, h);
+            if !g.set_size.is_some_and(|f| f(self.plugin, w, h)) {
+                self.window.resize(previous.0, previous.1);
             }
         }
     }
