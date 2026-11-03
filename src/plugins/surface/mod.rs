@@ -182,7 +182,7 @@ pub fn capture(source: Box<dyn Editor>, placement: Placement) -> Result<Box<dyn 
         next_capture: Instant::now(),
         opened_at: Instant::now(),
         painted: false,
-        error: None,
+        errors: CaptureErrors::default(),
     }))
 }
 
@@ -195,7 +195,35 @@ struct CapturedEditor {
     next_capture: Instant,
     opened_at: Instant,
     painted: bool,
-    error: Option<String>,
+    errors: CaptureErrors,
+}
+
+/// Recoverable UI state plus bounded evidence retained for this editor open.
+#[derive(Default)]
+pub(crate) struct CaptureErrors {
+    current: Option<String>,
+    first: Option<String>,
+}
+
+impl CaptureErrors {
+    pub fn record(&mut self, message: String) {
+        self.observe_first(Some(&message));
+        self.current = Some(message);
+    }
+    pub fn observe_first(&mut self, message: Option<&str>) {
+        if self.first.is_none() {
+            self.first = message.map(|message| message.chars().take(1024).collect());
+        }
+    }
+    pub fn recovered(&mut self) {
+        self.current = None;
+    }
+    pub fn current(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
+    pub fn first(&self) -> Option<&str> {
+        self.first.as_deref()
+    }
 }
 
 impl Editor for CapturedEditor {
@@ -215,7 +243,10 @@ impl Editor for CapturedEditor {
         self.pending.take()
     }
     fn capture_error(&self) -> Option<&str> {
-        self.error.as_deref()
+        self.errors.current()
+    }
+    fn first_capture_error(&self) -> Option<&str> {
+        self.errors.first()
     }
     fn pointer(&mut self, event: EditorPointer) -> Result<()> {
         event.validate()?;
@@ -249,16 +280,19 @@ impl Editor for CapturedEditor {
                             .all(|p| p[0] == p[1])
                     {
                         if self.opened_at.elapsed() >= STARTUP_TIMEOUT {
-                            self.error = Some("Editor capture produced no image within 5 seconds; try Pop out".into());
+                            self.errors.record(
+                                "Editor capture produced no image within 5 seconds; try Pop out"
+                                    .into(),
+                            );
                         }
                         return true;
                     }
                     self.painted = true;
-                    self.error = None;
+                    self.errors.recovered();
                     self.pending = Some(frame);
                 }
                 Err(error) => {
-                    self.error = Some(format!("{error:#}"));
+                    self.errors.record(format!("{error:#}"));
                 }
             }
         }
@@ -289,6 +323,18 @@ pub fn pump_worker_app() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_error_history_is_bounded_and_preserves_the_first_failure() {
+        let mut errors = CaptureErrors::default();
+        errors.record("界".repeat(2048));
+        assert_eq!(errors.first().unwrap().chars().count(), 1024);
+        let first = errors.first().unwrap().to_owned();
+        errors.recovered();
+        errors.record("later failure".into());
+        assert_eq!(errors.current(), Some("later failure"));
+        assert_eq!(errors.first(), Some(first.as_str()));
+    }
 
     #[test]
     fn capture_cadence_survives_ui_polling_jitter_and_skips_stalls() {

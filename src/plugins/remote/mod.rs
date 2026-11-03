@@ -300,7 +300,7 @@ impl Instance for RemoteInstance {
             captured,
             pending_input: VecDeque::new(),
             input_failed: false,
-            error: None,
+            errors: crate::plugins::surface::CaptureErrors::default(),
             native_error: None,
             generation: None,
         }))
@@ -317,7 +317,7 @@ struct RemoteEditor {
     captured: bool,
     pending_input: VecDeque<(u64, EditorPointer)>,
     input_failed: bool,
-    error: Option<String>,
+    errors: crate::plugins::surface::CaptureErrors,
     native_error: Option<String>,
     generation: Option<u64>,
 }
@@ -387,8 +387,12 @@ impl RemoteEditor {
         Ok(())
     }
 
+    fn record_error(&mut self, message: String) {
+        self.errors.record(message);
+    }
+
     fn fail_input(&mut self, message: String) {
-        self.error = Some(message);
+        self.record_error(message);
         self.input_failed = true;
         self.pending_input.clear();
         // Closing the child-owned editor releases its native drag even if the ordinary
@@ -425,7 +429,7 @@ impl Editor for RemoteEditor {
             Ok(SurfaceAccess::Ready(surface)) => surface,
             Ok(SurfaceAccess::Busy | SurfaceAccess::Missing) => return None,
             Err(error) => {
-                self.error = Some(format!("{error:#}"));
+                self.record_error(format!("{error:#}"));
                 return None;
             }
         };
@@ -433,18 +437,21 @@ impl Editor for RemoteEditor {
         match surface.take_latest() {
             Ok(Some(frame)) => {
                 self.size = frame.native_size;
-                self.error = None;
+                self.errors.recovered();
                 Some(frame)
             }
             Ok(None) => None,
             Err(error) => {
-                self.error = Some(format!("isolated editor capture: {error:#}"));
+                self.record_error(format!("isolated editor capture: {error:#}"));
                 None
             }
         }
     }
     fn capture_error(&self) -> Option<&str> {
-        self.error.as_deref().or(self.native_error.as_deref())
+        self.errors.current().or(self.native_error.as_deref())
+    }
+    fn first_capture_error(&self) -> Option<&str> {
+        self.errors.first().or_else(|| self.capture_error())
     }
     fn pointer(&mut self, event: EditorPointer) -> Result<()> {
         event.validate()?;
@@ -527,6 +534,11 @@ impl Editor for RemoteEditor {
                 if m.editor_id == self.token {
                     self.size = m.editor_size;
                     self.native_error = m.editor_error.clone();
+                    self.errors.observe_first(
+                        m.editor_first_error
+                            .as_deref()
+                            .or(m.editor_error.as_deref()),
+                    );
                     if m.editor_open {
                         self.seen_open = true;
                     } else {
@@ -593,6 +605,7 @@ mod tests {
                     editor_open: true,
                     editor_id: 2,
                     editor_error: None,
+                    editor_first_error: None,
                 }),
                 state: None,
                 checkpoint_seq: 0,
@@ -612,7 +625,7 @@ mod tests {
                 captured: true,
                 pending_input: VecDeque::new(),
                 input_failed: false,
-                error: None,
+                errors: crate::plugins::surface::CaptureErrors::default(),
                 native_error: None,
                 generation: Some(7),
             },
@@ -641,6 +654,64 @@ mod tests {
         editor.set_zoom(1.5);
         editor.place(None);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn recovered_worker_capture_error_reaches_parent_without_stale_editor_evidence() {
+        let (mut editor, _rx) = captured_editor(4);
+        {
+            let mut snapshot = editor.core.snapshot.lock().unwrap();
+            let metadata = snapshot.metadata.as_mut().unwrap();
+            metadata.editor_first_error = Some("native readback recovered".into());
+        }
+        assert!(editor.idle());
+        assert!(editor.capture_error().is_none());
+        assert_eq!(
+            editor.first_capture_error(),
+            Some("native readback recovered")
+        );
+        {
+            let mut snapshot = editor.core.snapshot.lock().unwrap();
+            snapshot.metadata.as_mut().unwrap().editor_first_error = None;
+        }
+        assert!(editor.idle());
+        assert_eq!(
+            editor.first_capture_error(),
+            Some("native readback recovered")
+        );
+
+        let (mut fresh, _rx) = captured_editor(4);
+        {
+            let mut snapshot = fresh.core.snapshot.lock().unwrap();
+            let metadata = snapshot.metadata.as_mut().unwrap();
+            metadata.editor_id = fresh.token - 1;
+            metadata.editor_first_error = Some("retired editor failure".into());
+        }
+        fresh.seen_open = false;
+        assert!(fresh.idle());
+        assert!(fresh.first_capture_error().is_none());
+    }
+
+    #[test]
+    fn parent_readback_recovery_clears_ui_error_and_retains_first_failure() {
+        let (mut editor, _rx) = captured_editor(4);
+        editor.record_error("parent readback failed".into());
+        let surface = match editor.active_surface().unwrap() {
+            SurfaceAccess::Ready(surface) => surface,
+            _ => panic!("test surface missing"),
+        };
+        surface
+            .publish(&EditorFrame {
+                width: 2,
+                height: 1,
+                native_size: (2, 1),
+                rgba: vec![255; 8],
+                popups: Vec::new(),
+            })
+            .unwrap();
+        assert!(editor.take_frame().is_some());
+        assert!(editor.capture_error().is_none());
+        assert_eq!(editor.first_capture_error(), Some("parent readback failed"));
     }
 
     #[test]
@@ -802,6 +873,7 @@ mod tests {
             editor_open: true,
             editor_id: 1,
             editor_error: None,
+            editor_first_error: None,
         };
         let core = Arc::new(Core {
             stop: AtomicBool::new(false),
@@ -837,7 +909,7 @@ mod tests {
             captured: false,
             pending_input: VecDeque::new(),
             input_failed: false,
-            error: None,
+            errors: crate::plugins::surface::CaptureErrors::default(),
             native_error: None,
             generation: None,
         };

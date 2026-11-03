@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_STATE: usize = 1024 * 1024;
 pub const MAX_PARAMS: usize = 8192;
@@ -39,6 +39,7 @@ pub struct Metadata {
     pub editor_open: bool,
     pub editor_id: u64,
     pub editor_error: Option<String>,
+    pub editor_first_error: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Command {

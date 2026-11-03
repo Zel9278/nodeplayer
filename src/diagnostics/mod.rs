@@ -822,6 +822,18 @@ mod tests {
     }
 
     #[test]
+    fn recovered_editor_error_fails_health_on_its_first_observation() {
+        let mut errors = crate::plugins::surface::CaptureErrors::default();
+        errors.record("readback failed".into());
+        errors.recovered();
+        assert!(errors.current().is_none());
+        let mut health = Health::new(scenario::HealthPolicy::default());
+        health.observe_status("running", 0);
+        health.observe_capture(100, 4, Some(0.0), errors.first());
+        assert_eq!(health.finish_failure(100), Some("editor capture reported an error"));
+    }
+
+    #[test]
     fn fixture_fault_requires_observation_and_explicit_recovery() {
         let mut health = Health::new(scenario::HealthPolicy::default());
         health.observe_status("running", 0);

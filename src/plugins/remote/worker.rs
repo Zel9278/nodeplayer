@@ -444,6 +444,7 @@ fn metadata_changed(
         || e.as_ref().map(|e| e.size()).unwrap_or((640, 480)) != cached.editor_size
         || editor_id != cached.editor_id
         || e.as_ref().and_then(|e| e.capture_error()) != cached.editor_error.as_deref()
+        || e.as_ref().and_then(|e| e.first_capture_error()) != cached.editor_first_error.as_deref()
     {
         return true;
     }
@@ -480,6 +481,10 @@ fn metadata(i: &dyn Instance, e: &Option<Box<dyn Editor>>, editor_id: u64) -> Re
     if let Some(error) = editor_error.as_mut() {
         truncate(error, 4096);
     }
+    let editor_first_error = e
+        .as_ref()
+        .and_then(|e| e.first_capture_error())
+        .map(|error| error.chars().take(1024).collect());
     Ok(Metadata {
         params,
         values,
@@ -491,6 +496,7 @@ fn metadata(i: &dyn Instance, e: &Option<Box<dyn Editor>>, editor_id: u64) -> Re
         editor_open: e.is_some(),
         editor_id,
         editor_error,
+        editor_first_error,
     })
 }
 fn truncate(s: &mut String, max: usize) {
@@ -701,6 +707,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_reports_capture_failure_that_recovers_before_polling() {
+        use crate::plugins::surface::CaptureErrors;
+        use crate::plugins::{Format, ParamDesc, PluginInfo};
+        struct TestInstance(PluginInfo);
+        impl Instance for TestInstance {
+            fn info(&self) -> &PluginInfo {
+                &self.0
+            }
+            fn params(&self) -> &[ParamDesc] {
+                &[]
+            }
+            fn param_value(&self, _: u32) -> f64 {
+                0.0
+            }
+            fn param_display(&self, _: u32, _: f64) -> String {
+                String::new()
+            }
+            fn set_param(&mut self, _: u32, _: f64) {}
+            fn save_state(&self) -> Option<Vec<u8>> {
+                None
+            }
+            fn load_state(&mut self, _: &[u8]) -> Result<()> {
+                Ok(())
+            }
+        }
+        #[derive(Default)]
+        struct FlakyEditor {
+            errors: CaptureErrors,
+            ticks: usize,
+        }
+        impl Editor for FlakyEditor {
+            fn placement(&self) -> Placement {
+                Placement::CaptureSource
+            }
+            fn size(&self) -> (u32, u32) {
+                (640, 480)
+            }
+            fn capture_error(&self) -> Option<&str> {
+                self.errors.current()
+            }
+            fn first_capture_error(&self) -> Option<&str> {
+                self.errors.first()
+            }
+            fn place(&mut self, _: Option<&crate::plugins::Spot>) {}
+            fn idle(&mut self) -> bool {
+                self.ticks += 1;
+                if self.ticks == 1 {
+                    self.errors
+                        .record("transient native readback failure".into());
+                } else {
+                    self.errors.recovered();
+                }
+                true
+            }
+        }
+        let instance = TestInstance(PluginInfo {
+            format: Format::Vst3,
+            id: "metadata-test".into(),
+            name: "metadata-test".into(),
+            vendor: String::new(),
+            category: String::new(),
+            path: PathBuf::new(),
+        });
+        let mut editor: Option<Box<dyn Editor>> = Some(Box::<FlakyEditor>::default());
+        let cached = metadata(&instance, &editor, 21).unwrap();
+        assert!(!metadata_changed(&instance, &editor, 21, &cached));
+        // Native capture runs twice before the supervisor's next metadata poll.
+        assert!(editor.as_mut().unwrap().idle());
+        assert!(editor.as_mut().unwrap().idle());
+        assert!(editor.as_ref().unwrap().capture_error().is_none());
+        assert!(metadata_changed(&instance, &editor, 21, &cached));
+        let recovered = metadata(&instance, &editor, 21).unwrap();
+        let wire = serde_json::to_vec(&recovered).unwrap();
+        let recovered: Metadata = serde_json::from_slice(&wire).unwrap();
+        assert!(recovered.editor_error.is_none());
+        assert_eq!(
+            recovered.editor_first_error.as_deref(),
+            Some("transient native readback failure")
+        );
+        assert!(!metadata_changed(&instance, &editor, 21, &recovered));
+        let reopened: Option<Box<dyn Editor>> = Some(Box::<FlakyEditor>::default());
+        let fresh = metadata(&instance, &reopened, 22).unwrap();
+        assert!(fresh.editor_first_error.is_none());
+    }
+
+    #[test]
     fn request_poll_keeps_native_pump_live_without_consuming_control_bytes() {
         use std::net::{Ipv4Addr, TcpListener};
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -731,7 +823,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         while let Ok(pending) = request_pending(&mut worker) {
             assert!(!pending, "the consumed control frame must not reappear");
-            assert!(Instant::now() < deadline, "closed control socket was not detected");
+            assert!(
+                Instant::now() < deadline,
+                "closed control socket was not detected"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
     }
