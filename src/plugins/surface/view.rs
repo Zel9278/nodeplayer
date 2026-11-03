@@ -23,6 +23,115 @@ pub struct EditorView {
     popup_layer: Option<egui::LayerId>,
     cancel_popup: bool,
     drag_popup: Option<PopupMapping>,
+    clicks: ClickTracker,
+}
+
+#[derive(Clone, Copy)]
+struct ClickLimits {
+    interval: f64,
+    distance: egui::Vec2,
+}
+
+impl ClickLimits {
+    fn current(context: &egui::Context) -> Self {
+        #[cfg(target_os = "macos")]
+        let interval = objc2_app_kit::NSEvent::doubleClickInterval();
+        #[cfg(target_os = "windows")]
+        let interval = unsafe {
+            f64::from(windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()) / 1000.0
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let interval = context.options(|options| options.input_options.max_double_click_delay);
+        #[cfg(not(target_os = "windows"))]
+        let distance =
+            egui::Vec2::splat(context.options(|options| options.input_options.max_click_dist));
+        #[cfg(target_os = "windows")]
+        let distance = unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, SM_CXDOUBLECLK, SM_CYDOUBLECLK,
+            };
+            egui::vec2(
+                GetSystemMetrics(SM_CXDOUBLECLK) as f32,
+                GetSystemMetrics(SM_CYDOUBLECLK) as f32,
+            ) / (2.0 * context.pixels_per_point())
+        };
+        Self { interval, distance }
+    }
+
+    fn contains(self, delta: egui::Vec2) -> bool {
+        delta.x.abs() <= self.distance.x && delta.y.abs() <= self.distance.y
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ButtonClick {
+    position: Pos2,
+    time: f64,
+    popup: Option<usize>,
+    count: u8,
+    released: bool,
+    dragged: bool,
+}
+
+#[derive(Default)]
+struct ClickTracker {
+    buttons: [Option<ButtonClick>; 3],
+    last_button: Option<u8>,
+}
+
+impl ClickTracker {
+    fn press(
+        &mut self,
+        button: u8,
+        popup: Option<usize>,
+        position: Pos2,
+        time: f64,
+        limits: ClickLimits,
+    ) -> u8 {
+        let previous = self.buttons[usize::from(button - 1)];
+        let count = previous
+            .filter(|click| {
+                self.last_button == Some(button)
+                    && click.released
+                    && click.popup == popup
+                    && time >= click.time
+                    && time - click.time <= limits.interval
+                    && limits.contains(position - click.position)
+            })
+            .map_or(1, |click| click.count.saturating_add(1));
+        self.buttons[usize::from(button - 1)] = Some(ButtonClick {
+            position,
+            time,
+            popup,
+            count,
+            released: false,
+            dragged: false,
+        });
+        self.last_button = Some(button);
+        count
+    }
+
+    fn moved(&mut self, position: Pos2, limits: ClickLimits) {
+        for click in self
+            .buttons
+            .iter_mut()
+            .flatten()
+            .filter(|click| !click.released)
+        {
+            click.dragged |= !limits.contains(position - click.position);
+        }
+    }
+
+    fn release(&mut self, button: u8, position: Pos2, time: f64, limits: ClickLimits) -> u8 {
+        let Some(click) = &mut self.buttons[usize::from(button - 1)] else {
+            return 0;
+        };
+        click.released = !click.dragged
+            && time >= click.time
+            && time - click.time <= limits.interval
+            && limits.contains(position - click.position);
+        if click.released { click.count } else { 0 }
+    }
 }
 
 struct PopupTexture {
@@ -275,6 +384,9 @@ impl EditorView {
             return Ok(());
         }
         let events = context.input(|input| input.events.clone());
+        // Count at the UI boundary, before worker queueing can compress click timing.
+        let time = context.input(|input| input.time);
+        let click_limits = ClickLimits::current(context);
         let visible = |point: Pos2| -> bool {
             screen.contains(point)
                 && spot.is_some_and(|spot| {
@@ -354,7 +466,10 @@ impl EditorView {
             let hovered =
                 focused && (popup.is_some() || (top_modal.is_none() && visible(position)));
             match kind {
-                PointerKind::Down(_) if !hovered => continue,
+                PointerKind::Down(_) if !hovered => {
+                    self.clicks = ClickTracker::default();
+                    continue;
+                }
                 PointerKind::Up(button) if self.buttons & (1 << (button - 1)) == 0 => continue,
                 PointerKind::Move if !hovered && self.buttons == 0 => continue,
                 PointerKind::Wheel { .. } if !hovered => continue,
@@ -368,7 +483,22 @@ impl EditorView {
             if matches!(kind, PointerKind::Down(_)) && self.buttons == 0 {
                 self.drag_popup = popup.and_then(|index| self.popup_mapping(index));
             }
+            let click_count = match kind {
+                PointerKind::Down(button) => {
+                    self.clicks
+                        .press(button, popup, position, time, click_limits)
+                }
+                PointerKind::Up(button) => {
+                    self.clicks.release(button, position, time, click_limits)
+                }
+                PointerKind::Move => {
+                    self.clicks.moved(position, click_limits);
+                    0
+                }
+                _ => 0,
+            };
             editor.pointer(EditorPointer {
+                click_count,
                 position: self.native_position(screen, size, position, popup),
                 kind,
                 buttons: next_buttons,
@@ -387,6 +517,7 @@ impl EditorView {
                 let bit = 1 << (button - 1);
                 if self.buttons & bit != 0 {
                     editor.pointer(EditorPointer {
+                        click_count: 0,
                         position: self.native_position(screen, size, position, None),
                         kind: PointerKind::Up(button),
                         buttons: self.buttons & !bit,
@@ -395,6 +526,9 @@ impl EditorView {
                 }
             }
             self.drag_popup = None;
+        }
+        if !focused || spot.is_none() {
+            self.clicks = ClickTracker::default();
         }
         Ok(())
     }
@@ -441,6 +575,7 @@ impl EditorView {
             let bit = 1 << (button - 1);
             if self.buttons & bit != 0 {
                 editor.pointer(EditorPointer {
+                    click_count: 0,
                     position,
                     kind: PointerKind::Up(button),
                     buttons: self.buttons & !bit,
@@ -449,6 +584,7 @@ impl EditorView {
             }
         }
         editor.pointer(EditorPointer {
+            click_count: 0,
             position,
             kind: PointerKind::Cancel,
             buttons: 0,
@@ -458,6 +594,7 @@ impl EditorView {
         self.popup_layer = None;
         self.popup_rects.clear();
         self.popups.clear();
+        self.clicks = ClickTracker::default();
         Ok(())
     }
 }
@@ -474,6 +611,49 @@ fn native_from_screen(screen: Rect, native_size: (u32, u32), position: Pos2) -> 
 mod tests {
     use super::*;
     use egui::Vec2;
+
+    #[test]
+    fn click_sequences_count_double_and_triple_clicks_on_press() {
+        let limits = ClickLimits {
+            interval: 0.5,
+            distance: Vec2::splat(4.0),
+        };
+        let mut tracker = ClickTracker::default();
+        for (time, expected) in [(10.0, 1), (10.2, 2), (10.4, 3)] {
+            assert_eq!(tracker.press(1, None, Pos2::ZERO, time, limits), expected);
+            assert_eq!(
+                tracker.release(1, Pos2::ZERO, time + 0.01, limits),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn click_sequences_reject_slow_distant_dragged_and_different_target_clicks() {
+        let limits = ClickLimits {
+            interval: 0.5,
+            distance: Vec2::splat(4.0),
+        };
+        for (time, point, button, popup) in [
+            (10.6, Pos2::ZERO, 1, None),
+            (10.2, egui::pos2(5.0, 0.0), 1, None),
+            (10.2, Pos2::ZERO, 2, None),
+            (10.2, Pos2::ZERO, 1, Some(0)),
+        ] {
+            let mut tracker = ClickTracker::default();
+            assert_eq!(tracker.press(1, None, Pos2::ZERO, 10.0, limits), 1);
+            assert_eq!(tracker.release(1, Pos2::ZERO, 10.01, limits), 1);
+            assert_eq!(tracker.press(button, popup, point, time, limits), 1);
+        }
+        let mut tracker = ClickTracker::default();
+        tracker.press(1, None, Pos2::ZERO, 10.0, limits);
+        tracker.moved(egui::pos2(20.0, 0.0), limits);
+        tracker.moved(Pos2::ZERO, limits);
+        assert_eq!(tracker.release(1, Pos2::ZERO, 10.05, limits), 0);
+        assert_eq!(tracker.press(1, None, Pos2::ZERO, 10.1, limits), 1);
+        // A second down without a release is not a second click.
+        assert_eq!(tracker.press(1, None, Pos2::ZERO, 10.2, limits), 1);
+    }
 
     #[test]
     fn mapping_keeps_native_coordinates_at_every_graph_zoom_and_dpi() {
@@ -505,6 +685,88 @@ mod tests {
             self.0.push(event);
             Ok(())
         }
+    }
+
+    #[test]
+    fn double_clicks_are_forwarded_and_focus_or_covered_clicks_reset_the_sequence() {
+        use crate::plugins::PxRect;
+        let context = egui::Context::default();
+        let mut view = EditorView {
+            screen: Some(Rect::from_min_size(
+                egui::pos2(100.0, 100.0),
+                egui::vec2(320.0, 180.0),
+            )),
+            ..Default::default()
+        };
+        view.update_texture(
+            &context,
+            EditorFrame {
+                width: 2,
+                height: 1,
+                native_size: (640, 360),
+                rgba: vec![255; 8],
+                popups: Vec::new(),
+            },
+        );
+        let step = ClickLimits::current(&context).interval / 8.0;
+        let mut editor = RecordingEditor(Vec::new());
+        let click = |pressed| egui::Event::PointerButton {
+            pos: egui::pos2(140.0, 145.0),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut run = |tick, events, focused, covered| {
+            let clip = PxRect {
+                x: 100,
+                y: 100,
+                w: 320,
+                h: 180,
+            };
+            let spot = Spot {
+                clip,
+                origin: (100, 100),
+                visible: if covered { Vec::new() } else { vec![clip] },
+            };
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    time: Some(10.0 + f64::from(tick) * step),
+                    focused,
+                    events,
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    view.dispatch(ui.ctx(), &mut editor, Some(&spot), 1.0)
+                        .unwrap()
+                },
+            );
+            output.textures_delta.clear();
+        };
+        run(0, vec![click(true)], true, false);
+        run(1, vec![click(false)], true, false);
+        run(2, vec![click(true)], true, false);
+        run(3, vec![click(false)], true, false);
+        run(4, Vec::new(), false, false);
+        run(5, vec![click(true)], true, false);
+        run(6, vec![click(false)], true, false);
+        run(7, vec![click(true), click(false)], true, true);
+        run(8, vec![click(true), click(false)], true, false);
+        assert_eq!(
+            editor
+                .0
+                .iter()
+                .map(|event| event.click_count)
+                .collect::<Vec<_>>(),
+            [1, 1, 2, 2, 1, 1, 1, 1]
+        );
+        assert!(editor.0.iter().all(|event| event.position == [80.0, 90.0]));
+        assert!(
+            matches!(editor.0[2].kind, PointerKind::Down(1)),
+            "double-click must be known on down"
+        );
+        drop(view);
+        context.tex_manager().write().take_delta().clear();
     }
 
     #[test]

@@ -690,16 +690,19 @@ mod tests {
         assert_eq!(pixel(&frame, 80, 90), [0, 204, 136, 255]);
         for event in [
             EditorPointer {
+                click_count: 1,
                 position: [80.0, 90.0],
                 kind: PointerKind::Down(1),
                 buttons: 1,
             },
             EditorPointer {
+                click_count: 0,
                 position: [300.0, 90.0],
                 kind: PointerKind::Move,
                 buttons: 1,
             },
             EditorPointer {
+                click_count: 1,
                 position: [300.0, 90.0],
                 kind: PointerKind::Up(1),
                 buttons: 0,
@@ -885,6 +888,11 @@ mod tests {
                 host.conn.map_window(child)?.check()?;
                 for (kind, buttons) in [(PointerKind::Down(1), 1), (PointerKind::Up(1), 0)] {
                     capture.pointer(EditorPointer {
+                        click_count: if matches!(kind, PointerKind::Down(_) | PointerKind::Up(_)) {
+                            1
+                        } else {
+                            0
+                        },
                         position: [40.0, 50.0],
                         kind,
                         buttons,
