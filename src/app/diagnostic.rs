@@ -15,7 +15,6 @@ pub(super) struct GuiDiagnostic {
     started: bool,
     next_telemetry: Instant,
     step_requested: bool,
-    restart_saw_down: bool,
     pub(super) editor_zoom: Option<f32>,
 }
 
@@ -60,7 +59,6 @@ impl App {
             started: false,
             next_telemetry: Instant::now(),
             step_requested: false,
-            restart_saw_down: false,
             editor_zoom: None,
         });
     }
@@ -190,19 +188,24 @@ impl App {
                 if lower.contains("running") || lower == "local" {
                     run.event("worker-ready", json!({}))?;
                 }
-                if lower.contains("fault")
-                    || lower.contains("unresponsive")
-                    || lower.contains("fail")
-                {
-                    run.event("worker-faulted", json!({}))?;
-                }
                 diagnostic.last_status = status;
+            }
+            if let Some(editor) = &plugin.editor
+                && editor.is_captured()
+            {
+                let stats = plugin.editor_view.frame_stats();
+                run.observe_editor_capture(
+                    stats.map_or(0, |stats| stats.frames),
+                    stats.map(|stats| stats.frame_age_seconds),
+                    editor.capture_error(),
+                )?;
             }
             if !diagnostic.editor_reported && plugin.editor.as_ref().is_some_and(|e| e.ready()) {
                 diagnostic.editor_reported = true;
                 run.event("editor-attached", json!({"embedded":plugin.is_embedded()}))?;
             }
         }
+        run.check_health()?;
         let Some(step) = run.scenario.steps.get(diagnostic.next).cloned() else {
             run.finish(Outcome::Passed, "all scenario steps completed")?;
             return Ok(());
@@ -290,13 +293,24 @@ impl App {
                         diagnostic.step_requested = true;
                         run.event("editor-requested", json!({"embedded":embedded}))?;
                     }
-                    complete = plugin.editor.as_ref().is_some_and(|editor| editor.ready());
-                    if !complete && diagnostic.step_started.elapsed() >= Duration::from_secs(5) {
+                    complete = plugin.editor.as_ref().is_some_and(|editor| {
+                        editor.ready()
+                            && (!editor.is_captured()
+                                || plugin
+                                    .editor_view
+                                    .frame_stats()
+                                    .is_some_and(|stats| stats.frames > 0))
+                    });
+                    if !complete
+                        && diagnostic.step_started.elapsed()
+                            >= Duration::from_millis(run.scenario.health.capture_startup_timeout_ms)
+                    {
                         bail!("editor open acknowledgement deadline");
                     }
                 }
             }
             Step::CloseEditor => {
+                run.close_editor_capture()?;
                 diagnostic_plugin(&mut self.snarl, diagnostic.node)?.editor = None;
                 diagnostic.editor_reported = false;
                 run.event("editor-closed", json!({}))?;
@@ -307,18 +321,23 @@ impl App {
             Step::RestartHost => {
                 let plugin = diagnostic_plugin(&mut self.snarl, diagnostic.node)?;
                 if !diagnostic.step_requested {
-                    diagnostic.restart_saw_down =
-                        plugin.instance.remote_status() != Some("running");
+                    run.expect_worker_restart()?;
                     if !plugin.instance.request_remote_restart() {
                         bail!("selected plugin has no external host to restart");
+                    }
+                    // A new worker cannot reuse the old native editor/token. Retire
+                    // its proxy now so a following OpenEditor can establish a fresh
+                    // captured-frame lifetime after recovery.
+                    if plugin.editor.take().is_some() {
+                        run.close_editor_capture()?;
+                        diagnostic.editor_reported = false;
+                        run.event("editor-closed", json!({"reason":"worker-restart"}))?;
                     }
                     diagnostic.step_requested = true;
                     run.event("restart-requested", json!({}))?;
                     complete = false;
                 } else {
-                    let running = plugin.instance.remote_status() == Some("running");
-                    diagnostic.restart_saw_down |= !running;
-                    complete = diagnostic.restart_saw_down && running;
+                    complete = run.worker_restart_complete();
                     if complete {
                         run.event("worker-restarted", json!({}))?;
                     }
@@ -340,7 +359,7 @@ impl App {
                 }
                 run.event("status-asserted", json!({}))?;
             }
-            Step::Fault { kind } => {
+            Step::Fault { kind, recover } => {
                 let plugin = diagnostic_plugin(&mut self.snarl, diagnostic.node)?;
                 if plugin.info().id != "org.nodeplayer.test-fixture" {
                     bail!("fault injection only supports the explicit nodeplayer test fixture");
@@ -354,8 +373,9 @@ impl App {
                     _ => bail!("this fixture fault is not implemented"),
                 };
                 let value = if kind == "crash" { 1.0 / 3.0 } else { 1.0 };
+                run.expect_fixture_fault(recover)?;
                 plugin.instance.set_param(id, value);
-                run.event("fault-requested", json!({"kind":kind}))?;
+                run.event("fault-requested", json!({"kind":kind,"recover":recover}))?;
             }
         }
         if complete {
