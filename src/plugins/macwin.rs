@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{DefinedClass, Encoding, MainThreadMarker, MainThreadOnly, RefEncode, define_class, msg_send, sel};
-use objc2_app_kit::{NSBackingStoreType, NSResponder, NSView, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{NSBackingStoreType, NSResponder, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask};
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
 
 use super::{Placement, Spot, WinEvent, WindowId};
@@ -64,6 +64,31 @@ impl Container {
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 }
+
+define_class!(
+    // SAFETY: this private NSWindow subclass only restricts activation and hides its children.
+    #[unsafe(super(NSWindow, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "NodeplayerCaptureWindow"]
+    struct CaptureWindow;
+
+    impl CaptureWindow {
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key(&self) -> bool { false }
+
+        #[unsafe(method(canBecomeMainWindow))]
+        fn can_become_main(&self) -> bool { false }
+
+        #[unsafe(method(addChildWindow:ordered:))]
+        fn add_child(&self, child: &NSWindow, ordering: NSWindowOrderingMode) {
+            // Menus may check isVisible on their parent. Keep both windows ordered,
+            // but capture their views instead of showing them on the desktop.
+            child.setAlphaValue(0.0);
+            child.setExcludedFromWindowsMenu(true);
+            unsafe { let _: () = msg_send![super(self), addChildWindow: child, ordered: ordering]; }
+        }
+    }
+);
 
 /// Core Graphics' color, only passed from NSColor to CALayer here.
 #[repr(C)]
@@ -177,17 +202,23 @@ impl HostWindow {
                 (None, Some(window))
             }
             Placement::CaptureSource => {
-                let window = unsafe {
-                    NSWindow::initWithContentRect_styleMask_backing_defer(
-                        NSWindow::alloc(mtm), frame, NSWindowStyleMask::Borderless,
-                        NSBackingStoreType::Buffered, false,
-                    )
+                let window: Retained<CaptureWindow> = unsafe {
+                    msg_send![CaptureWindow::alloc(mtm), initWithContentRect: frame,
+                        styleMask: NSWindowStyleMask::Borderless,
+                        backing: NSBackingStoreType::Buffered, defer: false,
+                    ]
                 };
+                let window = window.into_super();
                 unsafe { window.setReleasedWhenClosed(false) };
                 window.setExcludedFromWindowsMenu(true);
                 window.setContentView(Some(&view));
-                // Keep an attached native view and backing scale without ever ordering
-                // a desktop window, taking focus, or adding a Window-menu entry.
+                // Plugins use isVisible to keep redraws and transient menus alive.
+                // A transparent, nonactivating host satisfies that contract privately.
+                window.setAlphaValue(0.0);
+                window.setIgnoresMouseEvents(true);
+                window.setHasShadow(false);
+                window.setCollectionBehavior(NSWindowCollectionBehavior::Transient | NSWindowCollectionBehavior::IgnoresCycle | NSWindowCollectionBehavior::FullScreenAuxiliary);
+                window.orderBack(None);
                 (None, Some(window))
             }
             Placement::Embedded(parent) => {

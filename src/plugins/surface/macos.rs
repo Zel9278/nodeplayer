@@ -2,10 +2,10 @@
 //!
 //! The owning editor must outlive this adapter, including its native descendants;
 //! drop the adapter before destroying the plugin GUI. The native view may live in
-//! a window that was never ordered on screen. AppKit bitmap drawing does not
+//! a transparent private window. AppKit bitmap drawing does not
 //! universally capture plugin-owned Metal/OpenGL surfaces. Pointer delivery is
-//! experimental: plugin tracking loops, keyboard/IME, and separate popup windows
-//! require additional hosting support.
+//! experimental: blocking plugin tracking loops and keyboard/IME require additional
+//! hosting support. Attached child popup windows are captured as separate images.
 
 use std::{cell::Cell, ffi::c_void};
 
@@ -19,7 +19,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSDictionary, NSPoint, NSRect};
 
-use super::{EditorFrame, EditorPointer, PointerKind};
+use super::{EditorFrame, EditorPointer, EditorPopup, MAX_POPUPS, PointerKind};
 
 const MAX_CAPTURE_PIXELS: u64 = 16 * 1024 * 1024;
 
@@ -120,9 +120,20 @@ pub fn pump_worker_app() -> Result<()> {
     Ok(())
 }
 
-pub struct NativeCapture {
+#[derive(Default)]
+struct BitmapCache {
     bitmap: Option<Retained<NSBitmapImageRep>>,
-    bitmap_key: (u64, u64, u64),
+    key: (u64, u64, u64),
+}
+
+struct PopupCapture {
+    window: Retained<NSWindow>,
+    bitmap: BitmapCache,
+}
+
+pub struct NativeCapture {
+    bitmap: BitmapCache,
+    popups: Vec<PopupCapture>,
     drag_target: Option<Retained<NSView>>,
     button_target: Option<Retained<NSButton>>,
     view: Retained<NSView>,
@@ -143,8 +154,8 @@ impl NativeCapture {
             "native editor is not attached to a window"
         );
         Ok(Self {
-            bitmap: None,
-            bitmap_key: (0, 0, 0),
+            bitmap: BitmapCache::default(),
+            popups: Vec::new(),
             drag_target: None,
             button_target: None,
             view,
@@ -152,52 +163,47 @@ impl NativeCapture {
     }
 
     pub fn capture(&mut self, _native_size: (u32, u32)) -> Result<EditorFrame> {
-        MainThreadMarker::new().context("native capture must run on the main thread")?;
+        let mut frame = capture_view(&self.view, &mut self.bitmap, MAX_CAPTURE_PIXELS)?;
         let window = self
             .view
             .window()
             .context("native editor left its window")?;
-        let bounds = self.view.bounds();
-        let backing_scale: f64 = unsafe { msg_send![&*window, backingScaleFactor] };
-        ensure!(
-            bounds.size.width.is_finite()
-                && bounds.size.height.is_finite()
-                && backing_scale.is_finite()
-                && backing_scale > 0.0,
-            "invalid native editor capture geometry"
-        );
-        // Bound the bitmap before asking AppKit to allocate it, including Retina pixels.
-        let pixel_width = (bounds.size.width * backing_scale).ceil();
-        let pixel_height = (bounds.size.height * backing_scale).ceil();
-        ensure!(
-            pixel_width > 0.0
-                && pixel_height > 0.0
-                && pixel_width <= 16384.0
-                && pixel_height <= 16384.0
-                && pixel_width * pixel_height <= MAX_CAPTURE_PIXELS as f64,
-            "native editor exceeds capture pixel budget"
-        );
-        let native_size = (
-            bounds.size.width.round().max(1.0) as u32,
-            bounds.size.height.round().max(1.0) as u32,
-        );
-        self.view.displayIfNeeded();
-        let key = (
-            bounds.size.width.to_bits(),
-            bounds.size.height.to_bits(),
-            backing_scale.to_bits(),
-        );
-        if self.bitmap.is_none() || self.bitmap_key != key {
-            self.bitmap = self.view.bitmapImageRepForCachingDisplayInRect(bounds);
-            self.bitmap_key = key;
+        let root =
+            window.convertRectToScreen(self.view.convertRect_toView(self.view.bounds(), None));
+        let mut previous = std::mem::take(&mut self.popups);
+        let mut remaining_pixels = MAX_CAPTURE_PIXELS - frame.rgba.len() as u64 / 4;
+        for child in popup_windows(&window)? {
+            let Some(view) = child.contentView() else {
+                continue;
+            };
+            let mut popup = previous
+                .iter()
+                .position(|p| p.window == child)
+                .map(|index| previous.swap_remove(index))
+                .unwrap_or_else(|| PopupCapture {
+                    window: child.clone(),
+                    bitmap: BitmapCache::default(),
+                });
+            let image = capture_view(&view, &mut popup.bitmap, remaining_pixels)?;
+            remaining_pixels = remaining_pixels
+                .checked_sub(image.rgba.len() as u64 / 4)
+                .context("editor popups exceed capture pixel budget")?;
+            let bounds = child.convertRectToScreen(view.convertRect_toView(view.bounds(), None));
+            frame.popups.push(EditorPopup {
+                origin: [
+                    bounds.origin.x - root.origin.x,
+                    root.origin.y + root.size.height - bounds.origin.y - bounds.size.height,
+                ],
+                width: image.width,
+                height: image.height,
+                native_size: image.native_size,
+                rgba: image.rgba,
+                interactive: !child.ignoresMouseEvents(),
+            });
+            self.popups.push(popup);
         }
-        let bitmap = self
-            .bitmap
-            .as_ref()
-            .context("AppKit could not allocate a view snapshot")?;
-        self.view
-            .cacheDisplayInRect_toBitmapImageRep(bounds, bitmap);
-        rgba_frame(bitmap, native_size)
+        frame.validate()?;
+        Ok(frame)
     }
 
     pub fn pointer(&mut self, pointer: EditorPointer) -> Result<()> {
@@ -210,6 +216,17 @@ impl NativeCapture {
             .view
             .window()
             .context("native editor left its window")?;
+        if matches!(pointer.kind, PointerKind::Cancel) {
+            self.drag_target = None;
+            self.button_target = None;
+            // Give the plugin its normal cancellation callback before hiding leftovers.
+            window.makeFirstResponder(None);
+            for child in popup_windows(&window)?.into_iter().rev() {
+                child.orderOut(None);
+            }
+            self.popups.clear();
+            return Ok(());
+        }
         // Production HostWindow uses an ordinary, unflipped NSView. The graph protocol
         // always measures from its top-left, independent of the native view orientation.
         let bounds = self.view.bounds();
@@ -223,19 +240,49 @@ impl NativeCapture {
                 },
         );
         let location = self.view.convertPoint_toView(point, None);
+        let screen_point = window.convertPointToScreen(location);
+        let popups = popup_windows(&window)?;
         let target = self.drag_target.clone().or_else(|| {
+            // Popup views use their own window coordinates and can extend beyond the editor.
+            for child in popups.iter().rev() {
+                if child.ignoresMouseEvents() {
+                    continue;
+                }
+                let Some(view) = child.contentView() else {
+                    continue;
+                };
+                let location = child.convertPointFromScreen(screen_point);
+                let point = view.convertPoint_fromView(location, None);
+                let bounds = view.bounds();
+                if point.x < bounds.origin.x
+                    || point.y < bounds.origin.y
+                    || point.x >= bounds.origin.x + bounds.size.width
+                    || point.y >= bounds.origin.y + bounds.size.height
+                {
+                    continue;
+                }
+                let superview = unsafe { view.superview() };
+                let parent_point = view.convertPoint_toView(point, superview.as_deref());
+                if let Some(target) = view.hitTest(parent_point) {
+                    return Some(target);
+                }
+            }
             // NSView::hitTest takes coordinates in the receiver's superview, not bounds.
             let superview = unsafe { self.view.superview() };
             let parent_point = self.view.convertPoint_toView(point, superview.as_deref());
             self.view.hitTest(parent_point)
         });
         let Some(target) = target else { return Ok(()) };
+        let target_window = target
+            .window()
+            .context("native input target left its window")?;
+        let location = target_window.convertPointFromScreen(screen_point);
         if let PointerKind::Wheel { dx, dy } = pointer.kind {
             ensure!(
                 dx.is_finite() && dy.is_finite(),
                 "non-finite wheel displacement"
             );
-            return forward_wheel(&window, &target, location, dx, dy);
+            return forward_wheel(&target_window, &target, location, dx, dy);
         }
         // NSButton::mouseDown enters a blocking tracking loop. Release-time performClick
         // invokes the normal action without waiting for events from the graph window.
@@ -275,15 +322,18 @@ impl NativeCapture {
             PointerKind::Move if pointer.buttons & 4 != 0 => NSEventType::OtherMouseDragged,
             PointerKind::Move => NSEventType::MouseMoved,
             PointerKind::Wheel { .. } => unreachable!(),
+            PointerKind::Cancel => unreachable!(),
         };
         let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
             event_type, location, NSEventModifierFlags::empty(),
-            unsafe { CACurrentMediaTime() }, window.windowNumber(), None, 0, 1,
+            unsafe { CACurrentMediaTime() }, target_window.windowNumber(), None, 0, 1,
             if matches!(pointer.kind, PointerKind::Up(_)) { 0.0 } else { 1.0 },
         ).context("AppKit could not create forwarded pointer event")?;
         if matches!(pointer.kind, PointerKind::Down(_)) {
             self.drag_target = Some(target.clone());
-            window.makeFirstResponder(Some(&target));
+            if target_window == window {
+                window.makeFirstResponder(Some(&target));
+            }
         }
         match event_type {
             NSEventType::LeftMouseDown => target.mouseDown(&event),
@@ -302,6 +352,71 @@ impl NativeCapture {
         }
         Ok(())
     }
+}
+
+fn capture_view(view: &NSView, cache: &mut BitmapCache, pixel_budget: u64) -> Result<EditorFrame> {
+    MainThreadMarker::new().context("native capture must run on the main thread")?;
+    let window = view.window().context("native editor left its window")?;
+    let bounds = view.bounds();
+    let backing_scale: f64 = unsafe { msg_send![&*window, backingScaleFactor] };
+    ensure!(
+        bounds.size.width.is_finite()
+            && bounds.size.height.is_finite()
+            && backing_scale.is_finite()
+            && backing_scale > 0.0,
+        "invalid native editor capture geometry"
+    );
+    // Bound the bitmap before asking AppKit to allocate it, including Retina pixels.
+    let pixel_width = (bounds.size.width * backing_scale).ceil();
+    let pixel_height = (bounds.size.height * backing_scale).ceil();
+    ensure!(
+        pixel_width > 0.0
+            && pixel_height > 0.0
+            && pixel_width <= 16384.0
+            && pixel_height <= 16384.0
+            && pixel_width * pixel_height <= pixel_budget as f64,
+        "native editor exceeds capture pixel budget"
+    );
+    let native_size = (
+        bounds.size.width.round().max(1.0) as u32,
+        bounds.size.height.round().max(1.0) as u32,
+    );
+    view.displayIfNeeded();
+    let key = (
+        bounds.size.width.to_bits(),
+        bounds.size.height.to_bits(),
+        backing_scale.to_bits(),
+    );
+    if cache.bitmap.is_none() || cache.key != key {
+        cache.bitmap = view.bitmapImageRepForCachingDisplayInRect(bounds);
+        cache.key = key;
+    }
+    let bitmap = cache
+        .bitmap
+        .as_ref()
+        .context("AppKit could not allocate a view snapshot")?;
+    view.cacheDisplayInRect_toBitmapImageRep(bounds, bitmap);
+    rgba_frame(bitmap, native_size)
+}
+
+/// Only attached windows belong to this editor; never capture unrelated app windows.
+fn popup_windows(root: &NSWindow) -> Result<Vec<Retained<NSWindow>>> {
+    fn children(root: &NSWindow, result: &mut Vec<Retained<NSWindow>>) -> Result<()> {
+        if let Some(windows) = root.childWindows() {
+            for child in windows.iter().filter(|window| window.isVisible()) {
+                ensure!(result.len() < MAX_POPUPS, "too many native editor popups");
+                // The private host hides direct children before AppKit orders them.
+                // Keep any deeper attached windows private as well.
+                child.setAlphaValue(0.0);
+                result.push(child.clone());
+                children(&child, result)?;
+            }
+        }
+        Ok(())
+    }
+    let mut result = Vec::new();
+    children(root, &mut result)?;
+    Ok(result)
 }
 
 fn forward_wheel(
@@ -398,6 +513,7 @@ fn rgba_frame(bitmap: &NSBitmapImageRep, native_size: (u32, u32)) -> Result<Edit
             premultiplied,
         )?;
         return Ok(EditorFrame {
+            popups: Vec::new(),
             width,
             height,
             native_size,
@@ -416,6 +532,7 @@ fn rgba_frame(bitmap: &NSBitmapImageRep, native_size: (u32, u32)) -> Result<Edit
         .into_rgba8();
     let (width, height) = image.dimensions();
     Ok(EditorFrame {
+        popups: Vec::new(),
         width,
         height,
         native_size,

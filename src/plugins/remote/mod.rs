@@ -470,7 +470,7 @@ impl Editor for RemoteEditor {
         if self.pending_input.len() >= Self::MAX_PENDING_INPUT {
             // Moves and wheel deltas are disposable under pressure; button ordering is not.
             self.pending_input.retain(|(_, event)| {
-                matches!(event.kind, PointerKind::Down(_) | PointerKind::Up(_))
+                matches!(event.kind, PointerKind::Down(_) | PointerKind::Up(_) | PointerKind::Cancel)
             });
         }
         if self.pending_input.len() >= Self::MAX_PENDING_INPUT {
@@ -691,6 +691,7 @@ mod tests {
         let replacement = Arc::new(FrameMap::create(8, 2).unwrap());
         replacement
             .publish(&EditorFrame {
+                popups: Vec::new(),
                 width: 1,
                 height: 1,
                 native_size: (1, 1),

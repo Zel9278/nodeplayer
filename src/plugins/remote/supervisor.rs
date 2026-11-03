@@ -697,6 +697,7 @@ mod tests {
             token: 88,
         })?;
         map.publish(&crate::plugins::surface::EditorFrame {
+            popups: Vec::new(),
             width: 1,
             height: 1,
             native_size: (1, 1),

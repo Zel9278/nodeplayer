@@ -231,6 +231,7 @@ impl NativeCapture {
         // Source geometry wins if the plugin resized between the owner's metadata
         // snapshot and this read. On X11 native input units are source pixels.
         Ok(EditorFrame {
+            popups: Vec::new(),
             width: size.0,
             height: size.1,
             native_size: size,
@@ -268,6 +269,9 @@ impl NativeCapture {
         };
         let state = button_mask(event.buttons);
         match event.kind {
+            PointerKind::Cancel => {
+                self.pointer_target = None;
+            }
             PointerKind::Move => {
                 self.conn
                     .send_event(
