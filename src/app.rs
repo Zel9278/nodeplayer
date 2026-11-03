@@ -327,6 +327,8 @@ pub struct App {
     selection_kept: Option<crate::loop_editor::Selection>,
     /// The store's revision saved, and when it last changed.
     loops_saved: (u64, Instant),
+    /// The same for the lyrics panel's store.
+    lyrics_saved: (u64, Instant),
     /// What extensions were last told: current track and whether it played.
     ext_seen: (Option<PathBuf>, bool),
     /// The library revision the extensions' snapshot was taken from.
@@ -359,7 +361,7 @@ impl App {
             sample_rate: sample_rate as f32,
             snarl: Snarl::new(),
             outer: Vec::new(),
-            lyrics: LyricsPanel::new(LyricsSettings::default()),
+            lyrics: LyricsPanel::new(LyricsSettings::default(), session::load_lyrics()),
             video: VideoPanel::new(VideoSettings::default()),
             open_tabs: Vec::new(),
             // Editors that support scaling follow the zoom; others stay at their own size.
@@ -422,6 +424,7 @@ impl App {
             selection_track: None,
             selection_kept: None,
             loops_saved: (0, Instant::now()),
+            lyrics_saved: (0, Instant::now()),
             ext_seen: (None, false),
             ext_library: u64::MAX,
             track_ended: false,
@@ -1536,6 +1539,15 @@ impl App {
             }
         } else {
             self.loops_saved.1 = Instant::now();
+        }
+        // Each track's lyrics provider and offset, the same way (dragging the offset).
+        if self.lyrics.store.revision != self.lyrics_saved.0 {
+            if self.lyrics_saved.1.elapsed() > Duration::from_secs(1) || now {
+                session::save_lyrics(&self.lyrics.store);
+                self.lyrics_saved = (self.lyrics.store.revision, Instant::now());
+            }
+        } else {
+            self.lyrics_saved.1 = Instant::now();
         }
     }
 

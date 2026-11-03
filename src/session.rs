@@ -234,6 +234,23 @@ pub fn save_loops(loops: &crate::loop_editor::LoopStore) {
     }
 }
 
+/// Every track's lyrics provider and offset.
+fn lyrics_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("lyrics.json"))
+}
+
+pub fn load_lyrics() -> crate::lyrics::LyricsStore {
+    let Some(path) = lyrics_path().filter(|p| p.exists()) else { return Default::default() };
+    read_json(&path).map_err(|e| log::warn!("can't read the lyrics choices: {e:#}")).unwrap_or_default()
+}
+
+pub fn save_lyrics(store: &crate::lyrics::LyricsStore) {
+    let Some(path) = lyrics_path() else { return };
+    if let Err(e) = write_json(&path, store) {
+        log::warn!("can't save the lyrics choices: {e:#}");
+    }
+}
+
 pub fn load_session() -> Option<Session> {
     let path = session_path()?;
     if !path.exists() {

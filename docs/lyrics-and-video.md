@@ -7,18 +7,24 @@ and dock it where you like, as with the other panels.
 
 - Timed lyrics (LRC) follow playback: the current line is highlighted and kept near the
   middle, clicking a line seeks there, and the wheel scrolls by hand (following resumes after
-  4 seconds). **offset** shifts the timing when the lyrics run early or late.
+  4 seconds). **offset** shifts the timing when the lyrics run early or late; ↺ sets it back
+  to 0.
 - Plain lyrics just scroll.
 - **size** sets the font size; the lyrics fill the panel.
 
-The lyrics come from the first of these that has them:
+The menu at the top picks where the lyrics come from. **auto** takes the first of these that
+has them; picking one uses only that one:
 
-1. an `.lrc` (or `.txt`) file next to the track with the same name
-2. lyrics in the file's tags
-3. with **online** on: NetEase Cloud Music, then Kugou, searched by title and artist and
-   matched by name and length. These are the services' unofficial web APIs, so they may stop
-   working; the title, artist and length are sent to music.163.com and kugou.com. Answers are
-   cached; "not found" is asked again after a week, or at once with ⟳.
+1. **file**: an `.lrc` (or `.txt`) file next to the track with the same name
+2. **embedded**: lyrics in the file's tags
+3. with **online** on: **NetEase** (NetEase Cloud Music), **Kugou**, then **LRCLIB**
+   (lrclib.net), searched by title and artist and matched by name and length. NetEase's and
+   Kugou's are the services' unofficial web APIs, so they may stop working; LRCLIB's is public.
+   The title, artist and length are sent to music.163.com, kugou.com and lrclib.net. Each
+   one's answers are cached; "not found" is asked again after a week, or at once with ⟳.
+
+The provider picked and the offset are kept for each track, in `lyrics.json` in the settings
+folder, and come back when the track plays again.
 
 ## Video
 

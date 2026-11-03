@@ -1,14 +1,19 @@
 //! Lyrics panel: shows the current track's lyrics, following the playback position when they
 //! are timed (LRC).
 //!
-//! Where they come from, first found wins:
+//! Where they come from ([`Provider`]): the one picked for the track, or ("auto") the first of
+//! these that has them:
 //! 1. an `.lrc` (or `.txt`) file next to the track with the same name,
 //! 2. lyrics embedded in the file's tags,
-//! 3. online, when "online" is on: NetEase Cloud Music (music.163.com), then Kugou
-//!    (krcs.kugou.com), searched by title and artist and matched by name and length. Both are
-//!    the services' unofficial web APIs, needing no key. Answers (found or not) are cached in
+//! 3. online, when "online" is on: NetEase Cloud Music (music.163.com), Kugou
+//!    (krcs.kugou.com), then LRCLIB (lrclib.net), searched by title and artist and matched by
+//!    name and length. NetEase and Kugou are the services' unofficial web APIs; LRCLIB's is
+//!    public. None needs a key. Each one's answers (found or not) are cached in
 //!    `~/.cache/nodeplayer/lyrics/`.
+//!
+//! The provider picked and the timing offset are kept per track ([`LyricsStore`]).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -20,6 +25,8 @@ use crate::player::Player;
 
 /// The services answer browsers; an unknown client may get nothing.
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
+/// LRCLIB asks clients to name themselves.
+const LRCLIB_AGENT: &str = concat!("nodeplayer/", env!("CARGO_PKG_VERSION"), " (https://github.com/Zel9278/nodeplayer)");
 /// How long a "not found" answer is trusted before asking again.
 const RETRY_MISSING: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -28,14 +35,105 @@ const RETRY_MISSING: Duration = Duration::from_secs(7 * 24 * 3600);
 pub struct LyricsSettings {
     /// Look the lyrics up online when there are none locally.
     pub online: bool,
-    /// Added to the playback position, in seconds; positive shows lines earlier.
-    pub offset: f32,
     pub font_size: f32,
 }
 
 impl Default for LyricsSettings {
     fn default() -> Self {
-        Self { online: true, offset: 0.0, font_size: 16.0 }
+        Self { online: true, font_size: 16.0 }
+    }
+}
+
+/// Where lyrics come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    /// An `.lrc` or `.txt` next to the track.
+    File,
+    /// The file's tags.
+    Embedded,
+    NetEase,
+    Kugou,
+    Lrclib,
+}
+
+impl Provider {
+    /// All of them, in the order "auto" asks them.
+    pub const ALL: [Self; 5] = [Self::File, Self::Embedded, Self::NetEase, Self::Kugou, Self::Lrclib];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Embedded => "embedded",
+            Self::NetEase => "NetEase",
+            Self::Kugou => "Kugou",
+            Self::Lrclib => "LRCLIB",
+        }
+    }
+
+    /// For cache file names.
+    fn id(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Embedded => "embedded",
+            Self::NetEase => "netease",
+            Self::Kugou => "kugou",
+            Self::Lrclib => "lrclib",
+        }
+    }
+
+    /// The online service behind it.
+    fn service(self) -> Option<Service> {
+        match self {
+            Self::NetEase => Some(netease),
+            Self::Kugou => Some(kugou),
+            Self::Lrclib => Some(lrclib),
+            Self::File | Self::Embedded => None,
+        }
+    }
+}
+
+/// What is kept for one track.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrackLyrics {
+    /// The provider picked; `None` takes the first that has lyrics.
+    pub provider: Option<Provider>,
+    /// Added to the playback position, in seconds; positive shows lines earlier.
+    pub offset: f32,
+}
+
+/// Each track's provider and offset, by path (`lyrics.json`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LyricsStore {
+    pub tracks: BTreeMap<String, TrackLyrics>,
+    /// Counts changes, for saving.
+    #[serde(skip)]
+    pub revision: u64,
+}
+
+impl LyricsStore {
+    fn key(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    pub fn get(&self, path: &Path) -> TrackLyrics {
+        self.tracks.get(&Self::key(path)).cloned().unwrap_or_default()
+    }
+
+    /// Keeps `kept` for the track; a track left at the defaults goes.
+    pub fn set(&mut self, path: &Path, kept: TrackLyrics) {
+        if self.get(path) == kept {
+            return;
+        }
+        let key = Self::key(path);
+        if kept == TrackLyrics::default() {
+            self.tracks.remove(&key);
+        } else {
+            self.tracks.insert(key, kept);
+        }
+        self.revision += 1;
     }
 }
 
@@ -164,7 +262,8 @@ fn key_hash(s: &str) -> u64 {
 
 #[derive(Serialize, Deserialize)]
 struct Cached {
-    /// The service that had them; empty when none did.
+    /// The provider asked (its label). Earlier versions kept one answer for all of them: the
+    /// one that had the lyrics, or empty when none did.
     source: String,
     lyrics: Option<String>,
     /// Seconds since the epoch of the lookup.
@@ -175,11 +274,15 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(12))).http_status_as_error(false).build().into()
 }
 
-/// GETs `url` and parses the JSON answer.
-fn get_json(agent: &ureq::Agent, url: &str, query: &[(&str, String)], referer: Option<&str>) -> Result<serde_json::Value, String> {
-    let mut req = agent.get(url).header("User-Agent", USER_AGENT);
-    if let Some(r) = referer {
-        req = req.header("Referer", r);
+/// GETs `url` and parses the JSON answer. A browser's User-Agent goes along unless `headers`
+/// has one.
+fn get_json(agent: &ureq::Agent, url: &str, query: &[(&str, String)], headers: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+    let mut req = agent.get(url);
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("User-Agent")) {
+        req = req.header("User-Agent", USER_AGENT);
+    }
+    for (k, v) in headers {
+        req = req.header(*k, *v);
     }
     for (k, v) in query {
         req = req.query(*k, v);
@@ -274,7 +377,7 @@ fn netease(t: &Track, title: &str) -> Result<Option<String>, String> {
         Some(a) => format!("{title} {a}"),
         None => title.to_string(),
     };
-    let found = get_json(&agent, "https://music.163.com/api/cloudsearch/pc", &[("s", query), ("type", "1".into()), ("limit", "10".into())], Some(REFERER))?;
+    let found = get_json(&agent, "https://music.163.com/api/cloudsearch/pc", &[("s", query), ("type", "1".into()), ("limit", "10".into())], &[("Referer", REFERER)])?;
     let mut picks: Vec<(i32, u64)> = found["result"]["songs"]
         .as_array()
         .into_iter()
@@ -289,7 +392,7 @@ fn netease(t: &Track, title: &str) -> Result<Option<String>, String> {
     picks.sort_by_key(|(score, _)| -score);
     // The best match may be an instrumental or lack lyrics; try a few.
     for (_, id) in picks.into_iter().take(3) {
-        let l = get_json(&agent, "https://music.163.com/api/song/lyric", &[("id", id.to_string()), ("lv", "1".into()), ("tv", "-1".into())], Some(REFERER))?;
+        let l = get_json(&agent, "https://music.163.com/api/song/lyric", &[("id", id.to_string()), ("lv", "1".into()), ("tv", "-1".into())], &[("Referer", REFERER)])?;
         if l["nolyric"].as_bool() == Some(true) || l["pureMusic"].as_bool() == Some(true) {
             continue;
         }
@@ -312,7 +415,7 @@ fn kugou(t: &Track, title: &str) -> Result<Option<String>, String> {
         &agent,
         "https://krcs.kugou.com/search",
         &[("ver", "1".into()), ("man", "yes".into()), ("client", "mobi".into()), ("keyword", keyword), ("duration", ms), ("hash", String::new())],
-        None,
+        &[],
     )?;
     let mut picks: Vec<(i32, String, String)> = found["candidates"]
         .as_array()
@@ -331,7 +434,7 @@ fn kugou(t: &Track, title: &str) -> Result<Option<String>, String> {
             &agent,
             "https://krcs.kugou.com/download",
             &[("ver", "1".into()), ("client", "pc".into()), ("id", id), ("accesskey", key), ("fmt", "lrc".into()), ("charset", "utf8".into())],
-            None,
+            &[],
         )?;
         let Some(b64) = d["content"].as_str() else { continue };
         let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else { continue };
@@ -343,6 +446,33 @@ fn kugou(t: &Track, title: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// LRCLIB's public API (lrclib.net/docs): one search answers with the lyrics themselves.
+fn lrclib(t: &Track, title: &str) -> Result<Option<String>, String> {
+    let agent = agent();
+    let mut query = vec![("track_name", title.to_string())];
+    if let Some(a) = &t.artist {
+        query.push(("artist_name", a.clone()));
+    }
+    let found = get_json(&agent, "https://lrclib.net/api/search", &query, &[("User-Agent", LRCLIB_AGENT)])?;
+    let mut picks: Vec<(i32, &serde_json::Value)> = found
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["instrumental"].as_bool() != Some(true))
+        .filter_map(|r| {
+            let artists = vec![r["artistName"].as_str().unwrap_or("").to_string()];
+            let score = match_score(t, title, r["trackName"].as_str()?, &artists, r["duration"].as_f64())?;
+            // Between equal matches, timed lyrics first.
+            let synced = r["syncedLyrics"].as_str().is_some_and(|s| !s.trim().is_empty());
+            Some((score * 2 + i32::from(synced), r))
+        })
+        .collect();
+    picks.sort_by_key(|(score, _)| -score);
+    Ok(picks.into_iter().find_map(|(_, r)| {
+        [r["syncedLyrics"].as_str(), r["plainLyrics"].as_str()].into_iter().flatten().find(|s| !s.trim().is_empty()).map(String::from)
+    }))
+}
+
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -350,67 +480,96 @@ fn now_secs() -> u64 {
 /// An online service: the track and the title to search for → LRC text, if it has any.
 type Service = fn(&Track, &str) -> Result<Option<String>, String>;
 
-/// The online services, asked in this order.
-const SERVICES: [(&str, Service); 2] = [("NetEase", netease), ("Kugou", kugou)];
-
-fn lookup(t: &Track, online: bool, refresh: bool) -> State {
-    if let Some((text, p)) = sidecar(&t.path)
-        && let Some(l) = Lyrics::from_text(&text)
-    {
-        return State::Found(l, p.file_name().unwrap_or_default().to_string_lossy().into_owned());
-    }
-    if let Some(l) = t.embedded.as_deref().and_then(Lyrics::from_text) {
-        return State::Found(l, "embedded".into());
-    }
-    if !online {
-        return State::Missing("no lyrics file or tag".into());
-    }
+/// The lyrics from `choice`, or ("auto", `None`) from the first provider that has them.
+fn lookup(t: &Track, choice: Option<Provider>, online: bool, refresh: bool) -> State {
     let title = t.title.clone().unwrap_or_else(|| t.path.file_stem().unwrap_or_default().to_string_lossy().into_owned());
     let key = format!("{}\n{}\n{}", title.to_lowercase(), t.artist.as_deref().unwrap_or("").to_lowercase(), t.album.as_deref().unwrap_or("").to_lowercase());
-    let file = cache_dir().map(|d| d.join(format!("{:016x}.json", key_hash(&key))));
-    if !refresh
-        && let Some(c) = file.as_ref().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice::<Cached>(&b).ok())
-    {
-        match c.lyrics.as_deref().and_then(Lyrics::from_text) {
-            Some(l) => return State::Found(l, format!("{} (cached)", c.source)),
-            None if now_secs().saturating_sub(c.when) < RETRY_MISSING.as_secs() => {
-                return State::Missing("not found online".into());
+    let picked = choice.is_some();
+    let providers = match &choice {
+        Some(p) => std::slice::from_ref(p),
+        None => &Provider::ALL[..],
+    };
+    // Why there are none: errors, and (for the one picked) what was missing.
+    let mut why = Vec::new();
+    for &p in providers {
+        match p {
+            Provider::File => {
+                if let Some((text, path)) = sidecar(&t.path)
+                    && let Some(l) = Lyrics::from_text(&text)
+                {
+                    return State::Found(l, path.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                }
+                if picked {
+                    why.push("no .lrc or .txt next to the track".to_string());
+                }
             }
+            Provider::Embedded => {
+                if let Some(l) = t.embedded.as_deref().and_then(Lyrics::from_text) {
+                    return State::Found(l, p.label().into());
+                }
+                if picked {
+                    why.push("none in the tags".to_string());
+                }
+            }
+            _ if !online => {
+                if picked {
+                    why.push("online is off".to_string());
+                }
+            }
+            _ => match online_lookup(t, &title, &key, p, refresh) {
+                Ok(Some((l, true))) => return State::Found(l, format!("{} (cached)", p.label())),
+                Ok(Some((l, false))) => return State::Found(l, p.label().into()),
+                Ok(None) if picked => why.push(format!("not found on {}", p.label())),
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("lyrics lookup for {title} on {}: {e}", p.label());
+                    why.push(format!("{}: {e}", p.label()));
+                }
+            },
+        }
+    }
+    State::Missing(match why.is_empty() {
+        false => why.join(", "),
+        true if online => "not found online".into(),
+        true => "no lyrics file or tag".into(),
+    })
+}
+
+/// An online provider's lyrics for the track, and whether they came from the cache. Its
+/// answer is cached, "not found" too (asked again after a while), but not a failure to ask.
+fn online_lookup(t: &Track, title: &str, key: &str, p: Provider, refresh: bool) -> Result<Option<(Lyrics, bool)>, String> {
+    let Some(service) = p.service() else { return Ok(None) };
+    let file = cache_dir().map(|d| d.join(format!("{:016x}-{}.json", key_hash(key), p.id())));
+    if !refresh && let Some(c) = cached(file.as_deref(), key, p) {
+        match c.lyrics.as_deref().and_then(Lyrics::from_text) {
+            Some(l) => return Ok(Some((l, true))),
+            None if now_secs().saturating_sub(c.when) < RETRY_MISSING.as_secs() => return Ok(None),
             None => {}
         }
     }
-    let mut errors = Vec::new();
-    let mut found = None;
-    for (name, service) in SERVICES {
-        match service(t, &title) {
-            Ok(Some(text)) if Lyrics::from_text(&text).is_some() => {
-                found = Some((name, text));
-                break;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                log::warn!("lyrics lookup for {title} on {name}: {e}");
-                errors.push(format!("{name}: {e}"));
-            }
-        }
+    let found = service(t, title)?.filter(|text| Lyrics::from_text(text).is_some());
+    if let Some(f) = &file {
+        let c = Cached { source: p.label().into(), lyrics: found.clone(), when: now_secs() };
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = std::fs::write(f, serde_json::to_vec(&c).unwrap_or_default());
     }
-    // Don't remember "not found" when a service couldn't be asked.
-    if found.is_some() || errors.is_empty() {
-        let c = Cached { source: found.as_ref().map_or(String::new(), |f| f.0.to_string()), lyrics: found.as_ref().map(|f| f.1.clone()), when: now_secs() };
-        if let Some(f) = &file {
-            let _ = std::fs::create_dir_all(f.parent().unwrap());
-            let _ = std::fs::write(f, serde_json::to_vec(&c).unwrap_or_default());
-        }
-    }
-    match found {
-        Some((name, text)) => State::Found(Lyrics::from_text(&text).unwrap(), name.to_string()),
-        None if errors.is_empty() => State::Missing("not found online".into()),
-        None => State::Missing(errors.join(", ")),
-    }
+    Ok(found.as_deref().and_then(Lyrics::from_text).map(|l| (l, false)))
+}
+
+/// `p`'s cached answer; or lyrics an earlier version cached for the track as a whole, when
+/// `p` had them.
+fn cached(file: Option<&Path>, key: &str, p: Provider) -> Option<Cached> {
+    let read = |f: &Path| std::fs::read(f).ok().and_then(|b| serde_json::from_slice::<Cached>(&b).ok());
+    file.and_then(read).or_else(|| {
+        let legacy = cache_dir()?.join(format!("{:016x}.json", key_hash(key)));
+        read(&legacy).filter(|c| c.source == p.label() && c.lyrics.is_some())
+    })
 }
 
 pub struct LyricsPanel {
     pub settings: LyricsSettings,
+    /// Each track's provider and offset.
+    pub store: LyricsStore,
     track: Option<PathBuf>,
     state: Arc<Mutex<Option<State>>>,
     /// The lookup in flight, so an old one finishing late is ignored.
@@ -421,8 +580,13 @@ pub struct LyricsPanel {
 }
 
 impl LyricsPanel {
-    pub fn new(settings: LyricsSettings) -> Self {
-        Self { settings, track: None, state: Arc::default(), generation: Arc::default(), manual: None }
+    pub fn new(settings: LyricsSettings, store: LyricsStore) -> Self {
+        Self { settings, store, track: None, state: Arc::default(), generation: Arc::default(), manual: None }
+    }
+
+    /// The current track's offset, in seconds.
+    fn offset(&self) -> f64 {
+        self.track.as_deref().map_or(0.0, |p| f64::from(self.store.get(p).offset))
     }
 
     fn start_lookup(&mut self, player: &Player, refresh: bool) {
@@ -431,6 +595,7 @@ impl LyricsPanel {
             *self.state.lock().unwrap() = None;
             return;
         };
+        let choice = self.store.get(&path).provider;
         let track = Track {
             path,
             title: status.tags.title.clone(),
@@ -448,7 +613,7 @@ impl LyricsPanel {
         self.manual = None;
         let (state, gen_now, online) = (self.state.clone(), self.generation.clone(), self.settings.online);
         let _ = std::thread::Builder::new().name("lyrics".into()).spawn(move || {
-            let found = lookup(&track, online, refresh);
+            let found = lookup(&track, choice, online, refresh);
             if *gen_now.lock().unwrap() == generation {
                 *state.lock().unwrap() = Some(found);
             }
@@ -463,8 +628,29 @@ impl LyricsPanel {
             self.start_lookup(player, false);
         }
         let state = self.state.lock().unwrap().clone();
+        let mut kept = self.track.as_deref().map(|p| self.store.get(p));
 
         ui.horizontal(|ui| {
+            if let Some(kept) = &mut kept {
+                let before = kept.provider;
+                egui::ComboBox::from_id_salt("lyrics provider")
+                    .width(90.0)
+                    .selected_text(kept.provider.map_or("auto", Provider::label))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut kept.provider, None, "auto").on_hover_text("the first that has them");
+                        for p in Provider::ALL {
+                            ui.selectable_value(&mut kept.provider, Some(p), p.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text("where this track's lyrics come from (kept for the track)");
+                if kept.provider != before
+                    && let Some(path) = self.track.clone()
+                {
+                    self.store.set(&path, kept.clone());
+                    self.start_lookup(player, false);
+                }
+            }
             match &state {
                 Some(State::Searching) => {
                     ui.spinner();
@@ -483,7 +669,10 @@ impl LyricsPanel {
             if ui.small_button("⟳").on_hover_text("look again (skips the cache)").clicked() {
                 self.start_lookup(player, true);
             }
-            if ui.checkbox(&mut self.settings.online, "online").on_hover_text("look up NetEase, then Kugou (sends title, artist and length to music.163.com and kugou.com)").changed()
+            if ui
+                .checkbox(&mut self.settings.online, "online")
+                .on_hover_text("look up NetEase, Kugou and LRCLIB (sends title, artist and length to music.163.com, kugou.com and lrclib.net)")
+                .changed()
                 && self.settings.online
                 && matches!(state, Some(State::Missing(_)))
             {
@@ -491,12 +680,16 @@ impl LyricsPanel {
             }
         });
         let synced = matches!(state, Some(State::Found(Lyrics::Synced(_), _)));
-        if synced {
+        if synced && let (Some(mut kept), Some(path)) = (kept, self.track.clone()) {
             ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut self.settings.offset).speed(0.05).range(-30.0..=30.0).fixed_decimals(2).prefix("offset ").suffix(" s"))
-                    .on_hover_text("positive shows lines earlier");
+                ui.add(egui::DragValue::new(&mut kept.offset).speed(0.05).range(-30.0..=30.0).fixed_decimals(2).prefix("offset ").suffix(" s"))
+                    .on_hover_text("positive shows lines earlier; kept for this track");
+                if kept.offset != 0.0 && ui.small_button("↺").on_hover_text("offset back to 0").clicked() {
+                    kept.offset = 0.0;
+                }
                 ui.add(egui::DragValue::new(&mut self.settings.font_size).speed(0.2).range(9.0..=48.0).fixed_decimals(0).prefix("size "));
             });
+            self.store.set(&path, kept);
         } else {
             ui.add(egui::DragValue::new(&mut self.settings.font_size).speed(0.2).range(9.0..=48.0).fixed_decimals(0).prefix("size "));
         }
@@ -540,7 +733,7 @@ impl LyricsPanel {
 
         let (current, follow_to) = match lyrics {
             Lyrics::Synced(timed) => {
-                let t = player.position() + self.settings.offset as f64;
+                let t = player.position() + self.offset();
                 let cur = timed.partition_point(|(s, _)| *s <= t).checked_sub(1);
                 // Keep the current line a little above the middle.
                 let target = cur.map_or(0.0, |i| tops[i] + galleys[i].size().y / 2.0 - rect.height() * 0.42);
@@ -588,7 +781,7 @@ impl LyricsPanel {
                 && p.y < top + height + gap
             {
                 // Jump to the clicked line.
-                player.seek((timed[i].0 - self.settings.offset as f64).max(0.0));
+                player.seek((timed[i].0 - self.offset()).max(0.0));
                 self.manual = None;
             }
             painter.galley_with_override_text_color(pos2(x, top), g, color);
@@ -640,7 +833,9 @@ mod tests {
     #[ignore]
     fn online_services_answer() {
         let t = Track { title: Some("Bohemian Rhapsody".into()), artist: Some("Queen".into()), duration: Some(355.0), ..Default::default() };
-        for (name, service) in SERVICES {
+        for p in Provider::ALL {
+            let Some(service) = p.service() else { continue };
+            let name = p.label();
             let text = service(&t, "Bohemian Rhapsody").unwrap().unwrap_or_else(|| panic!("{name}: nothing"));
             let l = parse_lrc(&text).unwrap_or_else(|| panic!("{name}: not timed"));
             assert!(l.iter().any(|(_, s)| s.contains("real life")), "{name}: {:?}", &l[..3]);
@@ -648,6 +843,7 @@ mod tests {
         }
         let jp = Track { title: Some("夜に駆ける".into()), artist: Some("YOASOBI".into()), duration: Some(261.0), ..Default::default() };
         assert!(netease(&jp, "夜に駆ける").unwrap().is_some());
+        assert!(lrclib(&jp, "夜に駆ける").unwrap().is_some());
     }
 
     #[test]
@@ -657,17 +853,54 @@ mod tests {
         let song = dir.join("song.flac");
         std::fs::write(dir.join("song.lrc"), "[00:00.10]from file").unwrap();
         let t = Track { path: song.clone(), embedded: Some("embedded words".into()), ..Default::default() };
-        match lookup(&t, false, false) {
+        match lookup(&t, None, false, false) {
             State::Found(Lyrics::Synced(l), src) => assert_eq!((l[0].1.as_str(), src.as_str()), ("from file", "song.lrc")),
             s => panic!("{s:?}"),
         }
-        std::fs::remove_file(dir.join("song.lrc")).unwrap();
-        match lookup(&t, false, false) {
+        // Picking a provider skips the ones before it.
+        match lookup(&t, Some(Provider::Embedded), false, false) {
             State::Found(Lyrics::Plain(p), src) => assert_eq!((p.as_str(), src.as_str()), ("embedded words", "embedded")),
             s => panic!("{s:?}"),
         }
+        match lookup(&t, Some(Provider::NetEase), false, false) {
+            State::Missing(why) => assert_eq!(why, "online is off"),
+            s => panic!("{s:?}"),
+        }
+        std::fs::remove_file(dir.join("song.lrc")).unwrap();
+        match lookup(&t, None, false, false) {
+            State::Found(Lyrics::Plain(p), src) => assert_eq!((p.as_str(), src.as_str()), ("embedded words", "embedded")),
+            s => panic!("{s:?}"),
+        }
+        match lookup(&t, Some(Provider::File), false, false) {
+            State::Missing(why) => assert_eq!(why, "no .lrc or .txt next to the track"),
+            s => panic!("{s:?}"),
+        }
         let none = Track { path: song, ..Default::default() };
-        assert!(matches!(lookup(&none, false, false), State::Missing(_)));
+        assert!(matches!(lookup(&none, None, false, false), State::Missing(_)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keeps_provider_and_offset_per_track() {
+        let (a, b) = (Path::new("/music/a.flac"), Path::new("/music/b.flac"));
+        let mut store = LyricsStore::default();
+        store.set(a, TrackLyrics { provider: Some(Provider::Lrclib), offset: 0.5 });
+        assert_eq!(store.get(a), TrackLyrics { provider: Some(Provider::Lrclib), offset: 0.5 });
+        assert_eq!(store.get(b), TrackLyrics::default());
+        let revision = store.revision;
+        store.set(a, store.get(a));
+        assert_eq!(store.revision, revision, "setting the same doesn't count as a change");
+
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(json.contains("\"lrclib\""), "{json}");
+        let back: LyricsStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.get(a), store.get(a));
+
+        // Back at the defaults, the track goes.
+        store.set(a, TrackLyrics::default());
+        assert!(store.tracks.is_empty());
+        // Settings saved by earlier versions (with a global offset) still load.
+        let old: LyricsSettings = serde_json::from_str(r#"{"online":false,"offset":1.5,"font_size":20.0}"#).unwrap();
+        assert_eq!(old, LyricsSettings { online: false, font_size: 20.0 });
     }
 }

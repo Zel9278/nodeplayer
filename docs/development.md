@@ -160,7 +160,7 @@ NODEPLAYER_DEBUG_PLUGIN="[FORMAT:]<path>|<class name>" nodeplayer  # add the plu
 | `src/midi.rs` | MIDI In / Out (ALSA sequencer) and MIDI Monitor nodes |
 | `src/midifile/` | MIDI file parser and player from midi-blocks-rs (indexing, parallel scan, packed events, tempo map, the player thread) |
 | `src/midi_song.rs` | MIDI files as songs: the Player node's MIDI section, and placing the player's timed messages on their frames |
-| `src/lyrics.rs` | Lyrics panel: LRC parsing, local files and tags, NetEase / Kugou lookup and cache, the scrolling view |
+| `src/lyrics.rs` | Lyrics panel: LRC parsing, the providers (local files and tags, NetEase / Kugou / LRCLIB lookup and cache), each track's provider and offset, the scrolling view |
 | `src/csynth_node.rs` | CSynth instrument node: loading sounds in the background, MIDI to csynth on its clock, sustain pedal |
 | `src/about.rs` | The About window: author, license, and the crate list (`assets/licenses.json`) with the test that makes it |
 | `src/player.rs` | Decoder thread (symphonia, or FFmpeg for what it can't open, then rubato) feeding a ring buffer that the source node reads, and the rate shift (a variable-ratio sinc resampler on the audio thread); MIDI files go to `midi_song.rs` instead |
