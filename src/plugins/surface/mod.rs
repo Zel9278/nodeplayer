@@ -120,6 +120,8 @@ pub struct EditorPointer {
     pub kind: PointerKind,
     /// Bit 0 primary, bit 1 secondary, bit 2 middle.
     pub buttons: u8,
+    /// Click sequence on a button transition; zero for motion, wheel, or cancellation.
+    pub click_count: u8,
 }
 
 impl EditorPointer {
@@ -131,6 +133,13 @@ impl EditorPointer {
             "invalid editor pointer coordinates"
         );
         ensure!(self.buttons & !7 == 0, "invalid editor buttons");
+        ensure!(
+            matches!(self.kind, PointerKind::Down(_) | PointerKind::Up(_)) || self.click_count == 0,
+            "click count on a non-button editor event"
+        );
+        if matches!(self.kind, PointerKind::Down(_)) {
+            ensure!(self.click_count > 0, "editor mouse-down has no click count");
+        }
         match self.kind {
             PointerKind::Down(b) | PointerKind::Up(b) => {
                 ensure!((1..=3).contains(&b), "invalid editor pointer button")
@@ -306,6 +315,7 @@ mod tests {
         frame.rgba.pop();
         assert!(frame.validate().is_err());
         let mut event = EditorPointer {
+            click_count: 1,
             position: [0.0, 0.0],
             kind: PointerKind::Down(1),
             buttons: 1,
@@ -315,6 +325,13 @@ mod tests {
         assert!(event.validate().is_err());
         event.position[0] = 0.0;
         event.kind = PointerKind::Up(4);
+        assert!(event.validate().is_err());
+        event.kind = PointerKind::Down(1);
+        event.click_count = 0;
+        assert!(event.validate().is_err());
+        event.click_count = 2;
+        assert!(event.validate().is_ok());
+        event.kind = PointerKind::Move;
         assert!(event.validate().is_err());
     }
 }

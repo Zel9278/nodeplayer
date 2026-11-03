@@ -173,8 +173,11 @@ native input coordinates through zoom and viewport clamping, and dismisses inter
 popups on Escape, outside clicks, focus loss, or hiding the graph.
 
 Pointer messages carry the same worker generation and editor token. Adjacent moves
-may coalesce; button and wheel barriers preserve order. Transitions retry through
-queue pressure without blocking the parent. If even the bounded transition queue
+may coalesce; button and wheel barriers preserve order. Click counts are determined
+in the parent before worker queueing, so control delays cannot turn double-clicks
+into single clicks or combine separate clicks. macOS and Windows use their system
+double-click settings. Transitions retry through queue pressure without blocking
+the parent. If even the bounded transition queue
 fills, a reserved close slot closes the editor rather than leaving a stuck drag.
 Keyboard/IME, drag-and-drop, blocking native menus, and unattached popup windows are
 not bridged. Attached child popup capture is currently macOS-only. The source

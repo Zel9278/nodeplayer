@@ -865,6 +865,7 @@ mod tests {
             generation,
             token: 3,
             event: EditorPointer {
+                click_count: if matches!(kind, PointerKind::Down(_) | PointerKind::Up(_)) { 1 } else { 0 },
                 position: [x, 20.0],
                 kind,
                 buttons,

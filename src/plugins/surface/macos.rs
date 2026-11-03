@@ -326,7 +326,7 @@ impl NativeCapture {
         };
         let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
             event_type, location, NSEventModifierFlags::empty(),
-            unsafe { CACurrentMediaTime() }, target_window.windowNumber(), None, 0, 1,
+            unsafe { CACurrentMediaTime() }, target_window.windowNumber(), None, 0, isize::from(pointer.click_count),
             if matches!(pointer.kind, PointerKind::Up(_)) { 0.0 } else { 1.0 },
         ).context("AppKit could not create forwarded pointer event")?;
         if matches!(pointer.kind, PointerKind::Down(_)) {

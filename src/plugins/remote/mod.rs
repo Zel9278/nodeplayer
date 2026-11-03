@@ -619,6 +619,7 @@ mod tests {
 
     fn pointer(kind: PointerKind, x: f64, buttons: u8) -> EditorPointer {
         EditorPointer {
+            click_count: if matches!(kind, PointerKind::Down(_) | PointerKind::Up(_)) { 1 } else { 0 },
             position: [x, 90.0],
             kind,
             buttons,
@@ -659,6 +660,29 @@ mod tests {
         assert!(
             matches!(rx.try_recv().unwrap(), Command::Pointer { event, .. } if matches!(event.kind, PointerKind::Up(1)) && event.position[0] == 40.0 && event.buttons == 0)
         );
+        assert!(editor.pending_input.is_empty());
+    }
+
+    #[test]
+    fn double_click_counts_survive_queue_pressure_and_serialization() {
+        let (mut editor, rx) = captured_editor(1);
+        editor.core.tx.try_send(Command::Poll).unwrap();
+        for (kind, count, buttons) in [
+            (PointerKind::Down(1), 1, 1), (PointerKind::Up(1), 1, 0),
+            (PointerKind::Down(1), 2, 1), (PointerKind::Up(1), 2, 0),
+        ] {
+            let mut event = pointer(kind, 10.0, buttons);
+            event.click_count = count;
+            editor.pointer(event).unwrap();
+        }
+        assert!(matches!(rx.try_recv().unwrap(), Command::Poll));
+        for expected in [1, 1, 2, 2] {
+            editor.flush_input().unwrap();
+            let encoded = serde_json::to_vec(&rx.try_recv().unwrap()).unwrap();
+            let Command::Pointer { event, .. } = serde_json::from_slice::<Command>(&encoded).unwrap() else { panic!("expected pointer") };
+            assert_eq!(event.click_count, expected);
+            event.validate().unwrap();
+        }
         assert!(editor.pending_input.is_empty());
     }
 

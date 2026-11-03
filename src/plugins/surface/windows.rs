@@ -241,10 +241,16 @@ impl NativeCapture {
                 }
                 PointerKind::Move => (WM_MOUSEMOVE, WPARAM(flags as usize), coordinates(point)),
                 PointerKind::Down(button) => {
-                    let message = match button {
-                        1 => WM_LBUTTONDOWN,
-                        2 => WM_RBUTTONDOWN,
-                        3 => WM_MBUTTONDOWN,
+                    // Win32 replaces the second down with DBLCLK for opted-in classes.
+                    let double = event.click_count.is_multiple_of(2)
+                        && GetClassLongW(target, GCL_STYLE) & CS_DBLCLKS.0 != 0;
+                    let message = match (button, double) {
+                        (1, false) => WM_LBUTTONDOWN,
+                        (1, true) => WM_LBUTTONDBLCLK,
+                        (2, false) => WM_RBUTTONDOWN,
+                        (2, true) => WM_RBUTTONDBLCLK,
+                        (3, false) => WM_MBUTTONDOWN,
+                        (3, true) => WM_MBUTTONDBLCLK,
                         _ => bail!("unsupported editor pointer button"),
                     };
                     self.drag_target = Some(target);
@@ -419,6 +425,7 @@ mod tests {
         timer_ticks: Cell<u32>,
         down: Cell<bool>,
         clicks: Cell<u32>,
+        double_clicks: Cell<u32>,
         last_move: Cell<Option<(i32, i32)>>,
         last_up: Cell<Option<(i32, i32)>>,
     }
@@ -484,8 +491,11 @@ mod tests {
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
-                    WM_LBUTTONDOWN => {
+                    WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                         state.down.set(true);
+                        if message == WM_LBUTTONDBLCLK {
+                            state.double_clicks.set(state.double_clicks.get() + 1);
+                        }
                         return LRESULT(0);
                     }
                     WM_MOUSEMOVE => {
@@ -517,6 +527,7 @@ mod tests {
         let registered = REGISTERED.get_or_init(|| unsafe {
             let module = GetModuleHandleW(None).map_err(|error| error.to_string())?;
             let class = WNDCLASSW {
+                style: CS_DBLCLKS,
                 hInstance: HINSTANCE(module.0),
                 lpfnWndProc: Some(window_proc),
                 lpszClassName: CLASS,
@@ -535,6 +546,7 @@ mod tests {
             timer_ticks: Cell::new(0),
             down: Cell::new(false),
             clicks: Cell::new(0),
+            double_clicks: Cell::new(0),
             last_move: Cell::new(None),
             last_up: Cell::new(None),
         });
@@ -606,16 +618,19 @@ mod tests {
         );
 
         capture.pointer(EditorPointer {
+            click_count: 1,
             position: [157.0, 78.0],
             kind: PointerKind::Down(1),
             buttons: 1,
         })?;
         capture.pointer(EditorPointer {
+            click_count: 0,
             position: [-10.0, -20.0],
             kind: PointerKind::Move,
             buttons: 1,
         })?;
         capture.pointer(EditorPointer {
+            click_count: 1,
             position: [-10.0, -20.0],
             kind: PointerKind::Up(1),
             buttons: 0,
@@ -627,6 +642,16 @@ mod tests {
             Some((-82, -78)),
             "drag release stays with its original descendant"
         );
+        for kind in [PointerKind::Down(1), PointerKind::Up(1)] {
+            capture.pointer(EditorPointer {
+                position: [157.0, 78.0],
+                kind,
+                buttons: u8::from(matches!(kind, PointerKind::Down(_))),
+                click_count: 2,
+            })?;
+        }
+        assert_eq!(grandchild.state.clicks.get(), 2);
+        assert_eq!(grandchild.state.double_clicks.get(), 1);
         assert_eq!(child.state.clicks.get(), 0);
         assert_eq!(sibling.state.clicks.get(), 0);
         let after = capture.capture((720, 440))?;
@@ -740,11 +765,13 @@ mod tests {
             );
 
             capture.pointer(EditorPointer {
+                click_count: 1,
                 position: [40.0, 40.0],
                 kind: PointerKind::Down(1),
                 buttons: 1,
             })?;
             capture.pointer(EditorPointer {
+                click_count: 1,
                 position: [40.0, 40.0],
                 kind: PointerKind::Up(1),
                 buttons: 0,
