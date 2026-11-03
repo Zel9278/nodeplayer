@@ -41,10 +41,11 @@ The editor image, frame, and overlapping UI zoom and move together without chang
 plugin's own UI scale. A private native host keeps the editor rendering without opening
 a second desktop window. Closing the graph editor also destroys its native host.
 Clicks and drags are forwarded to the source, and Alt+wheel forwards wheel input.
+Pointer events retain Shift, Control and Alt/Option state for modified and fine drags.
 On macOS and Windows, double-clicks follow the system's timing settings.
-On macOS, attached child popup windows appear over the graph and accept pointer input,
+On macOS and Windows, attached or owned popup windows appear over the graph and accept pointer input,
 including outside the editor image. Escape or a click outside closes the popup.
-Keyboard/IME, drag-and-drop, blocking native menus, and unattached popup windows are
+Keyboard/IME, drag-and-drop, blocking native menus, and unrelated popup windows are
 not forwarded; use **Pop out** for those interactions. Capture can
 fail for some GPU-rendered editors. The flag also works with
 `--experimental-plugin-isolation`, where capture and native input stay in the worker.

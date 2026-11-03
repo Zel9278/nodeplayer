@@ -316,3 +316,133 @@ impl Drop for HostWindow {
         let _ = self.conn.flush();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an X11 display with Shape"]
+    fn embedded_parent_is_ready_for_another_connection_and_rejects_invalid_xids() -> Result<()> {
+        let (plugin, screen) = x11rb::connect(None)?;
+        let root = plugin.setup().roots[screen].root;
+        let parent = plugin.generate_id()?;
+        plugin
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                parent,
+                root,
+                CAPTURE_ORIGIN,
+                CAPTURE_ORIGIN,
+                256,
+                160,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new().override_redirect(1),
+            )?
+            .check()?;
+        plugin.map_window(parent)?.check()?;
+
+        for iteration in 0..64 {
+            let host = HostWindow::create(
+                Placement::Embedded(parent as usize),
+                128,
+                96,
+                "parent readiness",
+                false,
+            )?;
+            let child = plugin.generate_id()?;
+            plugin
+                .create_window(
+                    x11rb::COPY_DEPTH_FROM_PARENT,
+                    child,
+                    root,
+                    CAPTURE_ORIGIN,
+                    CAPTURE_ORIGIN,
+                    128,
+                    96,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    x11rb::COPY_FROM_PARENT,
+                    &CreateWindowAux::new().override_redirect(1),
+                )?
+                .check()?;
+            // No synchronization on the host connection belongs here: create must
+            // finish its server round trip before a plugin receives this parent.
+            plugin.reparent_window(child, host.id, 0, 0)?.check()?;
+            plugin.map_window(child)?.check()?;
+            assert_eq!(plugin.query_tree(child)?.reply()?.parent, host.id);
+            let size = (128 + iteration, 96 + iteration);
+            host.resize(size.0, size.1);
+            let clip = super::super::PxRect {
+                x: 0,
+                y: 0,
+                w: size.0,
+                h: size.1,
+            };
+            host.place(Some(&Spot {
+                clip,
+                origin: (0, 0),
+                visible: vec![clip],
+            }));
+            host.conn.get_input_focus()?.reply()?;
+            let geometry = plugin.get_geometry(host.id)?.reply()?;
+            assert_eq!(
+                (u32::from(geometry.width), u32::from(geometry.height)),
+                size
+            );
+            assert_eq!(
+                plugin.get_window_attributes(child)?.reply()?.map_state,
+                MapState::VIEWABLE
+            );
+            host.place(None);
+            host.conn.get_input_focus()?.reply()?;
+            assert_eq!(
+                plugin.get_window_attributes(child)?.reply()?.map_state,
+                MapState::UNVIEWABLE
+            );
+            let container = host.container.context("embedded container")?;
+            let id = host.id;
+            drop(host);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while plugin.get_geometry(container)?.reply().is_ok() {
+                ensure!(
+                    Instant::now() < deadline,
+                    "embedded container was not destroyed"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(plugin.get_geometry(id)?.reply().is_err());
+            assert!(plugin.get_geometry(child)?.reply().is_err());
+        }
+        let missing = plugin.generate_id()?;
+        let error = HostWindow::create(
+            Placement::Embedded(missing as usize),
+            128,
+            96,
+            "invalid parent",
+            false,
+        )
+        .err()
+        .context("nonexistent parent was accepted")?;
+        assert!(format!("{error:#}").contains("create the embedded editor container"));
+        assert!(
+            HostWindow::create(Placement::Embedded(0), 128, 96, "empty parent", false).is_err()
+        );
+        if let Ok(out_of_range) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(
+                HostWindow::create(
+                    Placement::Embedded(out_of_range),
+                    128,
+                    96,
+                    "invalid XID",
+                    false
+                )
+                .is_err()
+            );
+        }
+        plugin.destroy_window(parent)?.check()?;
+        Ok(())
+    }
+}

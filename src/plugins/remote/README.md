@@ -172,7 +172,8 @@ lease and total pixel budget. The parent draws them above the graph, preserves t
 native input coordinates through zoom and viewport clamping, and dismisses interactive
 popups on Escape, outside clicks, focus loss, or hiding the graph.
 
-Pointer messages carry the same worker generation and editor token. Adjacent moves
+Pointer messages carry the same worker generation and editor token, plus the modifier
+state recorded before queueing (including Shift for fine drags). Adjacent moves
 may coalesce; button and wheel barriers preserve order. Click counts are determined
 in the parent before worker queueing, so control delays cannot turn double-clicks
 into single clicks or combine separate clicks. macOS and Windows use their system
@@ -180,14 +181,20 @@ double-click settings. Transitions retry through queue pressure without blocking
 the parent. If even the bounded transition queue
 fills, a reserved close slot closes the editor rather than leaving a stuck drag.
 Keyboard/IME, drag-and-drop, blocking native menus, and unattached popup windows are
-not bridged. Attached child popup capture is currently macOS-only. The source
+not bridged. Attached child popup capture is supported on macOS; Windows also captures
+owned native popup windows. The source
 stays alive until the graph editor closes. Windows and X11 capture hosts remain mapped
 outside the desktop; the AppKit host and its child popups are ordered transparently
 without activating the source host. Plugins can observe a visible parent without
 showing a second desktop window. GPU editor capture
 remains renderer-dependent.
-Capture uses CPU readback/upload at approximately 30 updates per second; this is not
-a production bandwidth/latency qualification.
+Capture service targets 240 updates per second and skips missed deadlines after a stall.
+The worker services native UI/capture between control requests without an 8 ms blocking
+readiness poll. Parent repaint requests use the same target while a captured editor is
+visible. CPU readback/upload, plugin rendering, viewport scheduling and the display can
+each limit the measured rate; capture publication and parent delivery do not establish
+compositor presentation FPS. A blank startup that produces no usable image within five
+seconds exposes a capture error.
 
 Windows pumps bounded native message batches and initializes COM. macOS requires
 captured mode for isolation, initializes AppKit in the worker, and pumps events even
