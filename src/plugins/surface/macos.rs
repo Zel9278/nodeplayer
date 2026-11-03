@@ -1,10 +1,11 @@
 //! Bitmap capture and pointer delivery for an editor NSView owned by this process.
 //!
 //! The owning editor must outlive this adapter, including its native descendants;
-//! drop the adapter before destroying the plugin GUI. The source window stays
-//! visible. AppKit bitmap drawing does not universally capture plugin-owned
-//! Metal/OpenGL surfaces. Pointer delivery is experimental: plugin tracking loops,
-//! keyboard/IME, and separate popup windows require additional hosting support.
+//! drop the adapter before destroying the plugin GUI. The native view may live in
+//! a window that was never ordered on screen. AppKit bitmap drawing does not
+//! universally capture plugin-owned Metal/OpenGL surfaces. Pointer delivery is
+//! experimental: plugin tracking loops, keyboard/IME, and separate popup windows
+//! require additional hosting support.
 
 use std::{cell::Cell, ffi::c_void};
 
@@ -16,7 +17,7 @@ use objc2_app_kit::{
     NSBitmapImageRep, NSButton, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSView,
     NSWindow,
 };
-use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSDictionary, NSPoint, NSRect, NSRunLoop};
+use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSDictionary, NSPoint, NSRect};
 
 use super::{EditorFrame, EditorPointer, PointerKind};
 
@@ -107,7 +108,14 @@ pub fn pump_worker_app() -> Result<()> {
         };
         app.sendEvent(&event);
     }
-    NSRunLoop::currentRunLoop().runMode_beforeDate(mode, &date);
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: u8) -> i32;
+    }
+    // Expired NSRunLoop deadlines and zero-duration polls can starve native timers.
+    // Give them a bounded turn even when the user generates no input events.
+    // SAFETY: NSDefaultRunLoopMode is a toll-free bridged CFString on this main thread.
+    unsafe { CFRunLoopRunInMode((mode as *const objc2_foundation::NSString).cast(), 0.001, 1) };
     app.updateWindows();
     Ok(())
 }
@@ -149,10 +157,6 @@ impl NativeCapture {
             .view
             .window()
             .context("native editor left its window")?;
-        ensure!(
-            window.isVisible(),
-            "native capture source window is not visible"
-        );
         let bounds = self.view.bounds();
         let backing_scale: f64 = unsafe { msg_send![&*window, backingScaleFactor] };
         ensure!(

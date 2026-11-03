@@ -36,6 +36,8 @@ pub enum Placement {
     Window,
     /// A child of the given window (the app's main window).
     Embedded(WindowId),
+    /// A native rendering host for a captured graph editor, never shown to the user.
+    CaptureSource,
 }
 
 /// Pixel rectangle in the parent window's coordinates.

@@ -289,7 +289,7 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                         surface = None;
                         editor = None;
                         let source = instance.open_editor(if captured {
-                            Placement::Window
+                            Placement::CaptureSource
                         } else {
                             placement
                         })?;
