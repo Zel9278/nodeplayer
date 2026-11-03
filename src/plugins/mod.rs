@@ -298,6 +298,12 @@ pub trait Instance {
         bail!("{} can't restart", self.info().name)
     }
     fn save_state(&self) -> Option<Vec<u8>>;
+    /// Start an autosave checkpoint without waiting for an external host.
+    fn request_state_snapshot(&mut self) {}
+    /// Whether the requested checkpoint still needs time on the external host.
+    fn state_snapshot_pending(&self) -> bool { false }
+    /// Latest completed state for autosave. Local formats serialize on their owner thread.
+    fn cached_state(&self) -> Option<Vec<u8>> { self.save_state() }
     fn load_state(&mut self, data: &[u8]) -> Result<()>;
 
     /// A native editor window the plugin draws itself.

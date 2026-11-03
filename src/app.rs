@@ -312,6 +312,7 @@ pub struct App {
     /// Engine slots of plugins whose editors open once the window exists.
     pending_editors: Vec<u32>,
     last_save: Instant,
+    autosave_started: Option<Instant>,
     shut_down: bool,
     preset_name: String,
     presets: Vec<String>,
@@ -425,6 +426,7 @@ impl App {
             ffmpeg: (crate::av::available(), Instant::now()),
             pending_editors: Vec::new(),
             last_save: Instant::now(),
+            autosave_started: None,
             shut_down: false,
             preset_name: String::new(),
             presets: session::list_presets(),
@@ -783,6 +785,29 @@ impl App {
         self.with_root(|app| save_nodes(&app.snarl, None))
     }
 
+    fn poll_autosave(&mut self) {
+        if self.autosave_started.is_none() && self.last_save.elapsed() > AUTOSAVE {
+            for node in every_node(&mut self.snarl, &mut self.outer) {
+                if let NodeKind::Plugin(plugin) = &mut node.kind {
+                    plugin.instance.request_state_snapshot();
+                }
+            }
+            self.autosave_started = Some(Instant::now());
+            log::debug!("autosave checkpoint requests queued");
+        }
+        if let Some(started) = self.autosave_started {
+            let pending = every_node(&mut self.snarl, &mut self.outer).into_iter().any(|node| {
+                matches!(&node.kind, NodeKind::Plugin(plugin) if plugin.instance.state_snapshot_pending())
+            });
+            if !pending || started.elapsed() >= Duration::from_secs(3) {
+                log::debug!(
+                    "autosave checkpoints ready after {} ms; timed_out={pending}",
+                    started.elapsed().as_millis()
+                );
+                self.persist_session(StateCapture::Cached);
+            }
+        }
+    }
     /// Replaces the graph with `g`. Nodes that can't be recreated (a plugin that's gone) are
     /// skipped along with their wires.
     fn load_graph(&mut self, g: &SavedGraph) {
@@ -1030,9 +1055,15 @@ impl App {
     }
 
     fn save_session(&mut self) {
+        self.persist_session(StateCapture::Fresh);
+    }
+
+    fn persist_session(&mut self, capture: StateCapture) {
+        let started = Instant::now();
+        let audio_before = self.engine.as_ref().map(|engine| engine.sample_clock());
         let status = self.player.status();
         let s = Session {
-            graph: Some(self.save_graph()),
+            graph: Some(self.with_root(|app| save_nodes_with_state(&app.snarl, None, capture))),
             library_root: None,
             library_sources: self.library.sources.clone(),
             library_sort: self.library.sort,
@@ -1051,6 +1082,8 @@ impl App {
         };
         session::save_session(&s);
         self.last_save = Instant::now();
+        self.autosave_started = None;
+        log::debug!("session save mode={capture:?} ui_ms={} audio_before={audio_before:?} audio_after={:?}", started.elapsed().as_millis(), self.engine.as_ref().map(|engine| engine.sample_clock()));
     }
 
     fn next_track(&mut self) {
@@ -1619,9 +1652,7 @@ impl App {
                 }
             }
         }
-        if self.last_save.elapsed() > AUTOSAVE {
-            self.save_session();
-        }
+        self.poll_autosave();
 
         if let Some(rx) = &self.scan_rx {
             let msgs: Vec<_> = rx.try_iter().collect();
@@ -2881,7 +2912,17 @@ fn drop_nodes(mut snarl: Snarl<GraphNode>) {
 
 /// The nodes of `snarl` in `only` (all when `None`), groups with what's inside them, and the
 /// wires between them.
+#[derive(Clone, Copy, Debug)]
+enum StateCapture {
+    Fresh,
+    Cached,
+}
+
 fn save_nodes(snarl: &Snarl<GraphNode>, only: Option<&HashSet<NodeId>>) -> SavedGraph {
+    save_nodes_with_state(snarl, only, StateCapture::Fresh)
+}
+
+fn save_nodes_with_state(snarl: &Snarl<GraphNode>, only: Option<&HashSet<NodeId>>, capture: StateCapture) -> SavedGraph {
     let mut index = HashMap::new();
     let mut nodes = Vec::new();
     for (id, n) in snarl.nodes_ids_data() {
@@ -2906,12 +2947,15 @@ fn save_nodes(snarl: &Snarl<GraphNode>, only: Option<&HashSet<NodeId>>) -> Saved
             NodeKind::MidiOut(m) => SavedKind::MidiOut { port: m.want.clone() },
             NodeKind::MidiMonitor(_) => SavedKind::MidiMonitor,
             NodeKind::CSynth(c) => SavedKind::CSynth(c.settings.clone()),
-            NodeKind::Group(g) => SavedKind::Group { name: g.name.clone(), graph: save_nodes(&g.snarl, None) },
+            NodeKind::Group(g) => SavedKind::Group { name: g.name.clone(), graph: save_nodes_with_state(&g.snarl, None, capture) },
             NodeKind::GroupIn => SavedKind::GroupIn,
             NodeKind::GroupOut => SavedKind::GroupOut,
             NodeKind::Plugin(p) => {
                 let _g = guard::enter(&p.tag);
-                let state = p.instance.save_state().map(|b| BASE64.encode(b));
+                let state = match capture {
+                    StateCapture::Fresh => p.instance.save_state(),
+                    StateCapture::Cached => p.instance.cached_state(),
+                }.map(|b| BASE64.encode(b));
                 let info = p.info();
                 SavedKind::Plugin {
                     format: info.format,

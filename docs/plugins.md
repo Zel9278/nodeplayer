@@ -65,6 +65,8 @@ actual lookahead still changes its audio delay. Manual bypass keeps its immediat
 behavior when graph delay compensation is off. Wires to pins that no longer exist are
 dropped. An isolated worker's latency and parameter metadata updates
 preserve the existing audio bridge and its history.
+Session autosave waits for isolated state snapshots across UI ticks, so the periodic save
+does not pause the interface. Explicit preset saves still request fresh plugin state.
 
 On macOS, popped-out editors use regular primary windows that participate in Stage Manager,
 Spaces and window cycling. CLAP host resizes update the parent window before calling the

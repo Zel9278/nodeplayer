@@ -126,6 +126,7 @@ pub fn create(info: &PluginInfo, sr: f32, max_block: usize) -> Result<Created> {
             editor: true,
             status: "pending".into(),
             revision: 0,
+            pending_checkpoint: None,
         }),
         processor,
     })
@@ -142,6 +143,7 @@ struct RemoteInstance {
     editor: bool,
     status: String,
     revision: u64,
+    pending_checkpoint: Option<u64>,
 }
 impl Drop for RemoteInstance {
     fn drop(&mut self) {
@@ -249,6 +251,26 @@ impl Instance for RemoteInstance {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         cached
+    }
+    fn request_state_snapshot(&mut self) {
+        let sequence = self.core.snapshot.try_lock().ok().map(|s| s.checkpoint_seq);
+        self.pending_checkpoint = sequence.filter(|_| self.core.enqueue(Command::Checkpoint));
+    }
+    fn state_snapshot_pending(&self) -> bool {
+        self.pending_checkpoint.is_some_and(|sequence| {
+            self.core
+                .snapshot
+                .try_lock()
+                .map_or(true, |s| s.checkpoint_seq <= sequence)
+        })
+    }
+    fn cached_state(&self) -> Option<Vec<u8>> {
+        self.core
+            .snapshot
+            .try_lock()
+            .ok()
+            .and_then(|s| s.state.clone())
+            .or_else(|| self.state.clone())
     }
     fn load_state(&mut self, data: &[u8]) -> Result<()> {
         if data.len() > protocol::MAX_STATE {
@@ -895,6 +917,82 @@ mod tests {
         assert!(!editor.idle());
         assert!(editor.capture_error().unwrap().contains("editor closed"));
         assert!(matches!(rx.try_recv().unwrap(), Command::Poll));
+    }
+
+    #[test]
+    fn autosave_checkpoint_polls_without_waiting_and_reads_the_completed_snapshot() {
+        use crate::plugins::Format;
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let core = Arc::new(Core {
+            stop: AtomicBool::new(false),
+            recover: AtomicBool::new(false),
+            ready: AtomicBool::new(true),
+            map: Mutex::new(None),
+            surface: Mutex::new(None),
+            close_editor: AtomicU64::new(0),
+            retired: Mutex::new(Vec::new()),
+            cursor: AtomicU64::new(0),
+            algorithm_latency: AtomicU32::new(0),
+            instrument: AtomicBool::new(false),
+            underruns: AtomicU64::new(0),
+            overflows: AtomicU64::new(0),
+            next_editor: AtomicU64::new(2),
+            tx,
+            snapshot: Mutex::new(Snapshot {
+                metadata: None,
+                state: None,
+                checkpoint_seq: 0,
+                displays: HashMap::new(),
+                status: "running".into(),
+                revision: 0,
+            }),
+        });
+        let mut instance = RemoteInstance {
+            info: PluginInfo {
+                format: Format::Clap,
+                id: "autosave".into(),
+                name: "autosave".into(),
+                vendor: String::new(),
+                category: String::new(),
+                path: std::path::PathBuf::new(),
+            },
+            core: core.clone(),
+            params: Vec::new(),
+            values: HashMap::new(),
+            displays: HashMap::new(),
+            state: Some(vec![1]),
+            latency: 0,
+            midi: (false, false),
+            editor: false,
+            status: "running".into(),
+            revision: 0,
+            pending_checkpoint: None,
+        };
+        instance.request_state_snapshot();
+        assert!(matches!(rx.try_recv().unwrap(), Command::Checkpoint));
+        assert!(instance.state_snapshot_pending());
+        assert_eq!(instance.cached_state(), Some(vec![1]));
+        {
+            let snapshot = instance.core.snapshot.lock().unwrap();
+            assert!(instance.state_snapshot_pending());
+            assert_eq!(instance.cached_state(), Some(vec![1]));
+            drop(snapshot);
+        }
+        {
+            let mut snapshot = instance.core.snapshot.lock().unwrap();
+            snapshot.state = Some(vec![2]);
+            snapshot.checkpoint_seq += 1;
+        }
+        assert!(!instance.state_snapshot_pending());
+        // The serializer can use the new blob before the next instance.idle() adoption.
+        assert_eq!(instance.cached_state(), Some(vec![2]));
+        rx.try_iter().for_each(drop);
+        for _ in 0..4 {
+            instance.core.tx.try_send(Command::Poll).unwrap();
+        }
+        instance.request_state_snapshot();
+        assert!(!instance.state_snapshot_pending());
+        assert_eq!(instance.cached_state(), Some(vec![2]));
     }
 
     #[test]

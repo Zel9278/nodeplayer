@@ -151,6 +151,10 @@ retried by normal UI updates. Captured button transitions have a separate bounde
 retry queue. Supervisor coalescing never crosses state/editor lifecycle barriers.
 Explicit saves wait up to 3 s for a checkpoint sequence acknowledgement, including an
 unchanged state blob; timeout falls back to the cache, which may initially be absent.
+Session autosave requests all isolated checkpoints together and polls their acknowledgements
+on subsequent UI ticks. After completion, or the same 3 s deadline, it serializes the latest
+completed snapshots without waiting on the UI thread. Preset saves and shutdown still use
+fresh checkpoints. Local-format state APIs remain on their owning thread.
 Requested load blobs are preserved through faults. Automatic checkpoint interval is
 30 s. Parameter journal is replayed after cached state on manual restart; a requested
 load or acknowledged state checkpoint clears the preceding parameter overlay. This is
