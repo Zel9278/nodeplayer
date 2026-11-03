@@ -902,6 +902,7 @@ mod tests {
         );
 
         capture.pointer(EditorPointer {
+            timestamp_ms: None,
             modifiers: 0,
             click_count: 1,
             position: [157.0, 78.0],
@@ -928,6 +929,7 @@ mod tests {
             "private editor must not retain physical mouse capture"
         );
         capture.pointer(EditorPointer {
+            timestamp_ms: None,
             modifiers: 0,
             click_count: 0,
             position: [-10.0, -20.0],
@@ -935,6 +937,7 @@ mod tests {
             buttons: 1,
         })?;
         capture.pointer(EditorPointer {
+            timestamp_ms: None,
             modifiers: 0,
             click_count: 1,
             position: [-10.0, -20.0],
@@ -950,6 +953,7 @@ mod tests {
         );
         for kind in [PointerKind::Down(1), PointerKind::Up(1)] {
             capture.pointer(EditorPointer {
+                timestamp_ms: None,
                 modifiers: 0,
                 position: [157.0, 78.0],
                 kind,
@@ -1003,6 +1007,7 @@ mod tests {
         graph.state.capture_changes.set(0);
         for _ in 0..3 {
             capture.pointer(EditorPointer {
+                timestamp_ms: None,
                 modifiers: 0,
                 position: [40.0, 40.0],
                 kind: PointerKind::Down(1),
@@ -1015,6 +1020,7 @@ mod tests {
             // A popup can retain native capture after its opening button is released.
             // Selecting a row may call SetCapture again on that same logical owner.
             capture.pointer(EditorPointer {
+                timestamp_ms: None,
                 modifiers: 0,
                 position: [40.0, 40.0],
                 kind: PointerKind::Down(1),
@@ -1028,6 +1034,7 @@ mod tests {
             );
             for x in [30.0, 50.0, -300.0, 600.0] {
                 capture.pointer(EditorPointer {
+                    timestamp_ms: None,
                     modifiers: 0,
                     position: [x, -50.0],
                     kind: PointerKind::Move,
@@ -1038,6 +1045,7 @@ mod tests {
                 assert_eq!(unsafe { GetCapture() }, graph.hwnd);
             }
             capture.pointer(EditorPointer {
+                timestamp_ms: None,
                 modifiers: 0,
                 position: [600.0, -50.0],
                 kind: PointerKind::Cancel,
@@ -1061,6 +1069,7 @@ mod tests {
             graph.state.last_cancel.get()
         );
         capture.pointer(EditorPointer {
+            timestamp_ms: None,
             modifiers: 0,
             position: [40.0, 40.0],
             kind: PointerKind::Down(1),
@@ -1081,6 +1090,7 @@ mod tests {
         );
         assert_eq!(child.state.capture_changes.get(), 1);
         capture.pointer(EditorPointer {
+            timestamp_ms: None,
             modifiers: 0,
             position: [40.0, 40.0],
             kind: PointerKind::Down(1),
@@ -1100,6 +1110,7 @@ mod tests {
             "real native focus loss must reach the plugin"
         );
         capture.pointer(EditorPointer {
+            timestamp_ms: None,
             modifiers: 0,
             position: [40.0, 40.0],
             kind: PointerKind::Down(1),
@@ -1173,6 +1184,7 @@ mod tests {
             );
         }
         capture.pointer(EditorPointer {
+            timestamp_ms: None,
             modifiers: 0,
             position: [50.0, 60.0],
             kind: PointerKind::Down(1),
@@ -1181,6 +1193,7 @@ mod tests {
         })?;
         assert!(popup.state.down.get());
         capture.pointer(EditorPointer {
+            timestamp_ms: None,
             modifiers: 0,
             position: [50.0, 60.0],
             kind: PointerKind::Up(1),
@@ -1278,6 +1291,7 @@ mod tests {
             );
 
             capture.pointer(EditorPointer {
+                timestamp_ms: None,
                 modifiers: 0,
                 click_count: 1,
                 position: [40.0, 40.0],
@@ -1285,6 +1299,7 @@ mod tests {
                 buttons: 1,
             })?;
             capture.pointer(EditorPointer {
+                timestamp_ms: None,
                 modifiers: 0,
                 click_count: 1,
                 position: [40.0, 40.0],

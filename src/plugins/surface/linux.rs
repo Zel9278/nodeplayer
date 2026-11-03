@@ -25,7 +25,48 @@ pub struct NativeCapture {
     pixmap: Option<Pixmap>,
     masks: [u32; 3],
     pointer_target: Option<Window>,
+    pointer_buttons: u8,
     timestamp_window: Option<Window>,
+    event_clock: Option<EventClock>,
+}
+
+/// The source and worker share CLOCK_MONOTONIC, while X11 carries 32-bit display time.
+/// Calibrate against a real display event, then retain source intervals through IPC.
+struct EventClock {
+    local_anchor: u64,
+    server_anchor: Timestamp,
+    last: Option<(u64, Timestamp)>,
+}
+
+impl EventClock {
+    fn map(&mut self, source: Option<u64>, local_now: u64, server_now: Timestamp) -> Timestamp {
+        let source = source.filter(|source| {
+            *source <= local_now && local_now - source <= i32::MAX as u64
+        });
+        let candidate = source.map_or(server_now, |source| {
+            self.server_anchor.wrapping_add(source.wrapping_sub(self.local_anchor) as u32)
+        });
+        // Timestamps later than this observed display time are not valid for grabs.
+        // Also reject a source stamp from a different clock rather than inventing time.
+        let mut mapped = if candidate.wrapping_sub(server_now) as i32 > 0 {
+            server_now
+        } else {
+            candidate
+        };
+        if let Some((last_local, last_server)) = self.last
+            && local_now.saturating_sub(last_local) <= i32::MAX as u64
+            && (mapped.wrapping_sub(last_server) as i32) < 0
+        {
+            mapped = last_server;
+        }
+        // Zero means CurrentTime in requests, but is a literal zero in XSendEvent.
+        // At the 49-day wrap, use the most recent nonzero display time instead.
+        if mapped == x11rb::CURRENT_TIME {
+            mapped = Timestamp::MAX;
+        }
+        self.last = Some((local_now, mapped));
+        mapped
+    }
 }
 
 impl NativeCapture {
@@ -92,7 +133,9 @@ impl NativeCapture {
             pixmap: None,
             masks,
             pointer_target: None,
+            pointer_buttons: 0,
             timestamp_window: None,
+            event_clock: None,
         };
         let timestamp_window = capture.conn.generate_id()?;
         capture.timestamp_window = Some(timestamp_window);
@@ -113,6 +156,12 @@ impl NativeCapture {
             )?
             .check()
             .context("create editor input timestamp helper")?;
+        let server = capture.server_time()?;
+        capture.event_clock = super::pointer_timestamp_ms().map(|local_anchor| EventClock {
+            local_anchor,
+            server_anchor: server,
+            last: None,
+        });
         capture.rename_pixmap()?;
         capture.conn.flush()?;
         Ok(capture)
@@ -149,11 +198,14 @@ impl NativeCapture {
                 Event::PropertyNotify(event)
                     if event.window == helper && event.atom == u32::from(AtomEnum::WM_NAME) =>
                 {
-                    ensure!(
-                        event.time != x11rb::CURRENT_TIME,
-                        "editor input timestamp is zero"
-                    );
-                    return Ok(event.time);
+                    // At the timestamp wrap, zero is a real tick but would become
+                    // CurrentTime in a toolkit request. The preceding tick remains
+                    // valid and is never in the display's future.
+                    return Ok(if event.time == x11rb::CURRENT_TIME {
+                        Timestamp::MAX
+                    } else {
+                        event.time
+                    });
                 }
                 Event::Error(error) => bail!("editor input X11 request failed: {error:?}"),
                 Event::DestroyNotify(event) if event.window == self.window => {
@@ -163,6 +215,14 @@ impl NativeCapture {
             }
         }
         bail!("editor input timestamp notification missing")
+    }
+
+    fn pointer_time(&mut self, source: Option<u64>) -> Result<Timestamp> {
+        let server_now = self.server_time()?;
+        Ok(match (&mut self.event_clock, super::pointer_timestamp_ms()) {
+            (Some(clock), Some(local_now)) => clock.map(source, local_now, server_now),
+            _ => server_now,
+        })
     }
 
     fn rename_pixmap(&mut self) -> Result<()> {
@@ -317,6 +377,7 @@ impl NativeCapture {
                 // A plugin can destroy its dragged child. Do not keep routing later
                 // gestures to that stale XID after reporting the failed delivery.
                 self.pointer_target = None;
+                self.pointer_buttons = 0;
                 return Err(error);
             }
         };
@@ -331,9 +392,20 @@ impl NativeCapture {
                 state |= mask;
             }
         }
+        let time = self.pointer_time(event.timestamp_ms)?;
         match event.kind {
             PointerKind::Cancel => {
+                // X11 has no generic pointer-cancel message. Deliver the missing
+                // releases to the held child before abandoning its native gesture.
+                let mut held = button_mask(self.pointer_buttons) | state;
+                for button in 1..=3 {
+                    if self.pointer_buttons & (1 << (button - 1)) != 0 {
+                        self.send_button(target, local, root, (x_button(button)?, false), held, time)?;
+                        held = KeyButMask::from(u16::from(held) & !u16::from(button_bit(button)));
+                    }
+                }
                 self.pointer_target = None;
+                self.pointer_buttons = 0;
             }
             PointerKind::Move => {
                 self.conn
@@ -345,7 +417,7 @@ impl NativeCapture {
                             response_type: MOTION_NOTIFY_EVENT,
                             detail: Motion::NORMAL,
                             sequence: 0,
-                            time: self.server_time()?,
+                            time,
                             root: self.root,
                             event: target,
                             child: x11rb::NONE,
@@ -370,7 +442,8 @@ impl NativeCapture {
                 } else {
                     state | bit
                 };
-                self.send_button(target, local, root, detail, pressed, state)?;
+                self.send_button(target, local, root, (detail, pressed), state, time)?;
+                self.pointer_buttons = event.buttons;
                 if pressed {
                     self.pointer_target = Some(target);
                 } else if event.buttons == 0 {
@@ -389,8 +462,8 @@ impl NativeCapture {
                     let detail = if delta > 0.0 { positive } else { negative };
                     let steps = (delta.abs() / 40.0).ceil().clamp(1.0, 12.0) as usize;
                     for _ in 0..steps {
-                        self.send_button(target, local, root, detail, true, state)?;
-                        self.send_button(target, local, root, detail, false, state)?;
+                        self.send_button(target, local, root, (detail, true), state, time)?;
+                        self.send_button(target, local, root, (detail, false), state, time)?;
                     }
                 }
             }
@@ -419,10 +492,11 @@ impl NativeCapture {
         target: Window,
         local: (i16, i16),
         root: (i16, i16),
-        detail: u8,
-        pressed: bool,
+        transition: (u8, bool),
         state: KeyButMask,
+        time: Timestamp,
     ) -> Result<()> {
+        let (detail, pressed) = transition;
         self.conn
             .send_event(
                 false,
@@ -440,7 +514,7 @@ impl NativeCapture {
                     },
                     detail,
                     sequence: 0,
-                    time: self.server_time()?,
+                    time,
                     root: self.root,
                     event: target,
                     child: x11rb::NONE,
@@ -530,6 +604,57 @@ fn button_mask(buttons: u8) -> KeyButMask {
 mod tests {
     use super::*;
 
+    #[test]
+    fn source_times_preserve_click_intervals_through_delivery_stalls() {
+        let mut clock = EventClock {
+            local_anchor: 1000,
+            server_anchor: 50_000,
+            last: None,
+        };
+        let first = clock.map(Some(1050), 1100, 50_100);
+        let second = clock.map(Some(1250), 1900, 50_900);
+        assert_eq!(first, 50_050);
+        assert_eq!(second.wrapping_sub(first), 200);
+        assert_eq!(clock.map(None, 1950, 50_950), 50_950);
+    }
+
+    #[test]
+    fn mapped_times_bound_future_stale_and_reordered_input() {
+        let mut clock = EventClock {
+            local_anchor: 1000,
+            server_anchor: 50_000,
+            last: None,
+        };
+        assert_eq!(clock.map(Some(1100), 1200, 50_200), 50_100);
+        assert_eq!(clock.map(Some(1090), 1201, 50_201), 50_100);
+        assert_eq!(clock.map(Some(u64::MAX), 1300, 50_300), 50_300);
+        // A clock anchor just ahead of a later server observation cannot issue
+        // a future native timestamp, even for an otherwise plausible source time.
+        assert_eq!(clock.map(Some(1500), 1600, 50_400), 50_400);
+        let old = 1300 + i32::MAX as u64 + 1;
+        assert_eq!(clock.map(Some(1300), old, 60_000), 60_000);
+    }
+
+    #[test]
+    fn source_time_mapping_orders_correctly_across_display_wrap() {
+        let mut clock = EventClock {
+            local_anchor: 1000,
+            server_anchor: Timestamp::MAX - 20,
+            last: None,
+        };
+        let first = clock.map(Some(1005), 1010, Timestamp::MAX - 10);
+        let second = clock.map(Some(1030), 1040, 19);
+        assert_eq!(second.wrapping_sub(first), 25);
+        assert_eq!(clock.map(Some(1029), 1041, 20), second);
+        let mut zero = EventClock {
+            local_anchor: 1000,
+            server_anchor: Timestamp::MAX - 1,
+            last: None,
+        };
+        assert_eq!(zero.map(Some(1002), 1003, 1), Timestamp::MAX);
+        assert_eq!(zero.map(Some(1003), 1004, 2), 1);
+    }
+
     fn pack_channel(value: u8, mask: u32) -> u32 {
         let shift = mask.trailing_zeros();
         let max = u64::from(mask >> shift);
@@ -572,6 +697,7 @@ mod tests {
             (PointerKind::Up(1), 0, 2),
         ] {
             capture.pointer(EditorPointer {
+                timestamp_ms: None,
                 position: [32.0, 24.0],
                 kind,
                 buttons,
@@ -611,6 +737,99 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(source.conn.get_geometry(source.window)?.reply()?.width, 640);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an isolated X11 display with XComposite; briefly grabs its pointer"]
+    fn delayed_clicks_keep_source_intervals_and_native_grab_timestamps() -> Result<()> {
+        let source = Source::new()?;
+        source.conn.change_window_attributes(
+            source.window,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE),
+        )?.check()?;
+        let mut capture = NativeCapture::new(source.window as usize)?;
+        let mut times = Vec::new();
+        let started = std::time::Instant::now();
+        for (index, kind) in [
+            PointerKind::Down(1), PointerKind::Up(1),
+            PointerKind::Down(1), PointerKind::Up(1),
+        ].into_iter().enumerate() {
+            let timestamp_ms = super::super::pointer_timestamp_ms();
+            if index == 2 {
+                // The second press was already recorded by the parent, but the
+                // worker cannot deliver it until after a native double-click timeout.
+                std::thread::sleep(std::time::Duration::from_millis(550));
+            }
+            capture.pointer(EditorPointer {
+                timestamp_ms,
+                position: [32.0, 24.0],
+                kind,
+                buttons: u8::from(matches!(kind, PointerKind::Down(_))),
+                modifiers: 0,
+                click_count: if index >= 2 { 2 } else { 1 },
+            })?;
+            source.conn.get_input_focus()?.reply()?;
+            for _ in 0..256 {
+                let Some(event) = source.conn.poll_for_event()? else { break };
+                match event {
+                    Event::ButtonPress(event) => {
+                        times.push(event.time);
+                        let grabbed = source.conn.grab_pointer(
+                            false, source.window, EventMask::NO_EVENT,
+                            GrabMode::ASYNC, GrabMode::ASYNC, x11rb::NONE, x11rb::NONE, event.time,
+                        )?.reply()?;
+                        assert_eq!(grabbed.status, GrabStatus::SUCCESS,
+                            "source timestamps must remain usable by a native toolkit's grab");
+                    }
+                    Event::ButtonRelease(event) => {
+                        source.conn.ungrab_pointer(event.time)?.check()?;
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        assert!(started.elapsed() >= std::time::Duration::from_millis(550));
+        assert_eq!(times.len(), 2);
+        assert!(times[1].wrapping_sub(times[0]) < 150,
+            "worker delay replaced source click timing: {times:?}");
+        assert!(times.iter().all(|time| *time != x11rb::CURRENT_TIME));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an X11 display with XComposite"]
+    fn cancel_releases_held_native_buttons_before_abandoning_the_target() -> Result<()> {
+        let source = Source::new()?;
+        source.conn.change_window_attributes(
+            source.window,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE),
+        )?.check()?;
+        let mut capture = NativeCapture::new(source.window as usize)?;
+        for (kind, buttons, click_count) in [
+            (PointerKind::Down(1), 1, 1),
+            (PointerKind::Down(2), 3, 1),
+            (PointerKind::Cancel, 0, 0),
+        ] {
+            capture.pointer(EditorPointer {
+                timestamp_ms: super::super::pointer_timestamp_ms(),
+                position: [32.0, 24.0], kind, buttons, modifiers: 0, click_count,
+            })?;
+        }
+        source.conn.get_input_focus()?.reply()?;
+        let mut released = Vec::new();
+        while let Some(event) = source.conn.poll_for_event()? {
+            if let Event::ButtonRelease(event) = event {
+                released.push((event.detail, event.state));
+            }
+        }
+        assert_eq!(released.len(), 2);
+        assert_eq!(released[0].0, 1);
+        assert_eq!(released[0].1, KeyButMask::BUTTON1 | KeyButMask::BUTTON3);
+        assert_eq!(released[1], (3, KeyButMask::BUTTON3));
+        assert!(capture.pointer_target.is_none());
+        assert_eq!(capture.pointer_buttons, 0);
         Ok(())
     }
 
@@ -826,6 +1045,7 @@ mod tests {
         assert_eq!(pixel(&frame, 80, 90), [0, 204, 136, 255]);
         for event in [
             EditorPointer {
+                timestamp_ms: None,
                 modifiers: 0,
                 click_count: 1,
                 position: [80.0, 90.0],
@@ -833,6 +1053,7 @@ mod tests {
                 buttons: 1,
             },
             EditorPointer {
+                timestamp_ms: None,
                 modifiers: 0,
                 click_count: 0,
                 position: [300.0, 90.0],
@@ -840,6 +1061,7 @@ mod tests {
                 buttons: 1,
             },
             EditorPointer {
+                timestamp_ms: None,
                 modifiers: 0,
                 click_count: 1,
                 position: [300.0, 90.0],
@@ -1073,6 +1295,7 @@ mod tests {
                 host.conn.map_window(child)?.check()?;
                 for (kind, buttons) in [(PointerKind::Down(1), 1), (PointerKind::Up(1), 0)] {
                     capture.pointer(EditorPointer {
+                        timestamp_ms: None,
                         modifiers: 0,
                         click_count: if matches!(kind, PointerKind::Down(_) | PointerKind::Up(_)) {
                             1
