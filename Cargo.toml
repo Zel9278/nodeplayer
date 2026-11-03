@@ -40,6 +40,8 @@ symphonia = { version = "0.6", features = ["all"] }
 vst3 = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 ab_glyph = "0.2"
+# The font reader egui uses: lines fallback faces up with the same metrics it lays text out by.
+skrifa = "0.44"
 # FFmpeg's Windows builds come as zip files.
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 

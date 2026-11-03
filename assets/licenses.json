@@ -198,6 +198,12 @@
       "repository": "https://github.com/serde-rs/json"
     },
     {
+      "name": "skrifa",
+      "version": "0.44.0",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/googlefonts/fontations"
+    },
+    {
       "name": "souvlaki",
       "version": "0.8.3",
       "license": "MIT",

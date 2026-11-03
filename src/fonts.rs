@@ -116,5 +116,71 @@ pub fn install(ctx: &egui::Context) {
     };
     add(&mut defs, "cjk-sans", sans, FontFamily::Proportional, false);
     add(&mut defs, "cjk-mono", mono, FontFamily::Monospace, false);
+    align_baseline(&mut defs, &FontFamily::Proportional, "cjk-sans");
+    align_baseline(&mut defs, &FontFamily::Monospace, "cjk-mono");
     ctx.set_fonts(defs);
+}
+
+/// egui places a glyph from a fallback face by centring that face's line box on the primary
+/// face's, not by matching baselines. A face whose ascent and descent are balanced differently
+/// (Yu Gothic next to Segoe UI, say) then sits above or below the Latin text around it; shift
+/// it down by the difference so the baselines meet.
+fn align_baseline(defs: &mut FontDefinitions, family: &FontFamily, name: &str) {
+    let Some(primary) = defs.families.get(family).and_then(|list| list.first()) else {
+        return;
+    };
+    let (Some(p), Some(f)) = (
+        defs.font_data.get(primary).and_then(|d| vertical_metrics(d)),
+        defs.font_data.get(name).and_then(|d| vertical_metrics(d)),
+    ) else {
+        return;
+    };
+    let shift = baseline_shift(p, f);
+    log::debug!("{name}: baseline shifted by {shift:.3} em");
+    if let Some(data) = defs.font_data.get_mut(name) {
+        std::sync::Arc::make_mut(data).tweak.y_offset_factor = shift;
+    }
+}
+
+/// Ascent and line height (ascent + descent + line gap) in ems, as egui reads them.
+fn vertical_metrics(data: &FontData) -> Option<(f32, f32)> {
+    use skrifa::MetadataProvider;
+    let font = skrifa::FontRef::from_index(&data.font, data.index).ok()?;
+    let m = font.metrics(skrifa::instance::Size::unscaled(), skrifa::instance::LocationRef::default());
+    let em = f32::from(m.units_per_em);
+    (em > 0.0).then(|| (m.ascent / em, (m.ascent - m.descent + m.leading) / em))
+}
+
+/// How far down (in ems) to move a fallback face so its baseline meets the primary face's.
+/// egui puts the fallback baseline at `its ascent + (primary height - its height) / 2`.
+fn baseline_shift((p_ascent, p_height): (f32, f32), (f_ascent, f_height): (f32, f32)) -> f32 {
+    p_ascent - (f_ascent + 0.5 * (p_height - f_height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shift_lands_the_fallback_baseline_on_the_primary_one() {
+        // Segoe UI-like primary; a CJK face with a tall line box and a shallower ascent.
+        let primary = (1.08, 1.33);
+        let fallback = (0.88, 1.32);
+        let shift = baseline_shift(primary, fallback);
+        let baseline = fallback.0 + 0.5 * (primary.1 - fallback.1) + shift;
+        assert!((baseline - primary.0).abs() < 1e-6);
+        assert!(shift > 0.0, "a lower ascent in a similar line box must move down");
+        assert_eq!(baseline_shift(primary, primary), 0.0);
+    }
+
+    #[test]
+    fn system_faces_have_readable_metrics() {
+        // Only meaningful where the desktop has the faces; skip quietly elsewhere.
+        for pattern in ["sans-serif", "sans-serif:lang=ja"] {
+            let Some((path, index)) = fc_match(pattern) else { continue };
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let data = FontData { index, ..FontData::from_owned(bytes) };
+            let (ascent, height) = vertical_metrics(&data).expect("metrics");
+            assert!(ascent > 0.0 && height > ascent, "{pattern}: {ascent} {height}");        }
+    }
 }
