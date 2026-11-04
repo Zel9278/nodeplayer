@@ -223,6 +223,9 @@ completed drawables. The adapter applies only to that source layer, keeps at mos
 readback in flight, and retires its native registration before plugin GUI teardown.
 Mixed GPU/CPU view layouts and custom Metal-layer subclasses still need another adapter.
 Capture service targets 240 updates per second and skips missed deadlines after a stall.
+The parent retains the last uploaded root and popup pixels, so identical captures do
+not repeat color conversion or texture upload. Geometry, input state and capture-health
+timestamps still advance; graph transforms never depend on a new capture.
 The worker services native UI/capture between control requests without an 8 ms blocking
 readiness poll. On Windows, native message pumping yields after 2 ms or 256 messages,
 whichever comes first, once the current callback returns. A self-invalidating editor
