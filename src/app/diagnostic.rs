@@ -16,6 +16,7 @@ pub(super) struct GuiDiagnostic {
     next_telemetry: Instant,
     step_requested: bool,
     pub(super) editor_zoom: Option<f32>,
+    max_ui_frame_interval: f32,
 }
 
 impl App {
@@ -60,6 +61,7 @@ impl App {
             next_telemetry: Instant::now(),
             step_requested: false,
             editor_zoom: None,
+            max_ui_frame_interval: 0.0,
         });
     }
 
@@ -67,6 +69,9 @@ impl App {
         let Some(mut diagnostic) = self.diagnostic.take() else {
             return;
         };
+        diagnostic.max_ui_frame_interval = diagnostic
+            .max_ui_frame_interval
+            .max(ctx.input(|input| input.unstable_dt));
         if diagnostic.run.outcome().is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             self.diagnostic = Some(diagnostic);
@@ -169,8 +174,13 @@ impl App {
                     "bridge_underruns":counters.map(|c| c.0),
                     "bridge_overflows":counters.map(|c| c.1),
                     "editor_frame_stats":editor.and_then(|editor| editor.frame_stats()),
+                    // Counts UI frames, independently of native editor image delivery.
+                    // This is application progress, not compositor presentation timing.
+                    "ui_frame":ctx.cumulative_frame_nr(),
+                    "max_ui_frame_interval_seconds":diagnostic.max_ui_frame_interval,
                 }),
             )?;
+            diagnostic.max_ui_frame_interval = 0.0;
             diagnostic.next_telemetry = Instant::now() + Duration::from_millis(250);
         }
         if let Some(id) = diagnostic.node {
