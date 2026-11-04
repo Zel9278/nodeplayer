@@ -163,9 +163,9 @@ Requested load blobs are preserved through faults. Automatic checkpoint interval
 load or acknowledged state checkpoint clears the preceding parameter overlay. This is
 still not a transactional state/parameter version history.
 The known diagnostic fixture's fault trigger params >=100 are not replayed on
-manual restart. This deterministic fixture-only behavior is enabled by the parent's
-`NODEPLAYER_DIAGNOSTIC_WORKER=1` marker (diagnostic scenario runs only); production
-workers do not receive this special journal handling.
+manual restart. This deterministic fixture-only behavior requires an active diagnostic
+run in the parent and the reserved fixture ID. Production plugins retain all journaled
+parameters, including IDs >=100.
 
 No infinite automatic restart loop: recovery is explicit. A changed sample rate
 requires creating a new remote instance; metadata-only proxy restart does not
