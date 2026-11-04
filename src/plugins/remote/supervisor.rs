@@ -30,14 +30,11 @@ pub(super) fn run(core: Arc<Core>, rx: Receiver<Command>, info: PluginInfo, sr: 
     while !core.stop.load(Ordering::Acquire) {
         generation = generation.wrapping_add(1);
         core.recover.store(false, Ordering::Release);
-        // Diagnostics deliberately reserve fixture parameters >=100 as fault triggers.
-        // The worker is a separate process, so this gate is based on the shared
-        // diagnostic scenario signal (also inherited as an explicit env marker below).
-        if std::env::var_os("NODEPLAYER_DIAGNOSTIC_WORKER").is_some()
-            && info.id == "org.nodeplayer.test-fixture"
-        {
-            journal.retain(|id, _| *id < 100);
-        }
+        omit_diagnostic_fault_triggers(
+            &mut journal,
+            crate::diagnostics::active().is_some(),
+            &info.id,
+        );
         status(&core, "starting");
         clear_surface(&core, None);
         let result = session(&core, &rx, &info, sr, generation, &mut journal);
@@ -74,6 +71,17 @@ pub(super) fn run(core: Arc<Core>, rx: Receiver<Command>, info: PluginInfo, sr: 
             break;
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+fn omit_diagnostic_fault_triggers(
+    journal: &mut HashMap<u32, f64>,
+    diagnostic: bool,
+    plugin_id: &str,
+) {
+    // Only diagnostic fixtures reserve >=100 for one-shot fault triggers. The
+    // parent's active run is authoritative; the env marker is child-only.
+    if diagnostic && plugin_id == "org.nodeplayer.test-fixture" {
+        journal.retain(|id, _| *id < 100);
     }
 }
 fn reclaim(core: &Core) {
@@ -949,6 +957,26 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn diagnostic_recovery_drops_only_reserved_fixture_fault_parameters() {
+        let parameters =
+            HashMap::from([(7, 0.25), (99, 0.5), (100, 1.0), (102, 1.0), (4096, 0.75)]);
+        for (diagnostic, plugin_id, filtered) in [
+            (true, "org.nodeplayer.test-fixture", true),
+            (false, "org.nodeplayer.test-fixture", false),
+            (true, "org.vendor.production-plugin", false),
+            (false, "org.vendor.production-plugin", false),
+        ] {
+            let mut journal = parameters.clone();
+            omit_diagnostic_fault_triggers(&mut journal, diagnostic, plugin_id);
+            if filtered {
+                assert_eq!(journal, HashMap::from([(7, 0.25), (99, 0.5)]));
+            } else {
+                assert_eq!(journal, parameters);
+            }
+        }
     }
 
     #[test]
