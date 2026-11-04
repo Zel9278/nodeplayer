@@ -2,6 +2,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=src/plugins/surface/metal_capture.mm");
+    println!("cargo:rerun-if-changed=src/plugins/surface/cocoa_input.mm");
     let src = "third_party/ysfx";
     println!("cargo:rerun-if-changed={src}/sources");
     println!("cargo:rerun-if-changed={src}/include");
@@ -56,6 +57,7 @@ fn main() {
         cc::Build::new()
             .cpp(true)
             .file("src/plugins/surface/metal_capture.mm")
+            .file("src/plugins/surface/cocoa_input.mm")
             .flag("-std=c++17")
             .flag("-fobjc-arc")
             .opt_level(2)

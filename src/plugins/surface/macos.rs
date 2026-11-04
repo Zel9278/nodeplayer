@@ -7,7 +7,7 @@
 //! experimental: blocking plugin tracking loops and keyboard/IME require additional
 //! hosting support. Attached child popup windows are captured as separate images.
 
-use std::{cell::Cell, ffi::c_void};
+use std::{cell::Cell, ffi::c_void, ptr::NonNull};
 
 use anyhow::{Context, Result, ensure};
 use objc2::rc::Retained;
@@ -135,6 +135,47 @@ struct PopupCapture {
     bitmap: BitmapCache,
 }
 
+unsafe extern "C" {
+    fn np_capture_input_create(view: *mut c_void) -> *mut c_void;
+    fn np_capture_input_begin(handle: *mut c_void) -> *mut c_void;
+    fn np_capture_input_end(previous: *mut c_void);
+    fn np_capture_input_destroy(handle: *mut c_void);
+}
+
+struct CaptureInput(NonNull<c_void>);
+
+impl CaptureInput {
+    fn new(view: &NSView) -> Result<Self> {
+        // SAFETY: the retained source is live on its AppKit owner thread.
+        NonNull::new(unsafe {
+            np_capture_input_create((view as *const NSView).cast_mut().cast())
+        })
+        .map(Self)
+        .context("cannot initialize captured editor input")
+    }
+
+    fn enter(&self) -> InputScope {
+        // SAFETY: this owner and any nested scope outlive the guard on the main thread.
+        InputScope(unsafe { np_capture_input_begin(self.0.as_ptr()) })
+    }
+}
+
+impl Drop for CaptureInput {
+    fn drop(&mut self) {
+        // SAFETY: this adapter owns the handle and drops it before the source view.
+        unsafe { np_capture_input_destroy(self.0.as_ptr()) };
+    }
+}
+
+struct InputScope(*mut c_void);
+
+impl Drop for InputScope {
+    fn drop(&mut self) {
+        // SAFETY: scopes are restored in stack order, including on early returns.
+        unsafe { np_capture_input_end(self.0) };
+    }
+}
+
 pub struct NativeCapture {
     // Detach the drawable adapter before releasing the source or its descendants.
     metal: Option<MetalCapture>,
@@ -142,6 +183,7 @@ pub struct NativeCapture {
     popups: Vec<PopupCapture>,
     drag_target: Option<Retained<NSView>>,
     button_target: Option<Retained<NSButton>>,
+    input: CaptureInput,
     view: Retained<NSView>,
 }
 
@@ -174,6 +216,7 @@ impl NativeCapture {
             popups: Vec::new(),
             drag_target: None,
             button_target: None,
+            input: CaptureInput::new(&view)?,
             view,
         })
     }
@@ -233,6 +276,7 @@ impl NativeCapture {
 
     pub fn pointer(&mut self, pointer: EditorPointer) -> Result<()> {
         MainThreadMarker::new().context("native input must run on the main thread")?;
+        let _input = self.input.enter();
         ensure!(
             pointer.position.iter().all(|v| v.is_finite()),
             "non-finite pointer coordinates"
