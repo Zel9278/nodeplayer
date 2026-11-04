@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject};
-use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send, sel};
+use objc2::{AllocAnyThread, define_class, msg_send, sel};
 use objc2_foundation::{NSObject, NSString};
 
 /// `kCoreEventClass` ('aevt'), `kAEOpenDocuments` ('odoc') and `keyDirectObject` ('----').
@@ -96,7 +96,8 @@ fn files(event: &AnyObject) -> Vec<PathBuf> {
         (1..=count)
             .filter_map(|i| {
                 let item: Option<Retained<AnyObject>> = msg_send![&*list, descriptorAtIndex: i];
-                path_of(&item?)
+                let item = item?;
+                path_of(&item)
             })
             .collect()
     }
@@ -105,7 +106,8 @@ fn files(event: &AnyObject) -> Vec<PathBuf> {
 fn path_of(descriptor: &AnyObject) -> Option<PathBuf> {
     unsafe {
         let url: Option<Retained<AnyObject>> = msg_send![descriptor, fileURLValue];
-        let path: Option<Retained<NSString>> = msg_send![&*url?, path];
+        let url = url?;
+        let path: Option<Retained<NSString>> = msg_send![&*url, path];
         Some(PathBuf::from(path?.to_string()))
     }
 }
