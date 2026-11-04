@@ -121,8 +121,15 @@ health evidence and the requested outcome separately from the authoritative resu
 
 ## Releases
 
-Pushing a `v*` tag builds every platform and publishes a GitHub release with the archives
-(`.tar.gz` for Linux and macOS, `.zip` for Windows), each with the license and the README.
+Pushing a `v*` tag builds every platform and publishes a GitHub release with the archives,
+each with the license and the README: `.tar.gz` for Linux, `.zip` for Windows, and for macOS
+a `.zip` of `nodeplayer.app`, made (and ad-hoc signed) by `packaging/macos/make-app.sh` from
+`packaging/macos/Info.plist`. Every macOS CI run builds the app, so the bundle is checked too.
+
+Windows release builds are window apps: they open no terminal. Started from a terminal, they
+write their log there. Debug builds keep their console. Only one nodeplayer runs per user
+(see `src/instance.rs`); `--new-instance` starts another, for example a development build
+while the installed one runs.
 
 ## Licenses of what nodeplayer is built from
 

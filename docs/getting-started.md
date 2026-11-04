@@ -10,15 +10,18 @@ is nothing to install: the archive holds the program, the license and the README
 |---|---|---|
 | Linux x86_64 | `nodeplayer-<version>-linux-x86_64.tar.gz` | Needs ALSA, X11 or XWayland, and fontconfig, which desktop systems have. Sound goes through ALSA, so PipeWire and PulseAudio work through their ALSA plugins. |
 | Windows x86_64 | `nodeplayer-<version>-windows-x86_64.zip` | Runs on its own (the C++ runtime is built in). Sound goes through WASAPI. |
-| macOS (Apple silicon) | `nodeplayer-<version>-macos-arm64.tar.gz` | Not signed: see below. |
-| macOS (Intel) | `nodeplayer-<version>-macos-x86_64.tar.gz` | Not signed: see below. |
+| macOS (Apple silicon) | `nodeplayer-<version>-macos-arm64.zip` | `nodeplayer.app`; not signed: see below. |
+| macOS (Intel) | `nodeplayer-<version>-macos-x86_64.zip` | `nodeplayer.app`; not signed: see below. |
 
-On macOS, the first start is blocked because the program isn't signed. Allow it in System
-Settings → Privacy & Security, or remove the quarantine flag once:
+On macOS, move `nodeplayer.app` to Applications (or anywhere). The first start is blocked
+because the app isn't signed. Allow it in System Settings → Privacy & Security, or remove the
+quarantine flag once:
 
 ```sh
-xattr -d com.apple.quarantine nodeplayer
+xattr -dr com.apple.quarantine nodeplayer.app
 ```
+
+The app is listed under "Open With" for audio, video and MIDI files in the Finder.
 
 To build from source instead, see [Development](development.md).
 
@@ -27,11 +30,16 @@ To build from source instead, see [Development](development.md).
 Start `nodeplayer` (`nodeplayer.exe` on Windows). It can also be given a file or a folder:
 
 ```sh
-nodeplayer song.flac   # starts with the file loaded
-nodeplayer ~/Music     # starts with the folder in the library
+nodeplayer song.flac   # adds the file to the library and plays it
+nodeplayer ~/Music     # starts with the folder as the library
 ```
 
-Dropping files and folders onto the window does the same.
+Dropping files and folders onto the window, or opening them with nodeplayer from a file
+manager, adds them to the library (files as single tracks) and plays the first file.
+
+Only one nodeplayer runs at a time. Starting it again, or opening files with it from a file
+manager, hands the files to the one running, which comes to the front. To start a separate
+one anyway, use `nodeplayer --new-instance`.
 
 ### FFmpeg
 

@@ -85,7 +85,7 @@ Settings → Activity Privacy → "Share my activity" is on.
 ### macOS says the app can't be opened
 
 The builds aren't signed. Allow it in System Settings → Privacy & Security, or run
-`xattr -d com.apple.quarantine nodeplayer` once.
+`xattr -dr com.apple.quarantine nodeplayer.app` once.
 
 ### Starting over
 
