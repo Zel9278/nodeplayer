@@ -726,11 +726,12 @@ struct PreparedBypass {
     midi: MidiBuf,
 }
 
-/// A hosted plugin's processor with a bypass switch (parameter 0). `new` retains legacy
-/// immediate bypass; `with_latency` opts into prepared, constantly warmed delayed dry.
+/// A hosted plugin's processor with a bypass switch (parameter 0) and a warm restart
+/// fallback. Manual bypass follows the selected graph-compensation mode.
 pub struct PluginProc {
     inner: Option<Box<dyn Processor>>,
     bypass: bool,
+    delay_manual_bypass: bool,
     delayed: Option<PreparedBypass>,
     cursor: u64,
     midi_cleanup: bool,
@@ -739,18 +740,6 @@ pub struct PluginProc {
 }
 
 impl PluginProc {
-    pub fn new(inner: Box<dyn Processor>) -> Self {
-        Self {
-            inner: Some(inner),
-            bypass: false,
-            delayed: None,
-            cursor: 0,
-            midi_cleanup: false,
-            inner_cleanup: false,
-            resume_midi: MidiBuf::new(),
-        }
-    }
-
     /// Control-thread construction only. total includes algorithm + bridge; MIDI inherits
     /// bridge only. Instrument bypass is silent. The inner processor keeps running while
     /// bypassed so remote FIFOs and plugin timelines do not become stale.
@@ -763,6 +752,7 @@ impl PluginProc {
         Ok(Self {
             inner: Some(inner),
             bypass: false,
+            delay_manual_bypass: true,
             cursor: 0,
             midi_cleanup: false,
             inner_cleanup: false,
@@ -778,6 +768,18 @@ impl PluginProc {
             }),
         })
     }
+    /// Keep restart audio on the plugin's timeline without changing legacy manual bypass.
+    /// Graph delay compensation and a warm restart fallback are independent choices.
+    pub fn with_restart_latency(
+        inner: Box<dyn Processor>,
+        total_latency: u32,
+        bridge_latency: u32,
+        instrument: bool,
+    ) -> anyhow::Result<Self> {
+        let mut processor = Self::with_latency(inner, total_latency, bridge_latency, instrument)?;
+        processor.delay_manual_bypass = false;
+        Ok(processor)
+    }
 }
 
 impl Processor for PluginProc {
@@ -790,12 +792,19 @@ impl Processor for PluginProc {
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
         if let Some(delayed) = &mut self.delayed {
             delayed.fallback.process(n, inputs, &mut delayed.audio);
-            if let Some(inner) = &mut self.inner {
+            if let Some(inner) = &mut self.inner
+                && (!self.bypass || self.delay_manual_bypass)
+            {
                 inner.process(n, inputs, outputs);
             }
             if self.bypass || self.inner.is_none() {
                 for (index, out) in outputs.iter_mut().enumerate() {
-                    if let Some(dry) = delayed.audio.get(index) {
+                    let dry = if self.bypass && !self.delay_manual_bypass {
+                        inputs.get(index)
+                    } else {
+                        delayed.audio.get(index)
+                    };
+                    if let Some(dry) = dry {
                         out.l[..n].copy_from_slice(&dry.l[..n]);
                         out.r[..n].copy_from_slice(&dry.r[..n]);
                     } else {
@@ -837,7 +846,9 @@ impl Processor for PluginProc {
         midi_in: &[MidiEvent],
         midi_out: &mut MidiBuf,
     ) {
-        let inner_midi = if self.inner_cleanup && self.inner.is_some() && n > 0 {
+        let inner_midi = if self.inner_cleanup && self.inner.is_some() && n > 0
+            && (!self.bypass || self.delay_manual_bypass)
+        {
             self.resume_midi.clear();
             for channel in 0..16 {
                 for cc in [64, 123, 120] {
@@ -866,12 +877,19 @@ impl Processor for PluginProc {
                 midi_in,
                 &mut delayed.midi,
             );
-            if let Some(inner) = &mut self.inner {
+            if let Some(inner) = &mut self.inner
+                && (!self.bypass || self.delay_manual_bypass)
+            {
                 inner.process_timed(first_sample, n, inputs, outputs, inner_midi, midi_out);
             }
             if self.bypass || self.inner.is_none() {
                 for (index, output) in outputs.iter_mut().enumerate() {
-                    if let Some(dry) = delayed.audio.get(index) {
+                    let dry = if self.bypass && !self.delay_manual_bypass {
+                        inputs.get(index)
+                    } else {
+                        delayed.audio.get(index)
+                    };
+                    if let Some(dry) = dry {
                         output.l[..n].copy_from_slice(&dry.l[..n]);
                         output.r[..n].copy_from_slice(&dry.r[..n]);
                     } else {
@@ -879,7 +897,12 @@ impl Processor for PluginProc {
                     }
                 }
                 midi_out.clear();
-                for event in delayed.midi.events() {
+                let dry_midi = if self.bypass && !self.delay_manual_bypass {
+                    midi_in
+                } else {
+                    delayed.midi.events()
+                };
+                for event in dry_midi {
                     midi_out.push(*event);
                 }
             }
@@ -1010,7 +1033,7 @@ mod tests {
                 }
             }
         }
-        fn schedule(latency: u64, parallel: bool) -> Schedule {
+        fn schedule(latency: u64, parallel: bool, pdc: bool) -> Schedule {
             let count = if parallel { 4 } else { 3 };
             let nodes: Vec<_> = (0..count)
                 .map(|id| timing::NodeSpec {
@@ -1041,7 +1064,7 @@ mod tests {
                 edges.push(edge(0, 3));
             }
             let analysis =
-                timing::analyze(&nodes, &edges, true, timing::TimingLimits::default()).unwrap();
+                timing::analyze(&nodes, &edges, pdc, timing::TimingLimits::default()).unwrap();
             let mut schedule = Schedule::default();
             for node in analysis.order.iter().copied() {
                 schedule.steps.push(Step {
@@ -1057,14 +1080,14 @@ mod tests {
                     schedule.sinks.push(node);
                 }
             }
-            schedule.timing = Some(
+            schedule.timing = pdc.then(|| {
                 compensation::TimingPlan::prepare(
                     &analysis,
                     timing::TimingLimits::default(),
                     &schedule.steps,
                 )
-                .unwrap(),
-            );
+                .unwrap()
+            });
             schedule
         }
         for (rate, block) in [
@@ -1073,9 +1096,10 @@ mod tests {
             (48_000.0, 512),
             (96_000.0, 256),
         ] {
-            for parallel in [false, true] {
+            for (pdc, parallel) in [(false, false), (true, false), (true, true)] {
                 let latency = Arc::new(AtomicUsize::new(192));
-                let plugin = PluginProc::with_latency(
+                let prepare = if pdc { PluginProc::with_latency } else { PluginProc::with_restart_latency };
+                let plugin = prepare(
                     Box::new(WarmPlugin {
                         latency: latency.clone(),
                         history: vec![[0.0; 2]; 131072],
@@ -1091,7 +1115,7 @@ mod tests {
                 let (garbage_tx, mut garbage) = rtrb::RingBuffer::new(32);
                 let mut state = AudioState {
                     slots: (0..crate::engine::MAX_NODES).map(|_| None).collect(),
-                    schedule: Box::new(schedule(192, parallel)),
+                    schedule: Box::new(schedule(192, parallel, pdc)),
                     cmd_rx,
                     garbage_tx,
                     sample_clock: 0,
@@ -1132,6 +1156,7 @@ mod tests {
                         .push(Command::SetSchedule(Box::new(schedule(
                             delay as u64,
                             parallel,
+                            pdc,
                         ))))
                         .ok()
                         .unwrap();
@@ -1146,7 +1171,7 @@ mod tests {
                             assert_eq!(
                                 frame,
                                 &[expected[0] * gain, expected[1] * gain],
-                                "fallback alignment: rate={rate} block={block} parallel={parallel} delay={delay} sample={}",
+                                "fallback alignment: rate={rate} block={block} parallel={parallel} pdc={pdc} delay={delay} sample={}",
                                 first + i
                             );
                         }
@@ -1168,7 +1193,7 @@ mod tests {
                         assert!(
                             pcm.iter()
                                 .all(|sample| *sample != 0.0 && sample.is_finite()),
-                            "cold final PCM: rate={rate} block={block} parallel={parallel} delay={delay}"
+                            "cold final PCM: rate={rate} block={block} parallel={parallel} pdc={pdc} delay={delay}"
                         );
                         while garbage.pop().is_ok() {}
                     }
@@ -1377,7 +1402,14 @@ mod tests {
 
     #[test]
     fn legacy_bypass_still_passes_audio_and_midi_immediately() {
-        let mut proc = PluginProc::new(Box::new(Through));
+        // Default-mode restart history must not delay an explicit manual bypass.
+        struct BypassedPlugin;
+        impl Processor for BypassedPlugin {
+            fn process(&mut self, _: usize, _: &mut [StereoBuf], _: &mut [StereoBuf]) {
+                panic!("default manual bypass must skip plugin DSP");
+            }
+        }
+        let mut proc = PluginProc::with_restart_latency(Box::new(BypassedPlugin), 512, 64, false).unwrap();
         proc.set_param(0, 1.0);
         let (mut input, mut output) = ([StereoBuf::new()], [StereoBuf::new()]);
         input[0].l[0] = 0.5;

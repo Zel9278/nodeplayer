@@ -46,22 +46,19 @@ enum ScanMsg {
 fn queue_plugin_resume(
     eid: u32,
     plugin: &mut PluginNode,
-    pdc: bool,
     mut processor: Box<dyn crate::engine::Processor>,
     mut send: impl FnMut(Command),
     prepare: impl FnOnce(u32, u32, bool) -> anyhow::Result<crate::engine::nodes::LatencyBypass>,
 ) -> anyhow::Result<()> {
     let timing = (plugin.instance.latency(), plugin.instance.bridge_latency());
-    if pdc {
-        let bypass = match prepare(timing.0, timing.1, plugin.info().is_instrument()) {
-            Ok(bypass) => bypass,
-            Err(error) => {
-                processor.deactivate();
-                return Err(error);
-            }
-        };
-        send(Command::ConfigureBypass(eid, Box::new(bypass)));
-    }
+    let bypass = match prepare(timing.0, timing.1, plugin.info().is_instrument()) {
+        Ok(bypass) => bypass,
+        Err(error) => {
+            processor.deactivate();
+            return Err(error);
+        }
+    };
+    send(Command::ConfigureBypass(eid, Box::new(bypass)));
     send(Command::ResumePlugin(eid, processor));
     plugin.timing = timing;
     plugin.suspended = false;
@@ -1212,21 +1209,22 @@ impl App {
                     i.params().len(),
                     i.latency()
                 ));
-                let proc = if crate::runtime::get().experimental_pdc {
-                    match PluginProc::with_latency(
-                        created.processor,
-                        i.latency(),
-                        i.bridge_latency(),
-                        i.info().is_instrument(),
-                    ) {
-                        Ok(proc) => proc,
-                        Err(error) => {
-                            self.log(format!("plugin timing rejected: {error:#}"));
-                            return None;
-                        }
-                    }
+                let prepare = if crate::runtime::get().experimental_pdc {
+                    PluginProc::with_latency
                 } else {
-                    PluginProc::new(created.processor)
+                    PluginProc::with_restart_latency
+                };
+                let proc = match prepare(
+                    created.processor,
+                    i.latency(),
+                    i.bridge_latency(),
+                    i.info().is_instrument(),
+                ) {
+                    Ok(proc) => proc,
+                    Err(error) => {
+                        self.log(format!("plugin timing rejected: {error:#}"));
+                        return None;
+                    }
                 };
                 let node = PluginNode::new(created.instance);
                 self.insert(NodeKind::Plugin(Box::new(node)), Box::new(proc), pos)
@@ -1446,7 +1444,6 @@ impl App {
                     && let Err(error) = queue_plugin_resume(
                         eid,
                         p,
-                        crate::runtime::get().experimental_pdc,
                         proc,
                         |command| engine.send(command),
                         crate::engine::nodes::LatencyBypass::new,
@@ -1664,7 +1661,7 @@ impl App {
                         ports_changed.push(node.eid);
                     }
                     let timing = (p.instance.latency(), p.instance.bridge_latency());
-                    if crate::runtime::get().experimental_pdc && !p.suspended && timing != p.timing {
+                    if !p.suspended && timing != p.timing {
                         match crate::engine::nodes::LatencyBypass::new(
                             timing.0,
                             timing.1,
@@ -1676,7 +1673,7 @@ impl App {
                                         .send(Command::ConfigureBypass(node.eid, Box::new(bypass)));
                                 }
                                 p.timing = timing;
-                                self.dirty = true;
+                                self.dirty |= crate::runtime::get().experimental_pdc;
                             }
                             Err(error) => log::error!("plugin timing change rejected: {error:#}"),
                         }
@@ -3995,7 +3992,6 @@ mod restart_tests {
             let result = queue_plugin_resume(
                 1,
                 &mut plugin,
-                true,
                 proc,
                 |command| commands.push(command),
                 |total, bridge, instrument| {
@@ -4032,7 +4028,6 @@ mod restart_tests {
         queue_plugin_resume(
             1,
             &mut plugin,
-            true,
             proc,
             |command| commands.push(command),
             crate::engine::nodes::LatencyBypass::new,
