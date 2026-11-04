@@ -132,7 +132,8 @@ plugin hangs here the parent supervisor kills/reaps it. Before plugin-requested 
 pending VST3 and CLAP parameter changes flush on the audio thread without synthesizing
 input or advancing the audio clock. VST3 uses zero-sample parameter-only processing;
 CLAP uses its parameter flush extension. State load skips that flush.
-Checkpoints save the live instance on the worker's main thread without restarting DSP.
+Checkpoints save the live instance on the worker's main thread while DSP and parent audio
+publication continue. Only destructive state loads quiesce the bridge during control RPC.
 
 Local plugin restarts also retain the engine slot and processor wrapper while replacing
 only its suspended inner processor. The delayed dry path keeps 131072 frames of real

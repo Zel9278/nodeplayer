@@ -549,7 +549,9 @@ fn transact(
     *id = id
         .checked_add(1)
         .context("control request sequence overflow")?;
-    let quiesce = matches!(c, Command::Load(_) | Command::Checkpoint);
+    // Checkpoints serialize the live instance while child DSP keeps running.
+    // Gating the parent here would discard wet output and stop audio publication.
+    let quiesce = matches!(c, Command::Load(_));
     if quiesce {
         core.ready.store(false, Ordering::Release);
     }
@@ -753,6 +755,200 @@ mod tests {
 
     fn encoded(commands: Vec<Command>) -> serde_json::Value {
         serde_json::to_value(commands).unwrap()
+    }
+
+    fn checkpoint_core(map: Arc<Shared>, state: Vec<u8>) -> Arc<Core> {
+        use super::super::{AtomicBool, AtomicU32, Mutex, Snapshot};
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        Arc::new(Core {
+            stop: AtomicBool::new(false),
+            recover: AtomicBool::new(false),
+            ready: AtomicBool::new(true),
+            map: Mutex::new(Some(map)),
+            surface: Mutex::new(None),
+            close_editor: AtomicU64::new(0),
+            retired: Mutex::new(Vec::new()),
+            cursor: AtomicU64::new(0),
+            algorithm_latency: AtomicU32::new(0),
+            instrument: AtomicBool::new(false),
+            underruns: AtomicU64::new(0),
+            overflows: AtomicU64::new(0),
+            next_editor: AtomicU64::new(0),
+            snapshot: Mutex::new(Snapshot {
+                metadata: None,
+                state: Some(state),
+                checkpoint_seq: 0,
+                displays: HashMap::new(),
+                status: "running".into(),
+                revision: 0,
+            }),
+            tx,
+        })
+    }
+
+    fn process_checkpoint_audio(
+        processor: &mut super::super::processor::RemoteProcessor,
+        map: &Shared,
+    ) -> crate::engine::StereoBuf {
+        use crate::engine::{Processor, StereoBuf};
+        let mut input = [StereoBuf::new()];
+        input[0].l[..Q].fill(0.25);
+        input[0].r[..Q].fill(-0.125);
+        let mut output = [StereoBuf::new()];
+        processor.process(Q, &mut input, &mut output);
+        for i in 0..SLOTS {
+            let slot = map.slot(i);
+            if slot
+                .state
+                .compare_exchange(
+                    shared::INPUT,
+                    shared::WORKING,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                // A deterministic child applies gain, distinguishing wet from dry fallback.
+                // SAFETY: this fake child owns the slot until releasing OUTPUT below.
+                let payload = unsafe { slot.payload() };
+                for sample in payload.left.iter_mut().chain(&mut payload.right) {
+                    *sample *= 2.0;
+                }
+                payload.midi_count = 0;
+                slot.state.store(shared::OUTPUT, Ordering::Release);
+                map.progressed();
+            }
+        }
+        output.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn delayed_state_replies_keep_checkpoint_audio_live_but_quiesce_load() -> Result<()> {
+        #[derive(Clone, Copy)]
+        enum Outcome {
+            Accepted,
+            Rejected,
+            Disconnected,
+        }
+        const GENERATION: u64 = 73;
+        let old_state = vec![3, 1, 4, 1, 5];
+        let saved_state = (0..=255).cycle().take(4097).collect::<Vec<u8>>();
+        for (command, live) in [
+            (Command::Checkpoint, true),
+            (Command::Load(saved_state.clone()), false),
+        ] {
+            for outcome in [Outcome::Accepted, Outcome::Rejected, Outcome::Disconnected] {
+                let mut random = [0; 16];
+                SystemRandom::new().fill(&mut random).unwrap();
+                let suffix = random
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                let map = Arc::new(Shared::create(
+                    std::env::temp_dir().join(format!("np-checkpoint-test-{suffix}")),
+                    GENERATION,
+                )?);
+                let core = checkpoint_core(map.clone(), old_state.clone());
+                let mut processor = super::super::processor::RemoteProcessor::new(core.clone());
+                for _ in 0..=DELAY / Q {
+                    process_checkpoint_audio(&mut processor, &map);
+                }
+                assert_eq!(core.underruns.load(Ordering::Relaxed), 0);
+                let progress_before = map.progress();
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+                let mut stream = TcpStream::connect(listener.local_addr()?)?;
+                stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+                let (peer, _) = listener.accept()?;
+                peer.set_read_timeout(Some(Duration::from_secs(3)))?;
+                peer.set_write_timeout(Some(Duration::from_secs(3)))?;
+                let transaction_core = core.clone();
+                let requested = command.clone();
+                std::thread::scope(|scope| -> Result<()> {
+                    // Keep the peer inside the scope so failures close it before joining.
+                    let mut peer = peer;
+                    let transaction = scope.spawn(move || {
+                        let mut journal = HashMap::from([(7, 0.25)]);
+                        let result = transact_recorded(
+                            &mut stream,
+                            &transaction_core,
+                            GENERATION,
+                            &mut 0,
+                            &mut journal,
+                            &mut SurfaceFiles::default(),
+                            requested,
+                        );
+                        (result, journal)
+                    });
+                    let request: Request = protocol::receive(&mut peer)?;
+                    assert_eq!(
+                        encoded(vec![request.command]),
+                        encoded(vec![command.clone()])
+                    );
+                    // The transaction is waiting for this test's reply throughout these
+                    // callbacks. Run beyond the bridge delay to expose publication holes.
+                    for _ in 0..DELAY / Q + 4 {
+                        assert_eq!(core.ready.load(Ordering::Acquire), live);
+                        let output = process_checkpoint_audio(&mut processor, &map);
+                        assert_eq!(&output.l[..Q], &[if live { 0.5 } else { 0.25 }; Q]);
+                        assert_eq!(&output.r[..Q], &[if live { -0.25 } else { -0.125 }; Q]);
+                    }
+                    assert_eq!(
+                        map.progress() - progress_before,
+                        if live { (DELAY / Q + 4) as u64 } else { 0 }
+                    );
+                    if live {
+                        assert_eq!(core.underruns.load(Ordering::Relaxed), 0);
+                    }
+                    {
+                        let snapshot = core.snapshot.lock().unwrap();
+                        assert_eq!(snapshot.checkpoint_seq, 0);
+                        assert_eq!(
+                            snapshot.state.as_ref(),
+                            Some(if live { &old_state } else { &saved_state })
+                        );
+                    }
+                    if !matches!(outcome, Outcome::Disconnected) {
+                        protocol::send(
+                            &mut peer,
+                            &Reply {
+                                version: VERSION,
+                                generation: request.generation,
+                                id: request.id,
+                                metadata: None,
+                                // A rejected reply must not overwrite the previous checkpoint.
+                                state: live.then(|| saved_state.clone()),
+                                display: None,
+                                error: matches!(outcome, Outcome::Rejected)
+                                    .then(|| "snapshot failed".into()),
+                            },
+                        )?;
+                    }
+                    drop(peer);
+                    let (result, journal) = transaction.join().unwrap();
+                    let accepted = matches!(outcome, Outcome::Accepted);
+                    assert_eq!(result.is_ok(), accepted);
+                    let snapshot = core.snapshot.lock().unwrap();
+                    let saved = live && accepted;
+                    assert_eq!(snapshot.checkpoint_seq, u64::from(saved));
+                    assert_eq!(
+                        snapshot.state.as_ref(),
+                        Some(if live && !accepted {
+                            &old_state
+                        } else {
+                            &saved_state
+                        })
+                    );
+                    assert_eq!(journal.is_empty(), !live || accepted);
+                    if accepted {
+                        assert!(core.ready.load(Ordering::Acquire));
+                    } else if !live {
+                        assert!(!core.ready.load(Ordering::Acquire));
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(())
     }
 
     #[test]
