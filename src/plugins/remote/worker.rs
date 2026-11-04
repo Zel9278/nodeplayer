@@ -700,6 +700,7 @@ fn pump_native() -> Result<()> {
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
     };
+    let started = Instant::now();
     unsafe {
         let mut msg = MSG::default();
         for _ in 0..256 {
@@ -708,6 +709,12 @@ fn pump_native() -> Result<()> {
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+            // A plugin can keep invalidating its editor from WM_PAINT. Leave
+            // queued messages for the next pass so capture and control requests
+            // run between paints. One native callback still runs to completion.
+            if started.elapsed() >= Duration::from_millis(2) {
+                break;
+            }
         }
     }
     Ok(())
@@ -750,6 +757,74 @@ impl Drop for ComInit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a Windows window station"]
+    fn native_pump_yields_between_self_queued_paints_without_dropping_messages() -> Result<()> {
+        use std::sync::atomic::AtomicU32;
+        use windows::{
+            Win32::{
+                Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+                System::LibraryLoader::GetModuleHandleW,
+                UI::WindowsAndMessaging::*,
+            },
+            core::w,
+        };
+
+        unsafe extern "system" fn paint(
+            hwnd: HWND, message: u32, value: WPARAM, position: LPARAM,
+        ) -> LRESULT {
+            let count = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const AtomicU32;
+            if message == WM_PAINT && !count.is_null() {
+                // Model an editor that posts its next paint from an expensive callback.
+                let painted = unsafe { &*count }.fetch_add(1, Ordering::Relaxed) + 1;
+                std::thread::sleep(Duration::from_millis(4));
+                if painted < 32 {
+                    let _ = unsafe { PostMessageW(hwnd, WM_PAINT, WPARAM(0), LPARAM(0)) };
+                }
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, message, value, position) }
+        }
+
+        struct Window(HWND, HINSTANCE);
+        impl Drop for Window {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                    let _ = UnregisterClassW(w!("NodePlayerWorkerPumpTest"), self.1);
+                }
+            }
+        }
+
+        let count = Box::new(AtomicU32::new(0));
+        unsafe {
+            let instance = HINSTANCE(GetModuleHandleW(None)?.0);
+            let class = WNDCLASSW {
+                hInstance: instance,
+                lpszClassName: w!("NodePlayerWorkerPumpTest"),
+                lpfnWndProc: Some(paint),
+                ..Default::default()
+            };
+            anyhow::ensure!(RegisterClassW(&class) != 0, "register pump test window");
+            let window = Window(CreateWindowExW(
+                WINDOW_EX_STYLE::default(), w!("NodePlayerWorkerPumpTest"), w!(""),
+                WINDOW_STYLE::default(), 0, 0, 1, 1, HWND_MESSAGE, None, instance, None,
+            )?, instance);
+            SetWindowLongPtrW(window.0, GWLP_USERDATA, (&*count as *const AtomicU32) as isize);
+            PostMessageW(window.0, WM_PAINT, WPARAM(0), LPARAM(0))?;
+            pump_native()?;
+            assert_eq!(count.load(Ordering::Relaxed), 1);
+            let mut pending = MSG::default();
+            assert!(PeekMessageW(
+                &mut pending, window.0, WM_PAINT, WM_PAINT, PM_NOREMOVE,
+            ).as_bool(), "the next paint stays queued for the next service pass");
+            pump_native()?;
+            assert_eq!(count.load(Ordering::Relaxed), 2);
+        }
+        Ok(())
+    }
 
     #[test]
     fn unsupported_editor_open_stays_available_as_a_bounded_error() {

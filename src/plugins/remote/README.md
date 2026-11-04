@@ -224,7 +224,11 @@ readback in flight, and retires its native registration before plugin GUI teardo
 Mixed GPU/CPU view layouts and custom Metal-layer subclasses still need another adapter.
 Capture service targets 240 updates per second and skips missed deadlines after a stall.
 The worker services native UI/capture between control requests without an 8 ms blocking
-readiness poll. Parent repaint requests use the same target while a captured editor is
+readiness poll. On Windows, native message pumping yields after 2 ms or 256 messages,
+whichever comes first, once the current callback returns. A self-invalidating editor
+therefore cannot fill an entire count-only batch with repeated paints before capture and
+control run again. A single blocking native callback still requires the worker watchdog.
+Parent repaint requests use the same target while a captured editor is
 visible. CPU readback/upload, plugin rendering, viewport scheduling and the display can
 each limit the measured rate; capture publication and parent delivery do not establish
 compositor presentation FPS. A blank startup that produces no usable image within five
