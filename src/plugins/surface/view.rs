@@ -10,6 +10,7 @@ use crate::plugins::{Editor, Spot};
 #[derive(Default)]
 pub struct EditorView {
     texture: Option<egui::TextureHandle>,
+    pixels: Option<ImagePixels>,
     native_size: Option<(u32, u32)>,
     native_units_per_point: Option<f32>,
     screen: Option<Rect>,
@@ -141,9 +142,24 @@ impl ClickTracker {
 
 struct PopupTexture {
     texture: egui::TextureHandle,
+    pixels: ImagePixels,
     origin: [f64; 2],
     native_size: (u32, u32),
     interactive: bool,
+}
+
+/// Keep the last uploaded image so repeated native captures do not cause another
+/// CPU color conversion and GPU upload. Native capture already bounds the bytes.
+#[derive(PartialEq, Eq)]
+struct ImagePixels {
+    size: [usize; 2],
+    rgba: Vec<u8>,
+}
+
+impl ImagePixels {
+    fn image(&self) -> egui::ColorImage {
+        egui::ColorImage::from_rgba_unmultiplied(self.size, &self.rgba)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -262,12 +278,15 @@ impl EditorView {
             self.popup_offset = None;
         }
         for (index, popup) in frame.popups.into_iter().enumerate() {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [popup.width as usize, popup.height as usize],
-                &popup.rgba,
-            );
+            let pixels = ImagePixels {
+                size: [popup.width as usize, popup.height as usize],
+                rgba: popup.rgba,
+            };
             if let Some(previous) = self.popups.get_mut(index) {
-                previous.texture.set(image, egui::TextureOptions::LINEAR);
+                if previous.pixels != pixels {
+                    previous.texture.set(pixels.image(), egui::TextureOptions::LINEAR);
+                    previous.pixels = pixels;
+                }
                 previous.origin = popup.origin;
                 previous.native_size = popup.native_size;
                 previous.interactive = popup.interactive;
@@ -275,24 +294,30 @@ impl EditorView {
                 self.popups.push(PopupTexture {
                     texture: context.load_texture(
                         "plugin-popup",
-                        image,
+                        pixels.image(),
                         egui::TextureOptions::LINEAR,
                     ),
+                    pixels,
                     origin: popup.origin,
                     native_size: popup.native_size,
                     interactive: popup.interactive,
                 });
             }
         }
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [frame.width as usize, frame.height as usize],
-            &frame.rgba,
-        );
-        if let Some(texture) = &mut self.texture {
-            texture.set(image, egui::TextureOptions::LINEAR);
-        } else {
-            self.texture =
-                Some(context.load_texture("plugin-editor", image, egui::TextureOptions::LINEAR));
+        let pixels = ImagePixels {
+            size: [frame.width as usize, frame.height as usize],
+            rgba: frame.rgba,
+        };
+        if self.texture.is_none() || self.pixels.as_ref() != Some(&pixels) {
+            let image = pixels.image();
+            if let Some(texture) = &mut self.texture {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.texture = Some(context.load_texture(
+                    "plugin-editor", image, egui::TextureOptions::LINEAR,
+                ));
+            }
+            self.pixels = Some(pixels);
         }
     }
 
@@ -683,6 +708,64 @@ fn native_from_screen(screen: Rect, native_size: (u32, u32), position: Pos2) -> 
 mod tests {
     use super::*;
     use egui::Vec2;
+
+    #[test]
+    fn repeated_pixels_keep_textures_while_geometry_popups_and_delivery_advance() {
+        let context = egui::Context::default();
+        context.tex_manager().write().take_delta().clear();
+        let uploads = || {
+            let mut delta = context.tex_manager().write().take_delta();
+            let textures: Vec<_> = delta.set.keys().copied().collect();
+            delta.clear();
+            textures
+        };
+        let mut view = EditorView::default();
+        let mut frame = EditorFrame {
+            width: 2,
+            height: 2,
+            native_size: (2, 2),
+            native_units_per_point: 1.0,
+            rgba: [23, 45, 67, 255].repeat(4),
+            popups: vec![super::super::EditorPopup {
+                origin: [0.0, 1.0],
+                width: 2,
+                height: 1,
+                native_size: (2, 1),
+                rgba: [89, 12, 34, 220].repeat(2),
+                interactive: true,
+            }],
+        };
+        view.update_texture(&context, frame.clone());
+        assert_eq!(uploads().len(), 2);
+        let root_texture = view.texture.as_ref().unwrap().id();
+        let popup_texture = view.popups[0].texture.id();
+
+        frame.native_size = (4, 4);
+        frame.native_units_per_point = 2.0;
+        frame.popups[0].origin = [8.0, 12.0];
+        frame.popups[0].native_size = (4, 2);
+        frame.popups[0].interactive = false;
+        view.update_texture(&context, frame.clone());
+        assert!(uploads().is_empty());
+        assert_eq!(view.native_size, Some((4, 4)));
+        assert_eq!(view.native_units_per_point, Some(2.0));
+        assert_eq!(view.popups[0].origin, [8.0, 12.0]);
+        assert_eq!(view.popups[0].native_size, (4, 2));
+        assert!(!view.popups[0].interactive);
+        assert_eq!(view.frame_stats().unwrap().frames, 2);
+
+        // A fading menu changes independently of the stationary root editor.
+        frame.popups[0].rgba[3] = 100;
+        view.update_texture(&context, frame.clone());
+        assert_eq!(uploads(), [popup_texture]);
+
+        // The same byte count with a different shape still requires a new upload.
+        frame.width = 1;
+        frame.height = 4;
+        view.update_texture(&context, frame);
+        assert_eq!(uploads(), [root_texture]);
+        assert_eq!(view.texture.as_ref().unwrap().size(), [1, 4]);
+    }
 
     #[test]
     fn display_density_changes_wait_for_matching_pixels_and_preserve_logical_size() {
