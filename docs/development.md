@@ -45,14 +45,20 @@ are not part of this formatting pass. If another process is using the normal Win
 executable, use `--target-dir target/isolation` with build, Clippy and test commands instead
 of stopping unrelated processes.
 
-Experimental VST3/CLAP process isolation is enabled with
-`--experimental-plugin-isolation` (which also enables PDC); `--experimental-pdc`
-enables only delay compensation. See the [remote backend](<../src/plugins/remote/README.md>)
-for architecture and limitations. Machine-specific plugins, diagnostic scenarios and
-private notes can be kept under the ignored `.local/` directory.
+VST3/CLAP plugins use whole-plugin worker processes and delay compensation by default.
+Each worker owns one instance's DSP, editor, parameters, state and destruction. The bridge
+adds 4096 frames per plugin (about 85 ms at 48 kHz), plus the plugin's algorithm latency.
+`--in-process-plugins` selects local hosting without PDC; add `--experimental-pdc` to keep
+delay compensation in either flag order. `--experimental-plugin-isolation` remains an alias
+for worker hosting. When both hosting flags appear, the last one wins. The internal worker
+entry and native scan/test commands load locally to avoid recursive worker or scanner
+creation; `--test-isolated` explicitly tests the bridge. Unsupported worker setups report
+an error rather than loading locally. See the [remote backend](<../src/plugins/remote/README.md>)
+for architecture and limitations. Machine-specific plugins, diagnostic scenarios and private
+notes can be kept under the ignored `.local/` directory.
 
 Embedded VST3/CLAP editors always use captured presentation on macOS, Windows and Linux,
-with local hosting or `--experimental-plugin-isolation`. The legacy
+with default worker hosting or `--in-process-plugins`. The legacy
 `--experimental-editor-capture` argument is still accepted by existing launch commands.
 Captured editors use a private native rendering host. Graph zoom transforms the latest
 image on every frame without waiting for capture, resizing the source, or requesting a

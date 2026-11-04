@@ -4,6 +4,13 @@ A music player where the sound goes through a node graph you build yourself. Tra
 a Player node, run through effects, plugins and visualizers, and play from an Output node.
 Written in Rust, for Linux, Windows and macOS.
 
+VST3 and CLAP plugins run in separate worker processes by default, keeping native editor
+drawing off the graph's UI thread. Each worker owns one plugin instance, including its DSP,
+editor and state. The audio bridge adds 4096 frames per plugin (about 85 ms at 48 kHz), plus
+the plugin's own latency; delay compensation keeps graph paths aligned. Start with
+`--in-process-plugins` to use local hosting, or combine it with `--experimental-pdc` to keep
+delay compensation. See [Plugins](docs/plugins.md) for hosting behavior and limitations.
+
 ![nodeplayer](docs/images/screenshot.png)
 
 ## Features

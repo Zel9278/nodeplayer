@@ -1,4 +1,4 @@
-//! Experimental whole-plugin process isolation. See README.md for limits and ABI contract.
+//! Whole-plugin process isolation. See README.md for limits and ABI contract.
 mod processor;
 mod protocol;
 mod shared;

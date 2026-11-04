@@ -8,8 +8,9 @@ use std::{
 };
 
 pub const HELP: &str = "nodeplayer [options] [file-or-folder]\n\
-  --experimental-pdc                 Enable experimental delay compensation\n\
-  --experimental-plugin-isolation    Request plugin isolation (also enables PDC)\n\
+  --in-process-plugins               Run VST3/CLAP locally instead of in workers\n\
+  --experimental-pdc                 Enable delay compensation with local plugins\n\
+  --experimental-plugin-isolation    Compatibility alias for worker hosting\n\
   --data-root <directory>             Separate config/cache/state/data\n\
   --diagnostic-scenario <json>        Run an explicit, restricted scenario\n\
   --diagnostic-output <directory>     New, exclusive artifact directory\n\
@@ -20,6 +21,9 @@ pub const HELP: &str = "nodeplayer [options] [file-or-folder]\n\
 Existing commands: --scan-plugin <format> <path>; --test-plugin <format> <path> [filter];\n\
 --test-vst3 <bundle> [filter]; --test-editor <bundle> <name> <out.ppm>\n\
 --test-isolated <format> <path>         Explicit isolated fixture bridge test\n\
+VST3/CLAP plugins run in workers with delay compensation by default. Each worker\n\
+adds 4096 frames of bridge latency (about 85 ms at 48 kHz), plus plugin latency.\n\
+\n\
 Diagnostics disable normal-profile restore, Native extensions, external networking,\n\
 auto-downloads and broad library/plugin discovery. Plugin-owned OS data is NOT isolated.\n";
 
@@ -42,14 +46,31 @@ pub struct DiagnosticOptions {
     pub audio_device: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RuntimeOptions {
     pub experimental_pdc: bool,
     pub experimental_plugin_isolation: bool,
     pub data_root: Option<PathBuf>,
     pub diagnostic: Option<DiagnosticOptions>,
 }
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        Self {
+            experimental_pdc: true,
+            experimental_plugin_isolation: true,
+            data_root: None,
+            diagnostic: None,
+        }
+    }
+}
 impl RuntimeOptions {
+    fn in_process() -> Self {
+        Self {
+            experimental_pdc: false,
+            experimental_plugin_isolation: false,
+            ..Self::default()
+        }
+    }
     pub fn is_diagnostic(&self) -> bool {
         self.diagnostic.is_some()
     }
@@ -142,7 +163,9 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
     {
         args.next();
         let mut worker_args = Vec::new();
-        let mut options = RuntimeOptions::default();
+        // A worker owns the native instance. Its metadata scans must not spawn
+        // another scanner/worker through the parent's default hosting policy.
+        let mut options = RuntimeOptions::in_process();
         while let Some(arg) = args.next() {
             if arg == OsStr::new("--data-root") {
                 if options.data_root.is_some() {
@@ -169,6 +192,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
     let mut literal = false;
     let mut unknown_options = Vec::new();
     let mut legacy_capture_flag = false;
+    let mut explicit_pdc = false;
+    let mut explicit_hosting = false;
     while let Some(arg) = args.next() {
         if literal {
             positional.push(arg);
@@ -181,8 +206,15 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
         match arg.to_str() {
             Some("--") => literal = true,
             Some("--help" | "-h") => help = true,
-            Some("--experimental-pdc") => options.experimental_pdc = true,
-            Some("--experimental-plugin-isolation") => options.experimental_plugin_isolation = true,
+            Some("--experimental-pdc") => explicit_pdc = true,
+            Some("--experimental-plugin-isolation") => {
+                options.experimental_plugin_isolation = true;
+                explicit_hosting = true;
+            }
+            Some("--in-process-plugins") => {
+                options.experimental_plugin_isolation = false;
+                explicit_hosting = true;
+            }
             // Embedded editors always use capture; accept existing launch commands.
             Some("--experimental-editor-capture") => legacy_capture_flag = true,
             Some("--data-root") => {
@@ -259,11 +291,19 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
     if scenario.is_some() && (mode.is_some() || !positional.is_empty()) {
         bail!("diagnostic scenarios cannot be combined with scan/test commands or an initial file");
     }
-    if mode == Some("isolated") {
-        options.experimental_plugin_isolation = true;
+    match mode {
+        Some("isolated") => options.experimental_plugin_isolation = true,
+        // Scanner entry and native smoke tests deliberately load locally. In
+        // particular, scan_main calls Host::classes and would otherwise recurse.
+        Some("scan" | "plugin" | "vst3" | "editor") => {
+            options.experimental_plugin_isolation = false;
+        }
+        _ => {}
     }
-    options.experimental_pdc |= options.experimental_plugin_isolation;
-    if !unknown_options.is_empty() && (options.experimental_pdc || options.experimental_plugin_isolation || legacy_capture_flag) {
+    // An explicit PDC request survives either order of the hosting flags.
+    options.experimental_pdc = explicit_pdc || options.experimental_plugin_isolation;
+    let explicit_policy = explicit_pdc || explicit_hosting || mode == Some("isolated");
+    if !unknown_options.is_empty() && (explicit_policy || legacy_capture_flag) {
         bail!("unknown option {:?}; use -- before a path beginning with '-'", unknown_options[0]);
     }
     if let Some(scenario) = scenario {
@@ -281,7 +321,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
         Mode::Help
     } else {
         match mode {
-            None if count <= 1 || (!options.experimental_pdc && !options.experimental_plugin_isolation) => Mode::Gui {
+            None if count <= 1 || !explicit_policy => Mode::Gui {
                 initial_file: p.next().map(PathBuf::from),
             },
             Some("scan") if count == 2 => Mode::ScanPlugin {
@@ -330,8 +370,16 @@ mod tests {
     }
     #[test]
     fn defaults_and_paths() {
+        let defaults = RuntimeOptions::default();
+        let empty = parse(&[]).unwrap();
+        assert!(defaults.experimental_plugin_isolation && defaults.experimental_pdc);
+        assert_eq!(
+            empty.options.experimental_plugin_isolation,
+            defaults.experimental_plugin_isolation
+        );
+        assert_eq!(empty.options.experimental_pdc, defaults.experimental_pdc);
         let p = parse(&["音 楽/file.flac"]).unwrap();
-        assert!(!p.options.experimental_pdc);
+        assert!(p.options.experimental_plugin_isolation && p.options.experimental_pdc);
         assert!(p.options.allow_network());
         assert_eq!(
             p.mode,
@@ -352,11 +400,13 @@ mod tests {
         assert!(p.options.experimental_pdc && p.options.experimental_plugin_isolation);
         let capture = parse(&["--experimental-editor-capture"]).unwrap();
         assert!(matches!(capture.mode, Mode::Gui { initial_file: None }));
-        assert!(!capture.options.experimental_plugin_isolation && !capture.options.experimental_pdc);
+        assert!(capture.options.experimental_plugin_isolation && capture.options.experimental_pdc);
         assert!(parse(&["--experimental-editor-capture", "--unknown"]).is_err());
+        // Default worker hosting does not change the legacy positional parser.
         assert!(matches!(parse(&["--unknown"]).unwrap().mode, Mode::Gui { .. }));
         assert!(matches!(parse(&["a", "b"]).unwrap().mode, Mode::Gui { .. }));
         assert!(parse(&["--experimental-pdc", "--unknown"]).is_err());
+        assert!(parse(&["--in-process-plugins", "--unknown"]).is_err());
         assert!(parse(&["--experimental-plugin-isolation", "a", "b"]).is_err());
         for a in [
             & ["--data-root"][..],
@@ -364,6 +414,46 @@ mod tests {
             &["--diagnostic-output", "out"][..],
         ] {
             assert!(parse(a).is_err());
+        }
+    }
+    #[test]
+    fn in_process_opt_out_keeps_explicit_pdc_in_either_order() {
+        let local = parse(&["--in-process-plugins", "song.flac"]).unwrap();
+        assert!(!local.options.experimental_plugin_isolation && !local.options.experimental_pdc);
+        assert_eq!(
+            local.mode,
+            Mode::Gui {
+                initial_file: Some("song.flac".into())
+            }
+        );
+        for flags in [
+            ["--in-process-plugins", "--experimental-pdc"],
+            ["--experimental-pdc", "--in-process-plugins"],
+        ] {
+            let parsed = parse(&flags).unwrap();
+            assert!(!parsed.options.experimental_plugin_isolation && parsed.options.experimental_pdc);
+        }
+    }
+    #[test]
+    fn hosting_flags_use_the_last_selection_without_losing_pdc() {
+        for (flags, isolated) in [
+            (
+                ["--experimental-plugin-isolation", "--in-process-plugins"],
+                false,
+            ),
+            (
+                ["--in-process-plugins", "--experimental-plugin-isolation"],
+                true,
+            ),
+        ] {
+            let parsed = parse(&flags).unwrap();
+            assert_eq!(parsed.options.experimental_plugin_isolation, isolated);
+            assert_eq!(parsed.options.experimental_pdc, isolated);
+            let mut with_pdc = vec!["--experimental-pdc"];
+            with_pdc.extend(flags);
+            let parsed = parse(&with_pdc).unwrap();
+            assert_eq!(parsed.options.experimental_plugin_isolation, isolated);
+            assert!(parsed.options.experimental_pdc);
         }
     }
     #[test]
@@ -376,11 +466,29 @@ mod tests {
             }
         );
         assert!(!p.options.experimental_plugin_isolation);
+        assert!(!p.options.experimental_pdc);
+        let opaque = parse(&[
+            "--plugin-worker",
+            "--experimental-plugin-isolation",
+            "--in-process-plugins",
+        ])
+        .unwrap();
+        assert_eq!(
+            opaque.mode,
+            Mode::PluginWorker {
+                args: vec![
+                    "--experimental-plugin-isolation".into(),
+                    "--in-process-plugins".into()
+                ],
+            }
+        );
+        assert!(!opaque.options.experimental_plugin_isolation && !opaque.options.experimental_pdc);
     }
     #[test]
     fn worker_data_root_is_parsed_separately_from_worker_arguments() {
         let parsed = parse(&["--plugin-worker", "127.0.0.1:1234", "mapping", "2", "--data-root", "worker root"]).unwrap();
         assert_eq!(parsed.options.data_root.as_deref(), Some(std::path::Path::new("worker root")));
+        assert!(!parsed.options.experimental_plugin_isolation && !parsed.options.experimental_pdc);
         assert_eq!(parsed.mode, Mode::PluginWorker { args: vec!["127.0.0.1:1234".into(), "mapping".into(), "2".into()] });
         assert!(parse(&["--plugin-worker", "--data-root"]).is_err());
     }
@@ -389,7 +497,16 @@ mod tests {
         let p = parse(&["--test-isolated", "CLAP", "fixture.clap"]).unwrap();
         assert!(matches!(p.mode, Mode::TestIsolated { .. }));
         assert!(p.options.experimental_pdc && p.options.experimental_plugin_isolation);
+        let explicit = parse(&[
+            "--in-process-plugins",
+            "--test-isolated",
+            "CLAP",
+            "fixture.clap",
+        ])
+        .unwrap();
+        assert!(explicit.options.experimental_pdc && explicit.options.experimental_plugin_isolation);
         assert!(parse(&["--test-isolated", "CLAP"]).is_err());
+        assert!(parse(&["--test-isolated", "--unknown", "fixture.clap"]).is_err());
     }
     #[test]
     fn legacy_modes() {
@@ -409,6 +526,17 @@ mod tests {
             parse(&["--test-editor", "a", "b", "c"]).unwrap().mode,
             Mode::TestEditor { .. }
         ));
+        for args in [
+            &["--scan-plugin", "CLAP", "a b.clap"][..],
+            &["--test-plugin", "CLAP", "a", "name"][..],
+            &["--test-vst3", "a"][..],
+            &["--test-editor", "a", "b", "c"][..],
+            // An explicit scanner command must never spawn itself recursively.
+            &["--experimental-plugin-isolation", "--scan-plugin", "CLAP", "a"][..],
+        ] {
+            let parsed = parse(args).unwrap();
+            assert!(!parsed.options.experimental_plugin_isolation && !parsed.options.experimental_pdc);
+        }
     }
     #[test]
     fn diagnostic_policy_is_explicit() {

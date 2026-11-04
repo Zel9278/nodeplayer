@@ -24,6 +24,27 @@ remembered for later scans.
 
 The data folder is listed in [Files and troubleshooting](files-and-troubleshooting.md).
 
+## Hosting and latency
+
+VST3 and CLAP plugins run in separate worker processes by default. Each worker owns one
+complete plugin instance: DSP, parameters, state and native editor. The graph displays the
+latest editor image while native drawing and input run in the worker, so a slow plugin
+editor does not hold up graph movement or scaling. JSFX and native plugins keep their
+existing hosting.
+
+Each worker adds 4096 frames of audio bridge latency, about 85 ms at 48 kHz or 93 ms at
+44.1 kHz, in addition to the plugin's own latency. Delay compensation is enabled with
+worker hosting to align parallel graph paths. Plugins in series add their latencies.
+
+Start nodeplayer with `--in-process-plugins` to run VST3/CLAP plugins inside the app instead.
+Delay compensation is then off unless `--experimental-pdc` is also present, in either
+argument order. `--experimental-plugin-isolation` remains accepted as a compatibility alias
+for worker hosting; if both hosting flags are present, the last one selects the mode.
+Workers require a supported 64-bit platform and, on Linux, X11/XWayland. A worker setup
+failure is reported instead of silently loading the plugin inside the app.
+These requirements are checked when creating a plugin. A native Wayland main window can
+use separate X11 editor windows when XWayland is available.
+
 ## On the node
 
 - **Editor** opens the plugin's own window (VST3 and CLAP), drawn inside the node. **Pop out**
@@ -46,9 +67,8 @@ including outside the editor image. Escape or a click outside closes the popup.
 Windows layered menus retain their uploaded pixels and transparency in the graph.
 Keyboard/IME, drag-and-drop, blocking native menus, and unrelated popup windows are
 not forwarded; use **Pop out** for those interactions. Capture can
-fail for some GPU-rendered editors. With `--experimental-plugin-isolation`,
-capture and native input stay in the worker.
-On macOS, isolation requires this captured-editor mode. Linux requires X11/XWayland.
+fail for some GPU-rendered editors. Capture and native input stay in the worker under
+default hosting. With `--in-process-plugins`, they run on the app's UI thread.
 
 JSFX nodes show the effect's visible sliders, and effects with graphics (`@gfx`) draw them in
 the node, with the mouse, wheel, keys and `gfx_showmenu` menus working. Hidden sliders are under
@@ -81,10 +101,15 @@ keeps its default 120 BPM and 4/4.
 
 ## When a plugin crashes
 
-Plugins run inside nodeplayer, so one that crashes takes the app with it. nodeplayer notes
+Under default hosting, a VST3/CLAP worker that crashes or stops responding is marked as
+faulted on its node. **Restart host** starts a new worker from the last saved state and
+retained parameter changes. Recovery is explicit; the app does not restart a faulty worker
+in a loop.
+
+Plugins hosted inside nodeplayer can take the app down if they crash. nodeplayer notes
 which plugin it was calling into; on the next start a banner names it, and it goes on the
-disabled list: it isn't loaded, and nodes using it are skipped, until you press "Enable" at the
-top of the 🔌 tab.
+disabled list: it isn't loaded, and nodes using it are skipped, until you press "Enable" at
+the top of the 🔌 tab.
 
 Scanning is safe: each plugin file is scanned in a separate process, so a plugin that crashes
 while being scanned doesn't take the app down.
