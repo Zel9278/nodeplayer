@@ -91,6 +91,10 @@ to check that a stationary-cursor animation actually produces new pixels.
 For steady delivery measurements, use the periodic progress events before a screenshot,
 since PNG encoding pauses the diagnostic UI. The ignored `frame_transfer_timings` test
 reports shared-memory publish/read costs separately from capture and rendering.
+Progress events also report `ui_frame` and `max_ui_frame_interval_seconds` independently
+of editor image delivery. The counter tracks application UI frames, and the interval is
+the largest UI frame interval since the previous progress event; neither measures
+compositor presentation. This distinguishes slow plugin images from a stalled graph UI.
 
 Captured `open-editor` steps wait for the first delivered image. A worker fault, capture
 error, missing startup frame, or stale delivery fails the run even if its later steps
