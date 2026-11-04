@@ -1,3 +1,7 @@
+// Windows: a window app, so starting it opens no terminal; one started from a terminal still
+// writes there (see `attach_console`). Debug builds and tests keep their console.
+#![cfg_attr(all(windows, not(debug_assertions), not(test)), windows_subsystem = "windows")]
+
 mod about;
 mod app;
 mod audio2midi;
@@ -13,6 +17,7 @@ mod eq_editor;
 mod fonts;
 mod info;
 mod graph;
+mod instance;
 mod jsfx;
 mod library;
 mod loop_editor;
@@ -25,6 +30,8 @@ mod midir_io;
 mod misskey;
 mod mpris;
 mod native;
+#[cfg(target_os = "macos")]
+mod open_documents;
 mod player;
 mod plugins;
 mod r2;
@@ -43,7 +50,21 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow};
 
+/// A window app started from a terminal (or `--help`) writes to that terminal. Output a
+/// parent redirected (plugin workers, scans) stays where it goes.
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_console() {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE};
+    unsafe {
+        if GetStdHandle(STD_ERROR_HANDLE).is_ok_and(|h| h.is_invalid() || h.0.is_null()) {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    #[cfg(all(windows, not(debug_assertions)))]
+    attach_console();
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn,nodeplayer=info"),
     )
@@ -58,8 +79,8 @@ fn main() -> Result<()> {
         diagnostics::set_active(run.clone())?;
     }
     runtime::install(parsed.options)?;
-    let initial_file = match parsed.mode {
-        runtime::Mode::Gui { initial_file } => initial_file,
+    let (files, new_instance) = match parsed.mode {
+        runtime::Mode::Gui { files, new_instance } => (files, new_instance),
         runtime::Mode::ScanPlugin { format, path } => return plugins::scan_main(&format, &path),
         runtime::Mode::TestPlugin {
             format,
@@ -87,6 +108,16 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // A nodeplayer already running takes the files (and comes to the front) instead of a
+    // second window opening. Diagnostic runs are always separate.
+    if diagnostic.is_none() && !new_instance && matches!(instance::claim(&files), instance::Claim::Forwarded) {
+        return Ok(());
+    }
+    // Files opened from the Finder come as Apple events, also while running.
+    #[cfg(target_os = "macos")]
+    if diagnostic.is_none() {
+        open_documents::install();
+    }
     // Backend requirements are checked per plugin by remote::supported. A native
     // Wayland main window can still play without plugins and use separate X11
     // editor windows when XWayland is available.
@@ -107,7 +138,7 @@ fn main() -> Result<()> {
         options,
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx);
-            let mut app = app::App::new(initial_file, &cc.egui_ctx);
+            let mut app = app::App::new(files, &cc.egui_ctx);
             if let Some(run) = diagnostic.clone() {
                 app.attach_diagnostic(run);
             }

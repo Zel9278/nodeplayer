@@ -405,7 +405,10 @@ fn unpack_into(archive: &Path, tmp: &Path) -> Result<()> {
         let name = name.as_str();
         let found = find_file(&all, name).ok_or_else(|| anyhow!("no {name} in the archive"))?;
         std::fs::rename(&found, bin.join(name))?;
-        let ok = std::process::Command::new(bin.join(name)).arg("-version").output().is_ok_and(|o| o.status.success());
+        let ok = crate::av::hide_console(&mut std::process::Command::new(bin.join(name)))
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success());
         if !ok {
             bail!("the downloaded {name} doesn't run");
         }

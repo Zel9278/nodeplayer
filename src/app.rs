@@ -365,7 +365,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(initial_file: Option<PathBuf>, ctx: &egui::Context) -> Self {
+    pub fn new(files: Vec<PathBuf>, ctx: &egui::Context) -> Self {
         let mut messages = Vec::new();
         let engine = match if crate::runtime::get().allow_audio_device() {
             Engine::start()
@@ -486,10 +486,10 @@ impl App {
         }
         app.library.sort = saved.library_sort;
         app.library.columns = saved.library_columns.clone().unwrap_or_default();
-        match initial_file {
-            Some(f) if f.is_dir() => app.library.open(f),
-            Some(f) => app.load_file(&f),
-            None => {
+        match files.as_slice() {
+            // `nodeplayer <folder>` makes that folder the library.
+            [dir] if dir.is_dir() => app.library.open(dir.clone()),
+            _ => {
                 if !crate::runtime::get().allow_library_discovery() {
                     // Diagnostic profiles never restore or discover ordinary media roots.
                 } else if !saved.library_sources.is_empty() {
@@ -497,8 +497,11 @@ impl App {
                 } else if let Some(dir) = saved.library_root.clone().filter(|d| d.is_dir()).or_else(library::load_last_folder) {
                     app.library.open(dir);
                 }
-                // Bring back the last track, paused where it was.
-                if let Some(track) = saved.track.filter(|t| t.is_file()) {
+                if !files.is_empty() {
+                    // Opened from a file manager or the command line: added and played.
+                    app.open_paths(files);
+                } else if let Some(track) = saved.track.filter(|t| t.is_file()) {
+                    // Bring back the last track, paused where it was.
                     app.player.load(&track);
                     app.player.set_playing(false);
                     app.restored_track = Some(track);
@@ -1205,12 +1208,29 @@ impl App {
         self.reveal_current = true;
     }
 
-    fn open_dropped(&mut self, path: PathBuf) {
-        if path.is_dir() {
-            self.library.add(library::Source::Folder(path));
+    /// Opens files and folders dropped on the window or handed over by the system (a file
+    /// manager, a second start): folders join the library, audio, video and MIDI files are
+    /// added to it as tracks (unless it has them already), and the first file plays.
+    fn open_paths(&mut self, paths: Vec<PathBuf>) {
+        let mut sources = Vec::new();
+        let mut first = None;
+        for path in paths {
+            if path.is_dir() {
+                sources.push(library::Source::Folder(path));
+            } else if path.is_file() {
+                if library::is_media(&path) && self.library.index_of(&path).is_none() {
+                    sources.push(library::Source::File(path.clone()));
+                }
+                first.get_or_insert(path);
+            }
+        }
+        if sources.iter().any(|s| matches!(s, library::Source::Folder(_))) {
             self.show_tab(Tab::Library);
-        } else {
-            self.load_file(&path);
+        }
+        self.library.add_all(sources);
+        // Selected in the list once the scan with it finishes (the list follows the player).
+        if let Some(f) = first {
+            self.load_file(&f);
         }
     }
 
@@ -1911,7 +1931,7 @@ impl App {
             }
         });
         if self.library.sources.is_empty() {
-            ui.weak("Add a folder or files, or drop a folder onto the window.");
+            ui.weak("Add a folder or files, or drop them onto the window.");
             return;
         }
         let (folders, files) = self.library.sources.iter().fold((0, 0), |(d, f), s| match s {
@@ -2671,6 +2691,12 @@ impl eframe::App for App {
         }
         self.tick_diagnostic(ctx);
         self.poll_background();
+        // Files from a second start or the system: open them, and come to the front.
+        if let Some(files) = crate::instance::take() {
+            self.open_paths(files);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.keep_selection(false);
         self.sync_loop();
         let events = self.mpris.as_ref().map(|m| m.events()).unwrap_or_default();
@@ -2735,8 +2761,8 @@ impl eframe::App for App {
         let mut actions = Vec::new();
 
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
-        if let Some(p) = dropped.into_iter().next() {
-            self.open_dropped(p);
+        if !dropped.is_empty() {
+            self.open_paths(dropped);
         }
         // Space plays and pauses, unless something is being typed. Taken before any widget
         // sees it, so it doesn't also press the focused button.

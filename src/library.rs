@@ -295,8 +295,18 @@ impl Library {
 
     /// Adds a folder or file unless it's already there, and scans again.
     pub fn add(&mut self, source: Source) {
-        if !self.sources.contains(&source) {
-            self.sources.push(source);
+        self.add_all(vec![source]);
+    }
+
+    /// Adds the sources the library doesn't have yet, with one scan for all of them.
+    pub fn add_all(&mut self, sources: Vec<Source>) {
+        let before = self.sources.len();
+        for source in sources {
+            if !self.sources.contains(&source) {
+                self.sources.push(source);
+            }
+        }
+        if self.sources.len() > before {
             self.rescan();
         }
     }
