@@ -55,9 +55,22 @@ pub fn available() -> bool {
     tool("ffmpeg").is_some() && tool("ffprobe").is_some()
 }
 
+/// Runs a console program without a console window of its own: nodeplayer is a window app on
+/// Windows, so one would pop up for each run.
+pub fn hide_console(c: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    c
+}
+
 fn command(name: &str) -> Result<Command> {
     let path = tool(name).ok_or_else(|| anyhow!("FFmpeg isn't installed (no {name})"))?;
     let mut c = Command::new(path);
+    hide_console(&mut c);
     if name == "ffmpeg" {
         c.arg("-nostdin");
     }

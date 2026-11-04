@@ -7,7 +7,8 @@ use std::{
     time::Duration,
 };
 
-pub const HELP: &str = "nodeplayer [options] [file-or-folder]\n\
+pub const HELP: &str = "nodeplayer [options] [files-or-folders...]\n\
+  --new-instance                     Start a separate one, not the one already running\n\
   --in-process-plugins               Run VST3/CLAP locally instead of in workers\n\
   --experimental-pdc                 Enable delay compensation with local plugins\n\
   --experimental-plugin-isolation    Compatibility alias for worker hosting\n\
@@ -119,7 +120,10 @@ pub fn get() -> &'static RuntimeOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Gui {
-        initial_file: Option<PathBuf>,
+        /// Files and folders to open (from the command line or a file manager).
+        files: Vec<PathBuf>,
+        /// Start a window of its own instead of handing `files` to a running nodeplayer.
+        new_instance: bool,
     },
     ScanPlugin {
         format: String,
@@ -194,6 +198,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
     let mut legacy_capture_flag = false;
     let mut explicit_pdc = false;
     let mut explicit_hosting = false;
+    let mut new_instance = false;
     while let Some(arg) = args.next() {
         if literal {
             positional.push(arg);
@@ -215,6 +220,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
                 options.experimental_plugin_isolation = false;
                 explicit_hosting = true;
             }
+            Some("--new-instance") => new_instance = true,
             // Embedded editors always use capture; accept existing launch commands.
             Some("--experimental-editor-capture") => legacy_capture_flag = true,
             Some("--data-root") => {
@@ -321,8 +327,10 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs
         Mode::Help
     } else {
         match mode {
+            // Unknown options are tolerated here, but they're not paths to open.
             None if count <= 1 || !explicit_policy => Mode::Gui {
-                initial_file: p.next().map(PathBuf::from),
+                files: p.filter(|a| !unknown_options.contains(a)).map(PathBuf::from).collect(),
+                new_instance,
             },
             Some("scan") if count == 2 => Mode::ScanPlugin {
                 format: utf8(p.next().unwrap(), "format")?,
@@ -384,13 +392,24 @@ mod tests {
         assert_eq!(
             p.mode,
             Mode::Gui {
-                initial_file: Some("音 楽/file.flac".into())
+                files: vec!["音 楽/file.flac".into()],
+                new_instance: false,
             }
         );
         assert_eq!(
             parse(&["--", "--song"]).unwrap().mode,
             Mode::Gui {
-                initial_file: Some("--song".into())
+                files: vec!["--song".into()],
+                new_instance: false,
+            }
+        );
+        // Several files (a file manager may hand over a selection), and the opt-out of
+        // handing them to the running nodeplayer.
+        assert_eq!(
+            parse(&["--new-instance", "a.flac", "b"]).unwrap().mode,
+            Mode::Gui {
+                files: vec!["a.flac".into(), "b".into()],
+                new_instance: true,
             }
         );
     }
@@ -399,11 +418,12 @@ mod tests {
         let p = parse(&["--experimental-plugin-isolation", "--data-root", "a b"]).unwrap();
         assert!(p.options.experimental_pdc && p.options.experimental_plugin_isolation);
         let capture = parse(&["--experimental-editor-capture"]).unwrap();
-        assert!(matches!(capture.mode, Mode::Gui { initial_file: None }));
+        assert!(matches!(capture.mode, Mode::Gui { files, .. } if files.is_empty()));
         assert!(capture.options.experimental_plugin_isolation && capture.options.experimental_pdc);
         assert!(parse(&["--experimental-editor-capture", "--unknown"]).is_err());
         // Default worker hosting does not change the legacy positional parser.
-        assert!(matches!(parse(&["--unknown"]).unwrap().mode, Mode::Gui { .. }));
+        // ...but an unknown option isn't taken for a file to open.
+        assert!(matches!(parse(&["--unknown"]).unwrap().mode, Mode::Gui { files, .. } if files.is_empty()));
         assert!(matches!(parse(&["a", "b"]).unwrap().mode, Mode::Gui { .. }));
         assert!(parse(&["--experimental-pdc", "--unknown"]).is_err());
         assert!(parse(&["--in-process-plugins", "--unknown"]).is_err());
@@ -423,7 +443,8 @@ mod tests {
         assert_eq!(
             local.mode,
             Mode::Gui {
-                initial_file: Some("song.flac".into())
+                files: vec!["song.flac".into()],
+                new_instance: false,
             }
         );
         for flags in [
@@ -568,7 +589,8 @@ mod tests {
         assert_eq!(
             parse_args([path.clone()]).unwrap().mode,
             Mode::Gui {
-                initial_file: Some(path.into())
+                files: vec![path.into()],
+                new_instance: false,
             }
         );
     }
