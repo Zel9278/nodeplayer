@@ -1,9 +1,11 @@
-# Experimental remote plugin backend
+# Remote plugin backend
 
 This module owns VST3 / CLAP **whole-plugin child processes**, including component,
 controller, native editor, state and destruction. It is not an OS permission sandbox.
-It must be explicitly enabled by the parent; it never falls back to loading a binary
-in the parent. JSFX / Native are not routed here.
+The parent uses this backend by default. `--in-process-plugins` selects local hosting;
+`--experimental-plugin-isolation` remains a compatibility alias for worker hosting.
+Worker startup failures never fall back to loading a binary in the parent. JSFX / Native
+are not routed here.
 
 ## Integration
 
@@ -182,9 +184,10 @@ Graph movement and zoom transform the latest image on every parent frame, includ
 frames without a new capture. They do not move, mask, resize, or rescale the native source.
 The editor API and worker protocol carry no graph-scale requests.
 Pop-out editors retain ordinary native behavior.
-Windows layered popup windows require compositor bitmap capture, which this Win32
-printing backend does not provide. They produce an explicit capture error directing
-the user to Pop out; a stock-window caption is not accepted as the popup image.
+On Windows x86/x64, the adapter retains owned layered-window bitmap uploads, including
+per-pixel alpha, before the plugin reuses its source bitmap. Upload positions remain
+off the desktop. The retained bitmap supplies the popup image alongside ordinary
+Win32 client printing.
 
 Captured RGBA8 pixels use a separate bounded latest-frame mmap; they never enter the
 audio slots or the JSON control replies. Atomic slot ownership allows replacing an

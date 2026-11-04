@@ -64,6 +64,8 @@ and Ubuntu.
 Plugin editors are X11 windows and can only be embedded into an X11 window, so nodeplayer
 runs through XWayland. With `NODEPLAYER_WAYLAND=1` it opens as a Wayland window instead; editors
 then open in their own windows.
+VST3/CLAP workers still require an X11/XWayland display. If it is unavailable, those plugin
+nodes report an error; the main app can run with its other node types.
 
 ### The app closed while a plugin was in use
 

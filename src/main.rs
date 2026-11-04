@@ -87,15 +87,9 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if runtime::get().experimental_plugin_isolation {
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        if std::env::var_os("NODEPLAYER_WAYLAND").is_some() || std::env::var_os("DISPLAY").is_none()
-        {
-            anyhow::bail!(
-                "experimental plugin isolation requires X11/XWayland for embedded editors"
-            );
-        }
-    }
+    // Backend requirements are checked per plugin by remote::supported. A native
+    // Wayland main window can still play without plugins and use separate X11
+    // editor windows when XWayland is available.
     plugins::guard::install();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
