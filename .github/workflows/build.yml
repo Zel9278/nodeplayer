@@ -114,7 +114,17 @@ jobs:
         if: matrix.test
         run: cargo test --release --locked --target ${{ matrix.target }}
 
-      # The archive has the license and the README; .tar.gz keeps the executable bit.
+      # macOS ships as nodeplayer.app. Made on every run, so the bundle is checked too.
+      - name: macOS app
+        if: startsWith(matrix.package, 'macos')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          mkdir -p dist
+          sh packaging/macos/make-app.sh "target/${{ matrix.target }}/release/${{ matrix.exe }}" "$version" dist
+          plutil -lint dist/nodeplayer.app/Contents/Info.plist
+
+      # The archive has the license and the README. Linux's is a .tar.gz, which keeps the
+      # executable bit; macOS's a zip of the app made by ditto, which keeps the bundle intact.
       - name: Upload to the release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -123,14 +133,24 @@ jobs:
         run: |
           dir="nodeplayer-${GITHUB_REF_NAME}-${{ matrix.package }}"
           mkdir "$dir"
-          cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" LICENSE README.md "$dir/"
-          if [ "${{ matrix.package }}" = windows-x86_64 ]; then
-            archive="$dir.zip"
-            zip -qr "$archive" "$dir"
-          else
-            archive="$dir.tar.gz"
-            tar -czf "$archive" "$dir"
-          fi
+          cp LICENSE README.md "$dir/"
+          case "${{ matrix.package }}" in
+            windows-*)
+              cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" "$dir/"
+              archive="$dir.zip"
+              zip -qr "$archive" "$dir"
+              ;;
+            macos-*)
+              cp -R dist/nodeplayer.app "$dir/"
+              archive="$dir.zip"
+              ditto -c -k --keepParent "$dir" "$archive"
+              ;;
+            *)
+              cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" "$dir/"
+              archive="$dir.tar.gz"
+              tar -czf "$archive" "$dir"
+              ;;
+          esac
           gh release upload "$GITHUB_REF_NAME" "$archive" --repo "$GITHUB_REPOSITORY" --clobber
 
   publish:

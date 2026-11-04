@@ -37,8 +37,8 @@ delay compensation. See [Plugins](docs/plugins.md) for hosting behavior and limi
 Builds for Linux (x86_64), Windows (x86_64) and macOS (Apple silicon and Intel) are on the
 [releases page](https://github.com/Zel9278/nodeplayer/releases). Unpack and run; FFmpeg, used
 for video and some formats, is offered as a download on first start (on macOS, install it with
-`brew install ffmpeg`). The macOS builds aren't signed: allow them in System Settings → Privacy
-& Security, or run `xattr -d com.apple.quarantine nodeplayer` once.
+`brew install ffmpeg`). On macOS it's `nodeplayer.app`, which isn't signed: allow it in System
+Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine nodeplayer.app` once.
 
 ## Documentation
 
