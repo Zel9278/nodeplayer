@@ -121,6 +121,11 @@ pub enum NodeKind {
     GroupIn,
     /// Inside a group: what leaves the group.
     GroupOut,
+    /// Hands what comes in (audio and MIDI) to every [`NodeKind::Receive`] of the same name,
+    /// anywhere in the graph, groups included, without a wire.
+    Send { name: String },
+    /// Gives out what reaches the [`NodeKind::Send`] nodes of its name, mixed.
+    Receive { name: String },
 }
 
 impl NodeKind {
@@ -169,6 +174,8 @@ impl NodeKind {
             Self::Group(g) => g.name.clone(),
             Self::GroupIn => "Group input".into(),
             Self::GroupOut => "Group output".into(),
+            Self::Send { name } => format!("Send → {name}"),
+            Self::Receive { name } => format!("Receive ← {name}"),
         }
     }
 
@@ -180,7 +187,8 @@ impl NodeKind {
             | Self::MidiOut(_)
             | Self::MidiMonitor(_)
             | Self::CSynth(_)
-            | Self::GroupIn => 0,
+            | Self::GroupIn
+            | Self::Receive { .. } => 0,
             Self::Mixer { .. } => MIXER_INPUTS,
             _ => 1,
         }
@@ -192,14 +200,15 @@ impl NodeKind {
             | Self::MidiIn(_)
             | Self::MidiOut(_)
             | Self::MidiMonitor(_)
-            | Self::GroupOut => 0,
+            | Self::GroupOut
+            | Self::Send { .. } => 0,
             _ => 1,
         }
     }
 
     pub fn midi_input(&self) -> bool {
         match self {
-            Self::MidiOut(_) | Self::MidiMonitor(_) | Self::CSynth(_) | Self::Group(_) | Self::GroupOut => true,
+            Self::MidiOut(_) | Self::MidiMonitor(_) | Self::CSynth(_) | Self::Group(_) | Self::GroupOut | Self::Send { .. } => true,
             Self::Plugin(p) => p.instance.midi_ports().0,
             _ => false,
         }
@@ -207,7 +216,13 @@ impl NodeKind {
 
     pub fn midi_output(&self) -> bool {
         match self {
-            Self::Player | Self::MidiIn(_) | Self::MidiMonitor(_) | Self::Audio2Midi(_) | Self::Group(_) | Self::GroupIn => true,
+            Self::Player
+            | Self::MidiIn(_)
+            | Self::MidiMonitor(_)
+            | Self::Audio2Midi(_)
+            | Self::Group(_)
+            | Self::GroupIn
+            | Self::Receive { .. } => true,
             Self::Plugin(p) => p.instance.midi_ports().1,
             _ => false,
         }
@@ -215,10 +230,10 @@ impl NodeKind {
 
     /// Stereo inputs and outputs of the node's engine slot. The group's input and output
     /// nodes have one more than they show: the group feeds the first, the second feeds it.
+    /// Likewise a Send's hidden output feeds the Receives of its name.
     pub fn engine_ports(&self) -> (usize, usize) {
         match self {
-            Self::GroupIn => (1, 1),
-            Self::GroupOut => (1, 1),
+            Self::GroupIn | Self::GroupOut | Self::Send { .. } | Self::Receive { .. } => (1, 1),
             k => (k.audio_inputs(), k.audio_outputs()),
         }
     }
@@ -260,8 +275,11 @@ impl NodeKind {
             Self::MidiIn(m) | Self::MidiOut(m) => Box::new(m.processor()),
             Self::MidiMonitor(m) => Box::new(m.processor()),
             Self::CSynth(c) => Box::new(c.processor()),
-            // A group's own slot takes what comes in; the nodes inside pass it on.
-            Self::Group(_) | Self::GroupIn | Self::GroupOut => Box::new(nodes::MidiBridge { thru: true, ..Default::default() }),
+            // A group's own slot takes what comes in; the nodes inside pass it on. Sends and
+            // Receives pass it on the same way, along the links compiled between them.
+            Self::Group(_) | Self::GroupIn | Self::GroupOut | Self::Send { .. } | Self::Receive { .. } => {
+                Box::new(nodes::MidiBridge { thru: true, ..Default::default() })
+            }
             Self::Plugin(_) => return None,
         })
     }
@@ -302,10 +320,16 @@ impl IdAlloc {
 pub fn rate_shift(snarl: &mut Snarl<GraphNode>) -> f32 {
     let mut fed: std::collections::HashSet<NodeId> = snarl.node_ids().filter(|(_, n)| matches!(n.kind, NodeKind::Player)).map(|(id, _)| id).collect();
     let mut stack: Vec<NodeId> = fed.iter().copied().collect();
+    let links = bus_links(snarl);
     while let Some(n) = stack.pop() {
         for (o, i) in snarl.wires() {
             if o.node == n && !snarl[o.node].kind.is_midi_output(o.output) && fed.insert(i.node) {
                 stack.push(i.node);
+            }
+        }
+        for &(from, to) in &links {
+            if from == n && fed.insert(to) {
+                stack.push(to);
             }
         }
     }
@@ -330,6 +354,10 @@ pub fn would_cycle(snarl: &Snarl<GraphNode>, from: NodeId, to: NodeId) -> bool {
     for (o, i) in snarl.wires() {
         adj.entry(o.node).or_default().push(i.node);
     }
+    // A Send reaches the Receives of its name as if wired to them.
+    for (from, to_node) in bus_links(snarl) {
+        adj.entry(from).or_default().push(to_node);
+    }
     let mut stack = vec![to];
     let mut seen = std::collections::HashSet::new();
     while let Some(n) = stack.pop() {
@@ -341,6 +369,39 @@ pub fn would_cycle(snarl: &Snarl<GraphNode>, from: NodeId, to: NodeId) -> bool {
         }
     }
     false
+}
+
+/// Each Send in `snarl` (this level only) with each Receive of its name there.
+fn bus_links(snarl: &Snarl<GraphNode>) -> Vec<(NodeId, NodeId)> {
+    let mut links = Vec::new();
+    for (from, f) in snarl.node_ids() {
+        let NodeKind::Send { name } = &f.kind else { continue };
+        for (to, t) in snarl.node_ids() {
+            if matches!(&t.kind, NodeKind::Receive { name: n } if n == name) {
+                links.push((from, to));
+            }
+        }
+    }
+    links
+}
+
+/// Every Send's and Receive's name with its engine slot, in `snarl` and the groups inside it.
+fn collect_buses(snarl: &Snarl<GraphNode>, sends: &mut Vec<(String, u32)>, receives: &mut Vec<(String, u32)>) {
+    for node in snarl.nodes() {
+        match &node.kind {
+            NodeKind::Send { name } => sends.push((name.clone(), node.eid)),
+            NodeKind::Receive { name } => receives.push((name.clone(), node.eid)),
+            NodeKind::Group(g) => collect_buses(&g.snarl, sends, receives),
+            _ => {}
+        }
+    }
+}
+
+/// The names the Send nodes in `snarl` (groups included) send on.
+pub fn send_names(snarl: &Snarl<GraphNode>, out: &mut std::collections::BTreeSet<String>) {
+    let (mut sends, mut receives) = (Vec::new(), Vec::new());
+    collect_buses(snarl, &mut sends, &mut receives);
+    out.extend(sends.into_iter().map(|(name, _)| name));
 }
 
 /// Every node in `snarl` and in the groups inside it, groups' own nodes left out.
@@ -400,8 +461,8 @@ impl Flat {
                 id: node.eid,
                 audio_inputs,
                 audio_outputs,
-                midi_input: node.kind.midi_input() || matches!(node.kind, NodeKind::GroupIn),
-                midi_output: node.kind.midi_output() || matches!(node.kind, NodeKind::GroupOut),
+                midi_input: node.kind.midi_input() || matches!(node.kind, NodeKind::GroupIn | NodeKind::Receive { .. }),
+                midi_output: node.kind.midi_output() || matches!(node.kind, NodeKind::GroupOut | NodeKind::Send { .. }),
                 sink: matches!(node.kind, NodeKind::Output { .. }),
                 midi_sink: matches!(node.kind, NodeKind::MidiOut(_)),
                 timing,
@@ -440,6 +501,19 @@ impl Flat {
             }
         }
         Ok(())
+    }
+
+    /// Links each Send, anywhere in the graph, to the Receives of its name: its hidden output
+    /// to their hidden input, and its MIDI along. Receives of one name mix their Sends.
+    fn link_buses(&mut self, snarl: &Snarl<GraphNode>) {
+        let (mut sends, mut receives) = (Vec::new(), Vec::new());
+        collect_buses(snarl, &mut sends, &mut receives);
+        for (name, from) in &sends {
+            for (_, to) in receives.iter().filter(|(n, _)| n == name) {
+                self.audio.push(((*from, 0), (*to, 0)));
+                self.midi.push((*from, *to));
+            }
+        }
     }
 
     /// Topologically sorts every slot, including the latest upstream group expansion.
@@ -559,6 +633,7 @@ pub fn compile_with_timing_limits(
 ) -> Result<Schedule> {
     let mut flat = Flat::default();
     flat.add(snarl, enabled)?;
+    flat.link_buses(snarl);
     flat.schedule(enabled, limits)
 }
 
@@ -617,6 +692,68 @@ mod tests {
             assert!(pos(a) < pos(b), "{a} before {b}");
         }
         assert_eq!(path_to(&snarl, 11), Some((vec![gr], g)));
+    }
+
+    #[test]
+    fn sends_reach_receives_of_their_name_across_groups() {
+        let at = egui::pos2(0.0, 0.0);
+        let send = |name: &str| NodeKind::Send { name: name.into() };
+        let receive = |name: &str| NodeKind::Receive { name: name.into() };
+        // Inside a group: a Send "a" fed by nothing but the group's input.
+        let mut inside = Snarl::new();
+        let gi = inside.insert_node(at, GraphNode { eid: 10, kind: NodeKind::GroupIn });
+        let s2 = inside.insert_node(at, GraphNode { eid: 11, kind: send("a") });
+        wire(&mut inside, gi, 0, s2, 0);
+        wire(&mut inside, gi, 1, s2, 1);
+        // Outside: Player → Send "a"; Receive "a" → Output; a Receive "b" nobody sends to.
+        let mut snarl = Snarl::new();
+        let p = snarl.insert_node(at, GraphNode { eid: 0, kind: NodeKind::Player });
+        let s1 = snarl.insert_node(at, GraphNode { eid: 1, kind: send("a") });
+        let r = snarl.insert_node(at, GraphNode { eid: 2, kind: receive("a") });
+        let out = snarl.insert_node(at, GraphNode { eid: 3, kind: NodeKind::output() });
+        snarl.insert_node(at, GraphNode { eid: 4, kind: receive("b") });
+        let gr = snarl.insert_node(at, GraphNode { eid: 5, kind: NodeKind::Group(Box::new(GroupNode { name: "G".into(), snarl: inside })) });
+        wire(&mut snarl, p, 0, s1, 0);
+        wire(&mut snarl, p, 1, s1, 1);
+        wire(&mut snarl, p, 0, gr, 0);
+        wire(&mut snarl, r, 0, out, 0);
+
+        for pdc in [false, true] {
+            let s = compile_with_timing(&snarl, pdc).unwrap();
+            let step = |eid: u32| s.steps.iter().find(|st| st.node == eid).unwrap_or_else(|| panic!("no step for {eid}"));
+            let pos = |eid: u32| s.steps.iter().position(|st| st.node == eid).unwrap();
+            // Both Sends of "a", the one in the group too, mix into the Receive.
+            let mut sources = step(2).inputs[0].clone();
+            sources.sort();
+            assert_eq!(sources, vec![(1, 0), (11, 0)]);
+            let mut midi = step(2).midi.clone();
+            midi.sort();
+            assert_eq!(midi, vec![1, 11]);
+            assert!(pos(1) < pos(2) && pos(11) < pos(2), "Sends run before their Receive");
+            assert_eq!(step(3).inputs, vec![vec![(2, 0)]]);
+            assert_eq!(step(4).inputs, vec![Vec::new()], "a Receive with no Send gets silence");
+        }
+
+        // Wiring the Receive back into its Send would loop through the link.
+        assert!(would_cycle(&snarl, r, s1));
+        assert!(!would_cycle(&snarl, p, s1));
+        let mut names = std::collections::BTreeSet::new();
+        send_names(&snarl, &mut names);
+        assert_eq!(names.into_iter().collect::<Vec<_>>(), ["a"]);
+    }
+
+    #[test]
+    fn rate_shift_counts_through_a_send() {
+        let at = egui::pos2(0.0, 0.0);
+        let mut snarl = Snarl::new();
+        let p = snarl.insert_node(at, GraphNode { eid: 0, kind: NodeKind::Player });
+        let s = snarl.insert_node(at, GraphNode { eid: 1, kind: NodeKind::Send { name: "x".into() } });
+        let r = snarl.insert_node(at, GraphNode { eid: 2, kind: NodeKind::Receive { name: "x".into() } });
+        let shift = snarl.insert_node(at, rate_node(1.5, false));
+        wire(&mut snarl, p, 0, s, 0);
+        wire(&mut snarl, r, 0, shift, 0);
+        assert_eq!(rate_shift(&mut snarl), 1.5);
+        assert!(active(&snarl, shift));
     }
 
     #[test]

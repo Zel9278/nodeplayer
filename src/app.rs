@@ -950,6 +950,8 @@ impl App {
                             }
                         }
                         SavedKind::MidiMonitor => NodeKind::MidiMonitor(Box::new(Monitor::new())),
+                        SavedKind::Send { name } => NodeKind::Send { name: name.clone() },
+                        SavedKind::Receive { name } => NodeKind::Receive { name: name.clone() },
                         SavedKind::CSynth(s) => NodeKind::CSynth(Box::new(CSynthNode::new(s.clone(), self.sample_rate))),
                         SavedKind::MidiFile(_)
                         | SavedKind::Plugin { .. }
@@ -2172,6 +2174,13 @@ impl App {
             self.snarl.nodes().any(|n| matches!(n.kind, NodeKind::GroupIn)),
             self.snarl.nodes().any(|n| matches!(n.kind, NodeKind::GroupOut)),
         );
+        // Sends anywhere: the level shown and the ones around it (inside a group, the levels
+        // above hold the rest of the graph).
+        let mut send_names = std::collections::BTreeSet::new();
+        graph::send_names(&self.snarl, &mut send_names);
+        for level in &self.outer {
+            graph::send_names(&level.snarl, &mut send_names);
+        }
         // Each level keeps its own pan, zoom and selection.
         let salt = egui::Id::new("graph").with(self.group_path());
         // The graph pans on the wheel before node bodies see it, so take it out first.
@@ -2204,6 +2213,7 @@ impl App {
             node_presets: &self.node_presets,
             in_group,
             group_io,
+            send_names,
         };
         // Selectable node titles would swallow drags meant to move the node.
         ui.style_mut().interaction.selectable_labels = false;
@@ -2950,6 +2960,8 @@ fn save_nodes_with_state(snarl: &Snarl<GraphNode>, only: Option<&HashSet<NodeId>
             NodeKind::Group(g) => SavedKind::Group { name: g.name.clone(), graph: save_nodes_with_state(&g.snarl, None, capture) },
             NodeKind::GroupIn => SavedKind::GroupIn,
             NodeKind::GroupOut => SavedKind::GroupOut,
+            NodeKind::Send { name } => SavedKind::Send { name: name.clone() },
+            NodeKind::Receive { name } => SavedKind::Receive { name: name.clone() },
             NodeKind::Plugin(p) => {
                 let _g = guard::enter(&p.tag);
                 let state = match capture {
@@ -3067,6 +3079,8 @@ struct Viewer<'a> {
     /// The graph shown is a group's inside, and whether it has its input and output nodes.
     in_group: bool,
     group_io: (bool, bool),
+    /// The names Send nodes anywhere in the graph send on, for the Receives to pick from.
+    send_names: std::collections::BTreeSet<String>,
 }
 
 impl Viewer<'_> {
@@ -3082,6 +3096,11 @@ const MIDI_COLOR: Color32 = Color32::from_rgb(255, 170, 60);
 
 fn midi_pin() -> PinInfo {
     PinInfo::square().with_fill(MIDI_COLOR)
+}
+
+/// A pin's name, kept whole: the pin columns are narrow, and a wrapped or cut label read "ou".
+fn pin_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend))
 }
 
 impl SnarlViewer<GraphNode> for Viewer<'_> {
@@ -3131,22 +3150,22 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
     fn show_input(&mut self, pin: &InPin, ui: &mut egui::Ui, snarl: &mut Snarl<GraphNode>) -> impl SnarlPin + 'static {
         let kind = &snarl[pin.id.node].kind;
         if kind.is_midi_input(pin.id.input) {
-            ui.label("MIDI");
+            pin_label(ui, "MIDI");
             return midi_pin();
         }
         match kind {
-            NodeKind::Mixer { .. } => ui.label(format!("in {}", pin.id.input + 1)),
-            _ => ui.label("in"),
+            NodeKind::Mixer { .. } => pin_label(ui, &format!("in {}", pin.id.input + 1)),
+            _ => pin_label(ui, "in"),
         };
         PinInfo::circle().with_fill(PIN_COLOR)
     }
 
     fn show_output(&mut self, pin: &OutPin, ui: &mut egui::Ui, snarl: &mut Snarl<GraphNode>) -> impl SnarlPin + 'static {
         if snarl[pin.id.node].kind.is_midi_output(pin.id.output) {
-            ui.label("MIDI");
+            pin_label(ui, "MIDI");
             return midi_pin();
         }
-        ui.label("out");
+        pin_label(ui, "out");
         PinInfo::circle().with_fill(PIN_COLOR)
     }
 
@@ -3221,6 +3240,43 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                 }
             }
             NodeKind::GroupIn | NodeKind::GroupOut => {}
+            NodeKind::Send { name } => {
+                let before = name.clone();
+                ui.add(egui::TextEdit::singleline(name).desired_width(110.0).hint_text("name"))
+                    .on_hover_text("Receive nodes with this name give out what comes in here, anywhere in the graph");
+                if *name != before {
+                    self.actions.push(Action::Changed);
+                }
+            }
+            NodeKind::Receive { name } => {
+                let before = name.clone();
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(name).desired_width(90.0).hint_text("name"))
+                        .on_hover_text("gives out what the Send nodes with this name take in, mixed");
+                    // A combo box draws its own arrow (the fonts may not have one).
+                    egui::ComboBox::from_id_salt(("receive names", node))
+                        .selected_text("")
+                        .width(12.0)
+                        .show_ui(ui, |ui| {
+                            if self.send_names.is_empty() {
+                                ui.weak("no Send nodes yet");
+                            }
+                            for n in &self.send_names {
+                                if ui.selectable_label(n == name, n).clicked() {
+                                    *name = n.clone();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("pick a Send's name");
+                });
+                if !self.send_names.contains(name.as_str()) {
+                    ui.weak("no Send with this name: silent");
+                }
+                if *name != before {
+                    self.actions.push(Action::Changed);
+                }
+            }
             NodeKind::Player => self.player.midi().ui(ui),
             NodeKind::Visual(v) => v.show(ui, self.sample_rate),
             NodeKind::Audio2Midi(a) => audio2midi_body(ui, a, eid, self.sample_rate),
@@ -3459,6 +3515,17 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         add(ui, "Kazu Limiter", NodeKind::limiter);
         if ui.button("Group").on_hover_text("a node with a graph inside; open it to add nodes and wire them").clicked() {
             self.actions.push(Action::AddGroup(pos));
+            ui.close();
+        }
+        // A new Send gets a name no other Send has; a new Receive listens to the first there is.
+        if ui.button("Send").on_hover_text("sends what comes in to the Receive nodes of its name, without a wire").clicked() {
+            let name = (1..).map(|i| format!("bus {i}")).find(|n| !self.send_names.contains(n)).unwrap_or_default();
+            self.actions.push(Action::Add(NodeKind::Send { name }, pos));
+            ui.close();
+        }
+        if ui.button("Receive").on_hover_text("gives out what the Send nodes of its name take in").clicked() {
+            let name = self.send_names.iter().next().cloned().unwrap_or_else(|| "bus 1".into());
+            self.actions.push(Action::Add(NodeKind::Receive { name }, pos));
             ui.close();
         }
         ui.menu_button("MIDI", |ui| {
@@ -3819,6 +3886,7 @@ mod graph_zoom_tests {
                     node_presets: &[],
                     in_group: false,
                     group_io: (false, false),
+                    send_names: Default::default(),
                 };
                 SnarlWidget::new().id(id).style(SnarlStyle {
                     min_scale: Some(if frame == 0 { initial } else { 0.2 }),

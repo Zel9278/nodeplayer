@@ -84,6 +84,9 @@ pub enum SavedKind {
     Group { name: String, graph: SavedGraph },
     GroupIn,
     GroupOut,
+    /// Sends to the Receives of its name, without a wire.
+    Send { name: String },
+    Receive { name: String },
     /// VST3 plugins as saved before other formats existed.
     Vst3 {
         path: PathBuf,

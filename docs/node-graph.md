@@ -36,6 +36,7 @@ as a dead end.
 | Mixer | Four inputs, each with its own gain. |
 | Kazu Limiter | Peak limiter (below). |
 | Playback Rate Shift | See [the playback rate](library-and-playback.md#the-playback-rate). |
+| Send, Receive | Carry audio and MIDI between two places without a wire (below). |
 | MIDI In, MIDI Out, MIDI Monitor, CSynth, Audio → MIDI | See [MIDI](midi.md). |
 
 ### EQ
@@ -116,6 +117,22 @@ Group output leaves by the group's outputs.
 - Removing a group removes everything in it. Groups are saved with the session, graph presets
   and node presets.
 - A plugin's editor inside a group shows while the group is open.
+
+## Send and Receive
+
+A **Send** node and a **Receive** node with the same name are connected without a wire: what
+goes into the Send (audio and MIDI) comes out of every Receive of that name. Use them to feed
+a visualizer far from the chain, or to take a signal into or out of a group.
+
+- Right-click → **Send** adds one with a new name ("bus 1", "bus 2", …); type over it to
+  rename it. Right-click → **Receive** adds one that listens to the first Send's name; ▾ on it
+  picks another, or type a name.
+- They work across the whole graph, groups included.
+- Several Sends with one name mix together; any number of Receives can listen to one name. A
+  Receive whose name no Send has gives out silence, and says so.
+- A Receive can't feed back into its own Send. Wiring that on one level is refused like any
+  other loop. A loop made by renaming, or through a group, silences the loop and what comes
+  after it until it's broken (with delay compensation on, the change is refused and logged).
 
 ## Presets
 
