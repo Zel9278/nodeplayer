@@ -58,7 +58,10 @@ Plugin state is saved with the session and presets, as is whether each editor wa
 
 When a plugin requests a restart, its instance stays alive while processing pauses for
 reactivation. Effects use continuously warmed, latency-aligned dry audio during the
-handoff, including with graph delay compensation off. Manual bypass keeps its immediate
+handoff, including with graph delay compensation off. Rapid CLAP restart requests are
+coalesced until the control has been quiet for 200 ms, with a maximum wait of one second,
+so intermediate knob positions do not each reactivate the plugin. Changing a plugin's
+actual lookahead still changes its audio delay. Manual bypass keeps its immediate
 behavior when graph delay compensation is off. Wires to pins that no longer exist are
 dropped. An isolated worker's latency and parameter metadata updates
 preserve the existing audio bridge and its history.

@@ -42,6 +42,41 @@ use crate::plugins::dylib::{self, Library};
 use crate::plugins::{self, Format, ParamDesc, Placement, PluginInfo};
 
 const QUEUE_LEN: usize = 1024;
+const RESTART_QUIET_PERIOD: Duration = Duration::from_millis(200);
+const RESTART_MAX_WAIT: Duration = Duration::from_secs(1);
+
+/// Latency controls can request reactivation for every intermediate knob position. CLAP
+/// permits deferring restart; continue the current configuration until requests settle.
+#[derive(Default)]
+struct RestartRequests {
+    first_request: Option<Instant>,
+    last_activity: Option<Instant>,
+}
+
+impl RestartRequests {
+    fn parameter_changed(&mut self, now: Instant) {
+        // A plugin may request restart only once while later edits keep accumulating.
+        if self.first_request.is_some() {
+            self.last_activity = Some(now);
+        }
+    }
+
+    fn poll(&mut self, requested: bool, now: Instant) -> bool {
+        if requested {
+            self.first_request.get_or_insert(now);
+            self.last_activity = Some(now);
+        }
+        let quiet = self.last_activity.is_some_and(|last| now.duration_since(last) >= RESTART_QUIET_PERIOD);
+        let overdue = self.first_request.is_some_and(|first| now.duration_since(first) >= RESTART_MAX_WAIT);
+        if quiet || overdue {
+            self.first_request = None;
+            self.last_activity = None;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 fn cstr(p: *const c_char) -> String {
     if p.is_null() { String::new() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned() }
@@ -600,6 +635,7 @@ pub struct ClapPlugin {
     /// Note dialects of the first note input and output port.
     notes: (Option<Dialect>, Option<Dialect>),
     active: bool,
+    restart_requests: RestartRequests,
     _module: Arc<Module>,
 }
 
@@ -672,6 +708,7 @@ impl ClapPlugin {
                 latency: 0,
                 notes: (None, None),
                 active: false,
+                restart_requests: RestartRequests::default(),
                 _module: module,
             };
             me.reload_params();
@@ -884,7 +921,9 @@ impl plugins::Instance for ClapPlugin {
 
     fn set_param(&mut self, id: u32, value: f64) {
         let plain = self.plain(id, value);
-        self.recent.insert(id, (plain, Instant::now()));
+        let now = Instant::now();
+        self.restart_requests.parameter_changed(now);
+        self.recent.insert(id, (plain, now));
         let _ = self.to_audio.push(ParamChange { id, value: plain });
     }
 
@@ -897,10 +936,14 @@ impl plugins::Instance for ClapPlugin {
         // only drop our overrides once it has caught up.
         while let Ok(ch) = self.from_audio.pop() {
             self.recent.remove(&ch.id);
+            if self.params.iter().any(|p| p.id == ch.id && !p.read_only) {
+                self.restart_requests.parameter_changed(Instant::now());
+            }
         }
         self.recent.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(1));
         self.pump();
         if self.shared.rescan_params.swap(false, Ordering::AcqRel) {
+            self.restart_requests.parameter_changed(Instant::now());
             self.reload_params();
         }
         let s = &self.shared;
@@ -914,7 +957,10 @@ impl plugins::Instance for ClapPlugin {
     }
 
     fn wants_restart(&mut self) -> bool {
-        self.shared.restart_requested.swap(false, Ordering::AcqRel)
+        self.restart_requests.poll(
+            self.shared.restart_requested.swap(false, Ordering::AcqRel),
+            Instant::now(),
+        )
     }
 
     fn restart(&mut self, sample_rate: f64, max_block: usize) -> Result<Box<dyn Processor>> {
@@ -1268,6 +1314,49 @@ impl Drop for ClapProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_restart_requests_wait_for_quiet_and_are_consumed_once() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut requests = RestartRequests::default();
+        assert!(!requests.poll(false, at(0)));
+        for ms in (0..=500).step_by(25) {
+            assert!(!requests.poll(true, at(ms)));
+        }
+        assert!(!requests.poll(false, at(699)));
+        assert!(requests.poll(false, at(700)));
+        assert!(!requests.poll(false, at(1000)));
+        assert!(!requests.poll(true, at(1500)));
+        assert!(requests.poll(false, at(1700)));
+    }
+
+    #[test]
+    fn continuously_repeated_requests_cannot_postpone_restart_forever() {
+        let start = Instant::now();
+        let mut requests = RestartRequests::default();
+        for ms in (0..1000).step_by(25) {
+            assert!(!requests.poll(true, start + Duration::from_millis(ms)));
+        }
+        assert!(requests.poll(true, start + RESTART_MAX_WAIT));
+        assert!(!requests.poll(false, start + RESTART_MAX_WAIT * 2));
+    }
+
+    #[test]
+    fn edits_after_a_single_restart_request_extend_the_quiet_period() {
+        let start = Instant::now();
+        let mut requests = RestartRequests::default();
+        assert!(!requests.poll(true, start));
+        for ms in (25..=500).step_by(25) {
+            let now = start + Duration::from_millis(ms);
+            requests.parameter_changed(now);
+            assert!(!requests.poll(false, now));
+        }
+        assert!(!requests.poll(false, start + Duration::from_millis(699)));
+        assert!(requests.poll(false, start + Duration::from_millis(700)));
+        requests.parameter_changed(start + Duration::from_millis(800));
+        assert!(!requests.poll(false, start + Duration::from_millis(1200)));
+    }
 
     #[test]
     fn process_receives_transport_and_keeps_running_while_paused() {
