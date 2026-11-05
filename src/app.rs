@@ -3676,28 +3676,15 @@ fn audio2midi_body(ui: &mut egui::Ui, a: &mut Audio2Midi, eid: u32, sample_rate:
         ui.small(format!("auto gain ×{:.2} · {rate:.0} events/s", a.gain()));
     });
 
-    // Sounding notes on a 128-key strip; C notes are marked.
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(384.0, 26.0), egui::Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(rect, 2.0, Color32::from_gray(20));
-    let w = rect.width() / 128.0;
-    for n in 0..128u8 {
-        let black = matches!(n % 12, 1 | 3 | 6 | 8 | 10);
-        let x = rect.left() + n as f32 * w;
-        let key = egui::Rect::from_min_max(pos2(x, rect.top()), pos2(x + w - 0.5, rect.bottom()));
-        let color = if a.note_active(n) {
-            Color32::from_rgb(90, 200, 255)
-        } else if black {
-            Color32::from_gray(35)
-        } else {
-            Color32::from_gray(150)
-        };
-        p.rect_filled(key, 0.0, color);
-        if n % 12 == 0 {
-            p.text(pos2(x, rect.bottom() + 1.0), egui::Align2::LEFT_TOP, format!("C{}", n as i32 / 12 - 1), egui::FontId::proportional(8.0), Color32::from_gray(120));
-        }
-    }
-    ui.add_space(10.0);
+    // The sounding notes on a keyboard, each in the colour of its channel and detector.
+    let sounding = a.sounding();
+    crate::piano::keyboard(ui, |key| {
+        let (channel, by) = sounding.get(key).copied().flatten()?;
+        Some(crate::piano::Lit {
+            color: crate::piano::note_color(channel, by as u32),
+            by: format!("channel {} · {}", channel + 1, by.label()),
+        })
+    });
 }
 
 /// One full-width row laid out from the right, so a widget added last with infinite desired

@@ -944,13 +944,25 @@ impl Control {
 struct KeyCounts {
     down: [i32; NOTES],
     presses: [u32; NOTES],
+    /// Channel and track of each key's latest note, where `owned` says one was struck (or
+    /// held at a seek) this round.
     channel: [u8; NOTES],
+    track: [u32; NOTES],
+    owned: [bool; NOTES],
     played: u64,
 }
 
 impl Default for KeyCounts {
     fn default() -> Self {
-        Self { down: [0; NOTES], presses: [0; NOTES], channel: [0; NOTES], played: 0 }
+        Self { down: [0; NOTES], presses: [0; NOTES], channel: [0; NOTES], track: [0; NOTES], owned: [false; NOTES], played: 0 }
+    }
+}
+
+impl KeyCounts {
+    fn own(&mut self, key: usize, channel: usize, track: usize) {
+        self.channel[key] = channel as u8;
+        self.track[key] = track as u32;
+        self.owned[key] = true;
     }
 }
 
@@ -972,8 +984,9 @@ struct Shared {
     down: [AtomicU32; NOTES],
     /// Note-ons per key, so the UI sees presses shorter than a frame.
     presses: [AtomicU32; NOTES],
-    /// Channel of each key's latest note-on, for its colour.
+    /// Channel and track of each key's latest note-on, for its colour.
     channel_of: [AtomicU8; NOTES],
+    track_of: [AtomicU32; NOTES],
     notes_played: AtomicU64,
     /// Seeks asked for so far, so a view that reads ahead can tell a seek from a slow frame.
     seeks: AtomicU64,
@@ -991,14 +1004,14 @@ impl Shared {
         self.control.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn note_on(&self, c: &mut Control, msg: u32, out: &mut Vec<u32>) {
+    fn note_on(&self, c: &mut Control, msg: u32, track: usize, out: &mut Vec<u32>) {
         let (channel, key) = ((msg & 0x0f) as usize, (msg >> 8 & 0xff) as usize);
         let held = &mut c.held[channel * NOTES + key];
         *held = held.saturating_add(1);
         let keys = &mut c.keys;
         keys.down[key] += 1;
         keys.presses[key] += 1;
-        keys.channel[key] = channel as u8;
+        keys.own(key, channel, track);
         keys.played += 1;
         // notes above 127 (256-key black MIDI) are counted but not sent: MIDI has no such keys
         if key < 128 {
@@ -1034,14 +1047,18 @@ impl Shared {
             }
             if keys.presses[key] > 0 {
                 self.presses[key].fetch_add(keys.presses[key], Ordering::Relaxed);
+            }
+            if keys.owned[key] {
                 self.channel_of[key].store(keys.channel[key], Ordering::Relaxed);
+                self.track_of[key].store(keys.track[key], Ordering::Relaxed);
             }
         }
         self.notes_played.fetch_add(keys.played, Ordering::Relaxed);
         *keys = KeyCounts::default();
     }
 
-    fn dispatch(&self, c: &mut Control, msg: u32, out: &mut Vec<u32>) {
+    /// Plays `msg`, from `track` (whose notes the keys are coloured by).
+    fn dispatch(&self, c: &mut Control, msg: u32, track: usize, out: &mut Vec<u32>) {
         let status = msg as u8;
         let (channel, data1, data2) = (
             (status & 0x0f) as usize,
@@ -1052,7 +1069,7 @@ impl Shared {
             return;
         }
         match status & 0xf0 {
-            0x90 if data2 > 0 => self.note_on(c, msg, out),
+            0x90 if data2 > 0 => self.note_on(c, msg, track, out),
             0x80 | 0x90 => self.note_off(c, channel, data1, out),
             // All Sound Off / All Notes Off on this channel
             0xb0 if data1 == 0x78 || data1 == 0x7b => {
@@ -1184,11 +1201,12 @@ impl Shared {
                     self.send(&c, &chase);
                     // the notes struck before here and still held hold their keys down; they
                     // are not struck again, and come up with their note-offs
-                    for &(_, _, msg) in &held {
+                    for &(_, track, msg) in &held {
                         let (channel, key) = ((msg & 0x0f) as usize, (msg >> 8 & 0xff) as usize);
                         if !(c.skip_drums && channel == 9) {
                             c.held[channel * NOTES + key] = c.held[channel * NOTES + key].saturating_add(1);
                             c.keys.down[key] += 1;
+                            c.keys.own(key, channel, track);
                         }
                     }
                     self.flush_keys(&mut c);
@@ -1249,7 +1267,7 @@ impl Shared {
             let mut skipped = 0;
             // black MIDI has many events on a tick: each tick's time is worked out once
             let mut last: Option<(u64, Instant)> = None;
-            for &(tick, _track, msg) in &due_ticks {
+            for &(tick, track, msg) in &due_ticks {
                 let at = match last {
                     Some((t, at)) if t == tick => at,
                     _ => {
@@ -1268,7 +1286,7 @@ impl Shared {
                     continue;
                 }
                 let before = out.len();
-                self.dispatch(&mut c, msg, &mut out);
+                self.dispatch(&mut c, msg, track, &mut out);
                 stamps.resize(out.len().max(before), at);
             }
             c.keys.played += skipped;
@@ -1488,6 +1506,7 @@ impl MidiPlayer {
             down: std::array::from_fn(|_| AtomicU32::new(0)),
             presses: std::array::from_fn(|_| AtomicU32::new(0)),
             channel_of: std::array::from_fn(|_| AtomicU8::new(0)),
+            track_of: std::array::from_fn(|_| AtomicU32::new(0)),
             notes_played: AtomicU64::new(0),
             seeks: AtomicU64::new(0),
             notes_skipped: AtomicU64::new(0),
@@ -1633,6 +1652,11 @@ impl MidiPlayer {
     /// MIDI channel of the latest note-on on `key`.
     pub fn channel(&self, key: usize) -> u8 {
         self.shared.channel_of[key].load(Ordering::Relaxed)
+    }
+
+    /// Track of the latest note-on on `key`.
+    pub fn track(&self, key: usize) -> u32 {
+        self.shared.track_of[key].load(Ordering::Relaxed)
     }
 
     /// Note-ons per key so far (also catches presses shorter than a frame).
@@ -2168,7 +2192,7 @@ mod tests {
             msg(0xc0, 3, 0),
             msg(0xb0, 0x79, 0),
         ] {
-            shared.dispatch(&mut c, m, &mut out);
+            shared.dispatch(&mut c, m, 0, &mut out);
         }
         assert_eq!(chase_messages(c.channels.iter().copied()), [msg(0xc0, 3, 0), msg(0xb1, 10, 127), msg(0xc1, 74, 0)]);
         shared.reset(&mut c);
@@ -2276,6 +2300,26 @@ mod tests {
         player.play();
         std::thread::sleep(Duration::from_millis(900));
         assert!(!player.key_down(60) && !player.key_down(62) && !player.key_down(64));
+    }
+
+    #[test]
+    fn keys_tell_the_channel_and_track_that_struck_them() {
+        // Track 0 holds 60 on channel 1; track 1 holds 62 on channel 4 and strikes 64 at 0.5 s.
+        let a = track(&[(0, &[0x90, 60, 100]), (1920, &[0x80, 60, 0])]);
+        let b = track(&[(0, &[0x93, 62, 100]), (480, &[0x93, 64, 100]), (1440, &[0x83, 62, 0]), (0, &[0x83, 64, 0])]);
+        let mut player = MidiPlayer::new(MidiSettings::default());
+        player.install(parse_bytes(file(480, &[a, b])).unwrap(), false, None);
+        // Held at a seek: coloured by the notes holding them, though not struck again.
+        player.seek(0.1);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(player.key_down(60) && player.key_down(62) && !player.key_down(64));
+        assert_eq!((player.channel(60), player.track(60)), (0, 0));
+        assert_eq!((player.channel(62), player.track(62)), (3, 1));
+        // Struck while playing.
+        player.play();
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(player.key_down(64));
+        assert_eq!((player.channel(64), player.track(64)), (3, 1));
     }
 
     #[test]

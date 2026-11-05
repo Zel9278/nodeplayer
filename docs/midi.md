@@ -15,7 +15,9 @@ orange one under `out`), so connect that pin to an instrument:
 4. Play a MIDI file.
 
 While a MIDI file is loaded, the Player node shows its tracks and notes, the held keys on a
-keyboard strip, how many notes have played, and **no drums**, which leaves out channel 10.
+piano keyboard, how many notes have played, and **no drums**, which leaves out channel 10.
+Each held key takes the colour of the channel and track that struck it, so the parts can be
+told apart; hovering a key shows its name, and while it sounds, its channel and track.
 
 Even very large "black MIDI" files load: the tracks are read in parallel and kept packed in
 memory. Seeking restores the controllers, programs and bends of that place and the notes still
@@ -81,6 +83,8 @@ detectors: the level, the strongest FFT peaks (with pitch bend for the remainder
 pitch detection.
 
 - "Panic" sends All Notes Off and resets the pitch bend on every channel.
+- A piano keyboard shows the sounding notes, each in the colour of its channel and of the
+  detector that found it; hovering a key names it, and its channel and detector.
 - ⚙ opens the settings, saved with the session and presets ("Reset to defaults" restores
   them; "Original algorithm" sets up the original's behaviour):
   - analysis: frame size (512–8192), hop, and input (Mid, L, R)

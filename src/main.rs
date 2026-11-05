@@ -32,6 +32,7 @@ mod mpris;
 mod native;
 #[cfg(target_os = "macos")]
 mod open_documents;
+mod piano;
 mod player;
 mod plugins;
 mod r2;

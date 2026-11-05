@@ -301,8 +301,26 @@ pub struct Analyzer {
     gain: f32,
     /// Sine-calibrated RMS of the last frame after gain, in dB.
     level_db: f32,
-    /// (note, channel) → time it was (re)triggered.
-    active: BTreeMap<(u8, u8), f64>,
+    /// (note, channel) → time it was (re)triggered, and by which detector.
+    active: BTreeMap<(u8, u8), (f64, Detector)>,
+}
+
+/// Which detection a note comes from; the keyboard colours notes by it and their channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Detector {
+    Level,
+    Peaks,
+    Pitch,
+}
+
+impl Detector {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Level => "level",
+            Self::Peaks => "FFT peaks",
+            Self::Pitch => "pitch",
+        }
+    }
 }
 
 impl Analyzer {
@@ -342,12 +360,14 @@ impl Analyzer {
         self.level_db
     }
 
-    pub fn active_notes(&self) -> impl Iterator<Item = u8> + '_ {
-        self.active.keys().map(|(n, _)| *n)
+    /// The notes sounding: note, channel, the detector that last (re)triggered it, and when.
+    pub fn active_notes(&self) -> impl Iterator<Item = (u8, u8, Detector, f64)> + '_ {
+        self.active.iter().map(|(&(note, ch), &(time, by))| (note, ch, by, time))
     }
 
     /// Applies transpose, note range and the velocity floor, then starts (or retriggers) the note.
-    fn note_on(&mut self, time: f64, note: u8, vel: u8, ch: u8, cfg: &Config, out: &mut Vec<Msg>) {
+    #[allow(clippy::too_many_arguments)]
+    fn note_on(&mut self, time: f64, note: u8, vel: u8, ch: u8, by: Detector, cfg: &Config, out: &mut Vec<Msg>) {
         let note = note as i32 + cfg.transpose;
         if vel <= cfg.velocity_gate() || note < cfg.min_note as i32 || note > cfg.max_note as i32 {
             return;
@@ -355,15 +375,15 @@ impl Analyzer {
         let note = note as u8;
         // A note that is still sounding is only retriggered (its release is pushed back).
         if let Some(t) = self.active.get_mut(&(note, ch)) {
-            *t = time;
+            *t = (time, by);
             return;
         }
         out.push(Msg::On { ch, note, vel });
-        self.active.insert((note, ch), time);
+        self.active.insert((note, ch), (time, by));
     }
 
     fn release_expired(&mut self, time: f64, note_secs: f64, out: &mut Vec<Msg>) {
-        self.active.retain(|&(note, ch), &mut start| {
+        self.active.retain(|&(note, ch), &mut (start, _)| {
             let keep = time - start < note_secs;
             if !keep {
                 out.push(Msg::Off { ch, note });
@@ -405,7 +425,7 @@ impl Analyzer {
             // In "by level" mode the note follows the level step, as in the original.
             let offset = if cfg.level_channel == ChannelMode::ByLevel { level_step(pos) } else { 0 };
             let note = cfg.level_base_note.saturating_add(offset).min(127);
-            self.note_on(time, note, vel, ch, cfg, out);
+            self.note_on(time, note, vel, ch, Detector::Level, cfg, out);
         }
 
         self.release_expired(time, cfg.note_ms as f64 / 1000.0, out);
@@ -437,7 +457,7 @@ impl Analyzer {
                     if cfg.pitch_bend {
                         out.push(Msg::Bend { ch, value: bend });
                     }
-                    self.note_on(time, note, vel, ch, cfg, out);
+                    self.note_on(time, note, vel, ch, Detector::Peaks, cfg, out);
                 }
             }
         }
@@ -447,7 +467,7 @@ impl Analyzer {
             if let Some(p) = self.detector.get_pitch(frame, sr, cfg.power_threshold, cfg.clarity_threshold) {
                 let (note, _) = freq_to_note_bend(p.frequency, cfg.bend_range);
                 let (vel, pos) = cfg.velocity(p.clarity * self.gain * volume, loudness);
-                self.note_on(time, note, vel, cfg.pitch_channel.pick(pos), cfg, out);
+                self.note_on(time, note, vel, cfg.pitch_channel.pick(pos), Detector::Pitch, cfg, out);
             }
         }
     }
@@ -825,6 +845,8 @@ struct Shared {
     level_db: AtomicU32,
     /// Bitset of notes sounding on any channel.
     notes: [AtomicU64; 2],
+    /// Per note, the channel and detector that last (re)triggered it while it sounds.
+    owners: Mutex<Vec<Option<(u8, Detector)>>>,
     sent: AtomicU64,
     dests: Mutex<Vec<Dest>>,
     connected: Mutex<Option<Dest>>,
@@ -921,6 +943,12 @@ impl Audio2Midi {
     pub fn note_active(&self, note: u8) -> bool {
         let word = self.shared.notes[note as usize / 64].load(Ordering::Relaxed);
         word & (1 << (note % 64)) != 0
+    }
+
+    /// Per note (0-127), the channel and detector sounding it, if it sounds.
+    pub fn sounding(&self) -> Vec<Option<(u8, Detector)>> {
+        let owners = self.shared.owners.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (0..128u8).map(|n| owners.get(n as usize).copied().flatten().filter(|_| self.note_active(n))).collect()
     }
 
     /// MIDI events per second, averaged over about half a second.
@@ -1087,11 +1115,18 @@ fn worker(
         }
         if analyzed {
             let mut bits = [0u64; 2];
-            for n in analyzer.active_notes() {
+            // A note on several channels shows the one (re)triggered last.
+            let mut owners: Vec<Option<(u8, Detector, f64)>> = vec![None; 128];
+            for (n, ch, by, at) in analyzer.active_notes() {
                 bits[n as usize / 64] |= 1 << (n % 64);
+                let owner = &mut owners[n as usize];
+                if owner.is_none_or(|(_, _, t)| at >= t) {
+                    *owner = Some((ch, by, at));
+                }
             }
             shared.notes[0].store(bits[0], Ordering::Relaxed);
             shared.notes[1].store(bits[1], Ordering::Relaxed);
+            *shared.owners.lock().unwrap_or_else(|e| e.into_inner()) = owners.into_iter().map(|o| o.map(|(ch, by, _)| (ch, by))).collect();
             shared.gain.store(analyzer.gain().to_bits(), Ordering::Relaxed);
             shared.level_db.store(analyzer.level_db().to_bits(), Ordering::Relaxed);
         }
@@ -1179,6 +1214,33 @@ mod tests {
         assert!((b12 - 170).abs() <= 2, "bend {b12}");
         assert_eq!(note_name(60), "C4");
         assert_eq!(note_name(69), "A4");
+    }
+
+    #[test]
+    fn notes_remember_the_detector_that_found_them() {
+        // Each detection on its own, notes long enough to still sound at the end.
+        for (by, cfg) in [
+            (Detector::Level, Config { fft_peaks: false, pitch_detect: false, note_ms: 1000.0, ..Config::default() }),
+            (Detector::Peaks, Config { amplitude_notes: false, pitch_detect: false, note_ms: 1000.0, ..Config::default() }),
+            (
+                Detector::Pitch,
+                Config { amplitude_notes: false, fft_peaks: false, pitch_channel: ChannelMode::Fixed(4), note_ms: 1000.0, ..Config::default() },
+            ),
+        ] {
+            let sr = 48_000;
+            let mut a = Analyzer::new(sr, cfg.frame);
+            let mut out = Vec::new();
+            for k in 0..4 {
+                let t = k as f64 * cfg.hop as f64 / sr as f64;
+                a.frame(&sine(440.0, 0.5, sr, k * cfg.hop, cfg.frame), t, &cfg, &mut out);
+            }
+            let notes: Vec<_> = a.active_notes().collect();
+            assert!(!notes.is_empty(), "{by:?} found nothing");
+            assert!(notes.iter().all(|n| n.2 == by), "{by:?}: {notes:?}");
+            if by == Detector::Pitch {
+                assert!(notes.iter().all(|n| n.0 == 69 && n.1 == 4), "{notes:?}");
+            }
+        }
     }
 
     #[test]

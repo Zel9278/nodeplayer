@@ -97,24 +97,18 @@ impl MidiSong {
         }
     }
 
-    /// The 128 keys, lit while the file holds them.
+    /// The 128 keys as a keyboard, each lit while the file holds it, in the colour of the
+    /// channel and track that struck it.
     fn keys(&self, ui: &mut egui::Ui) {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(256.0, 16.0), egui::Sense::hover());
-        let p = ui.painter_at(rect);
-        let w = rect.width() / 128.0;
-        for key in 0..128 {
-            let black = matches!(key % 12, 1 | 3 | 6 | 8 | 10);
-            let x = rect.left() + key as f32 * w;
-            let r = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height()));
-            let color = if self.player.key_down(key) {
-                egui::Color32::from_rgb(255, 170, 60)
-            } else if black {
-                egui::Color32::from_gray(40)
-            } else {
-                egui::Color32::from_gray(170)
-            };
-            p.rect_filled(r.shrink2(egui::vec2(0.15, if black { 3.0 } else { 0.0 })), 0.0, color);
-        }
+        crate::piano::keyboard(ui, |key| {
+            self.player.key_down(key).then(|| {
+                let (channel, track) = (self.player.channel(key), self.player.track(key));
+                crate::piano::Lit {
+                    color: crate::piano::note_color(channel, track),
+                    by: format!("channel {} · track {}", channel + 1, track + 1),
+                }
+            })
+        });
     }
 }
 
