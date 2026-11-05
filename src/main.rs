@@ -40,9 +40,12 @@ mod runtime;
 mod session;
 mod setup;
 mod titleformat;
+mod updater;
 mod video;
 mod visual;
 mod vst3;
+#[cfg(target_os = "windows")]
+mod windows_identity;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod x11_errors;
 mod yabridge;
@@ -64,6 +67,7 @@ fn attach_console() {
 }
 
 fn main() -> Result<()> {
+    updater::handle_hooks();
     #[cfg(all(windows, not(debug_assertions)))]
     attach_console();
     env_logger::Builder::from_env(
@@ -109,6 +113,9 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if diagnostic.is_none() {
+        updater::bootstrap();
+    }
     // A nodeplayer already running takes the files (and comes to the front) instead of a
     // second window opening. Diagnostic runs are always separate.
     if diagnostic.is_none() && !new_instance && matches!(instance::claim(&files), instance::Claim::Forwarded) {
@@ -123,6 +130,10 @@ fn main() -> Result<()> {
     // Wayland main window can still play without plugins and use separate X11
     // editor windows when XWayland is available.
     plugins::guard::install();
+    #[cfg(target_os = "windows")]
+    if diagnostic.is_none() {
+        windows_identity::install();
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("nodeplayer")

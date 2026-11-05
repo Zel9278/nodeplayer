@@ -7,12 +7,15 @@ fn main() {
     println!("cargo:rerun-if-changed={src}/sources");
     println!("cargo:rerun-if-changed={src}/include");
     println!("cargo:rerun-if-changed={src}/CMakeLists.txt");
+    let static_crt = std::env::var("CARGO_CFG_TARGET_FEATURE")
+        .unwrap_or_default().split(',').any(|f| f == "crt-static");
     let dst = cmake::Config::new(src)
         .profile("Release")
         .define("YSFX_PLUGIN", "OFF")
         .define("YSFX_GFX", "ON")
         .define("YSFX_TESTS", "OFF")
         .define("YSFX_TOOLS", "OFF")
+        .define("YSFX_STATIC_CRT", if static_crt { "ON" } else { "OFF" })
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
         .build_target("ysfx")
         .build();

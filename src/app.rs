@@ -342,6 +342,7 @@ pub struct App {
     /// App extensions from native plugins.
     extensions: Extensions,
     about: crate::about::About,
+    updater: crate::updater::Updater,
     loop_editor: crate::loop_editor::LoopEditor,
     /// The stretch the selection loop plays, of the track loaded.
     selection: Option<crate::loop_editor::Selection>,
@@ -444,6 +445,7 @@ impl App {
             capture_scroll: false,
             extensions: Extensions::default(),
             about: Default::default(),
+            updater: crate::updater::Updater::new(ctx.clone()),
             loop_editor: Default::default(),
             selection: None,
             loops: session::load_loops(),
@@ -2691,6 +2693,7 @@ impl eframe::App for App {
         }
         self.tick_diagnostic(ctx);
         self.poll_background();
+        self.updater.poll();
         // Files from a second start or the system: open them, and come to the front.
         if let Some(files) = crate::instance::take() {
             self.open_paths(files);
@@ -2817,11 +2820,14 @@ impl eframe::App for App {
                     if ui.small_button("About").clicked() {
                         self.about.open = !self.about.open;
                     }
+                    if self.updater.has_update() && ui.small_button("Update available").clicked() {
+                        self.about.open = true;
+                    }
                 });
             });
         });
         self.param_windows(&ctx);
-        self.about.show(&ctx);
+        self.about.show(&ctx, &mut self.updater);
         self.loop_editor.show(&ctx, &self.player, &mut self.selection, &mut self.library.repeat, &mut self.loops);
 
         let mut dock = std::mem::replace(&mut self.dock, egui_dock::DockState::new(Vec::new()));

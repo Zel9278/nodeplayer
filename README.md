@@ -35,7 +35,10 @@ delay compensation. See [Plugins](docs/plugins.md) for hosting behavior and limi
 ## Download
 
 Builds for Linux (x86_64), Windows (x86_64) and macOS (Apple silicon and Intel) are on the
-[releases page](https://github.com/Zel9278/nodeplayer/releases). Unpack and run; FFmpeg, used
+[releases page](https://github.com/Zel9278/nodeplayer/releases). Windows has a `.msi`
+installer, Setup.exe and a portable ZIP; macOS has a `.pkg` installer and an app ZIP;
+Linux has an AppImage. These packages use Velopack to check for updates from GitHub Releases.
+Use **About** to download an update and restart when ready. FFmpeg, used
 for video and some formats, is offered as a download on first start (on macOS, install it with
 `brew install ffmpeg`). On macOS it's `nodeplayer.app`, which isn't signed: allow it in System
 Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine nodeplayer.app` once.

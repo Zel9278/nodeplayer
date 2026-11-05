@@ -40,7 +40,7 @@ pub struct About {
 }
 
 impl About {
-    pub fn show(&mut self, ctx: &egui::Context) {
+    pub fn show(&mut self, ctx: &egui::Context, updater: &mut crate::updater::Updater) {
         if !self.open {
             return;
         }
@@ -57,6 +57,7 @@ impl About {
                 ui.heading(format!("nodeplayer {}", env!("CARGO_PKG_VERSION")));
                 ui.label(format!("Created by {}", env!("CARGO_PKG_AUTHORS")));
                 ui.label("Released under the MIT License.");
+                updater.ui(ui);
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.collapsing("License", |ui| {

@@ -107,4 +107,25 @@ nodeplayer shows up in the system's media controls and answers media keys: MPRIS
 (KDE, GNOME and the like), the media overlay on Windows, and Now Playing on macOS. They show
 the title, artist, album, length and cover, and can play, pause, stop, skip and seek.
 
+On Windows, Velopack registers the shortcut and the running app with the same app identity,
+so the media overlay can identify it by name. A bare developer exe has a fallback per-user
+shortcut; packaged releases leave Velopack's shortcuts under its control.
+
+## Application updates
+
+Velopack packages check GitHub Releases in the background at startup and every hour while
+running, including while minimized. Failed checks retry after an hour; About also offers
+a manual retry. Once an update is available or downloading/ready, periodic checks pause
+so they do not replace its download or restart controls. A notice beside
+**About** appears when an update is available. Open **About**, choose **Download update**,
+then **Restart and update** when ready. Checking and downloading leave playback running;
+the restart uses normal shutdown to save the session and stop plugin workers before the
+updater replaces the app. An explicit data folder is kept across this restart.
+
+Updates stay on the platform and architecture channel installed (Windows x64, Linux x64,
+macOS arm64 or macOS x64). Downloads are checked against the release feed's hashes. A failed
+check/download can be retried from About. Prereleases and automatic downgrades are excluded.
+A downloaded update can be applied after reopening the app too; it is not installed just
+because it was downloaded. Developer builds and diagnostic runs do not check for updates.
+
 Next: [The node graph](node-graph.md).

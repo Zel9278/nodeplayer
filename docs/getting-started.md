@@ -2,16 +2,29 @@
 
 ## Installing
 
-Download the archive for your system from the
-[releases page](https://github.com/Zel9278/nodeplayer/releases) and unpack it anywhere. There
-is nothing to install: the archive holds the program, the license and the README.
+Download the package for your system from the
+[releases page](https://github.com/Zel9278/nodeplayer/releases). Use an installer or unpack
+the portable package. Velopack packages include automatic update checks; **About** has the
+download and restart controls. Earlier releases' raw archives can still be run, but need
+manual replacement to move to a Velopack package.
 
-| System | Archive | Notes |
+| System | Package | Notes |
 |---|---|---|
-| Linux x86_64 | `nodeplayer-<version>-linux-x86_64.tar.gz` | Needs ALSA, X11 or XWayland, and fontconfig, which desktop systems have. Sound goes through ALSA, so PipeWire and PulseAudio work through their ALSA plugins. |
-| Windows x86_64 | `nodeplayer-<version>-windows-x86_64.zip` | Runs on its own (the C++ runtime is built in). Sound goes through WASAPI. |
-| macOS (Apple silicon) | `nodeplayer-<version>-macos-arm64.zip` | `nodeplayer.app`; not signed: see below. |
-| macOS (Intel) | `nodeplayer-<version>-macos-x86_64.zip` | `nodeplayer.app`; not signed: see below. |
+| Linux x86_64 | AppImage (`linux-x64` channel) | Mark executable and run. Needs the desktop audio/X11/fontconfig libraries; built on Ubuntu 24.04. Sound uses ALSA, including PipeWire/PulseAudio's ALSA plugins. |
+| Windows x86_64 | MSI, Setup.exe or portable ZIP (`win-x64` channel) | Installs for the current user with a Start menu entry. The C++ runtime is built in. Sound uses WASAPI. |
+| macOS (Apple silicon) | PKG or portable app ZIP (`osx-arm64` channel) | `nodeplayer.app`; ad-hoc signed, not notarized: see below. |
+| macOS (Intel) | PKG or portable app ZIP (`osx-x64` channel) | `nodeplayer.app`; ad-hoc signed, not notarized: see below. |
+
+On Windows, the per-user MSI installs under `%LOCALAPPDATA%\Zel9278.nodeplayer` by default.
+Remove it through Settings > Apps > Installed apps; your nodeplayer profile is kept. The
+installer is unsigned, so Windows may show an unknown publisher warning. For future
+versions use **About > Download update > Restart and update**. Close earlier nodeplayer
+instances before first installing the Velopack version. A portable ZIP should be extracted
+in full: keep `Update.exe`, the launcher and `current` together.
+
+On Linux, keep the AppImage in a writable folder so it can replace itself during an update.
+For example, run `chmod +x *.AppImage` after downloading. A system-managed installation
+should continue to be updated by its package manager.
 
 On macOS, move `nodeplayer.app` to Applications (or anywhere). The first start is blocked
 because the app isn't signed. Allow it in System Settings → Privacy & Security, or remove the
