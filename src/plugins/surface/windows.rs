@@ -21,8 +21,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::plugins::window::CaptureInput;
 use super::{EditorFrame, EditorPointer, EditorPopup, PointerKind};
+use crate::plugins::window::CaptureInput;
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn PrintWindow(hwnd: *mut c_void, dc: *mut c_void, flags: u32) -> i32;
+}
 
 const MAX_DIMENSION: u32 = 8192;
 const MAX_PIXELS: u64 = 16 * 1024 * 1024;
@@ -114,30 +119,60 @@ impl NativeCapture {
         unsafe {
             // A plugin that does not paint every pixel must not expose stale frames.
             std::ptr::write_bytes(bitmap.bits, 0, width as usize * height as usize * 4);
-            // One explicit traversal paints every client exactly once. PrintWindow
-            // already recurses into children on supported windows; printing those
-            // children again doubled expensive plugin paints. Owning the traversal also
-            // gives nested children explicit ancestor clipping and sibling stacking.
             let mut origin = POINT::default();
             ensure!(
                 ClientToScreen(self.hwnd, &mut origin).as_bool(),
                 "locate editor client origin"
             );
-            let mut budget = 512;
-            print_tree(
-                self.hwnd,
-                bitmap.memory_dc,
-                origin,
-                RECT {
-                    left: 0,
-                    top: 0,
-                    right: width as i32,
-                    bottom: height as i32,
-                },
-                0,
-                &mut budget,
-                true,
-            )?;
+            let root_printed = {
+                let _saved = SavedDc::new(bitmap.memory_dc)?;
+                // Several plugin editors implement PrintWindow's WM_PRINT protocol but
+                // ignore a direct WM_PRINT sent to their root HWND.
+                PrintWindow(self.hwnd.0, bitmap.memory_dc.0, 3) != 0
+            };
+            let root_has_pixels = {
+                let _ = GdiFlush();
+                let bytes = std::slice::from_raw_parts(
+                    bitmap.bits.cast::<u8>(),
+                    width as usize * height as usize * 4,
+                );
+                bytes.iter().any(|byte| *byte != 0)
+            };
+            let root_printed = root_printed && root_has_pixels;
+            let root_clip = RECT {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            };
+            if root_printed {
+                // PrintWindow is client-only, so render native children once ourselves.
+                // This preserves nested clipping and sibling order without asking the root
+                // to recursively paint children and then painting them a second time.
+                let mut budget = 512;
+                print_children(
+                    self.hwnd,
+                    bitmap.memory_dc,
+                    origin,
+                    root_clip,
+                    0,
+                    &mut budget,
+                )?;
+            } else {
+                // Preserve support for windows that implement WM_PRINT but not
+                // PrintWindow. The traversal owns both the root and child painting.
+                std::ptr::write_bytes(bitmap.bits, 0, width as usize * height as usize * 4);
+                let mut budget = 512;
+                print_tree(
+                    self.hwnd,
+                    bitmap.memory_dc,
+                    origin,
+                    root_clip,
+                    0,
+                    &mut budget,
+                    true,
+                )?;
+            }
             let _ = GdiFlush();
             let pixels = std::slice::from_raw_parts(
                 bitmap.bits.cast::<u8>(),
@@ -495,6 +530,40 @@ impl Drop for KeyboardModifiers {
     }
 }
 
+unsafe fn print_children(
+    hwnd: HWND,
+    dc: HDC,
+    root_origin: POINT,
+    ancestor_clip: RECT,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<()> {
+    ensure!(
+        depth <= 32 && *budget != 0,
+        "captured editor native hierarchy exceeds limits"
+    );
+    unsafe {
+        if let Ok(first) = GetWindow(hwnd, GW_CHILD) {
+            let mut child = GetWindow(first, GW_HWNDLAST).unwrap_or(first);
+            for _ in 0..512 {
+                let previous = GetWindow(child, GW_HWNDPREV).ok();
+                print_tree(
+                    child,
+                    dc,
+                    root_origin,
+                    ancestor_clip,
+                    depth + 1,
+                    budget,
+                    false,
+                )?;
+                let Some(previous) = previous else { break };
+                child = previous;
+            }
+        }
+    }
+    Ok(())
+}
+
 unsafe fn print_tree(
     hwnd: HWND,
     dc: HDC,
@@ -562,15 +631,7 @@ unsafe fn print_tree(
         if clip.left >= clip.right || clip.top >= clip.bottom {
             return Ok(());
         }
-        if let Ok(first) = GetWindow(hwnd, GW_CHILD) {
-            let mut child = GetWindow(first, GW_HWNDLAST).unwrap_or(first);
-            for _ in 0..512 {
-                let previous = GetWindow(child, GW_HWNDPREV).ok();
-                print_tree(child, dc, root_origin, clip, depth + 1, budget, false)?;
-                let Some(previous) = previous else { break };
-                child = previous;
-            }
-        }
+        print_children(hwnd, dc, root_origin, clip, depth, budget)?;
     }
     Ok(())
 }
