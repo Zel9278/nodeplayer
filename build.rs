@@ -65,7 +65,9 @@ fn main() {
             .flag("-fobjc-arc")
             .opt_level(2)
             .compile("nodeplayer_metal_capture");
-        for fw in ["Cocoa", "Carbon", "Foundation", "Metal", "MetalKit", "QuartzCore"] {
+        // souvlaki 0.8's build script gates MediaPlayer on the build host's cfg,
+        // so Linux -> macOS builds must also declare this target dependency here.
+        for fw in ["Cocoa", "Carbon", "Foundation", "Metal", "MetalKit", "QuartzCore", "MediaPlayer"] {
             println!("cargo:rustc-link-lib=framework={fw}");
         }
     }
