@@ -15,14 +15,19 @@ sdk="$OSXCROSS_TARGET/SDK/MacOSX14.5.sdk"
 test -d "$sdk"
 env_target=${target//-/_}
 cargo_target=${env_target^^}
-linker_var="CARGO_TARGET_${cargo_target}_LINKER"
-cc=$(command -v "${!linker_var}")
-cxx="${cc}++"
 ar_var="AR_${env_target}"
 ar=$(command -v "${!ar_var}")
-ranlib="${ar%-ar}-ranlib"
+prefix=${ar%-ar}
+# The action can pick a *-cmake-clang helper from its filename glob. Derive
+# exact tool names from ar instead; the helper has no matching clang++ binary.
+cc="${prefix}-clang"
+cxx="${prefix}-clang++"
+ranlib="${prefix}-ranlib"
+ld="${prefix}-ld"
+test -x "$cc"
 test -x "$cxx"
 test -x "$ranlib"
+test -x "$ld"
 
 mkdir -p target/osxcross
 toolchain="$PWD/target/osxcross/$target.cmake"
@@ -36,6 +41,11 @@ set(CMAKE_C_COMPILER "$cc")
 set(CMAKE_CXX_COMPILER "$cxx")
 set(CMAKE_AR "$ar")
 set(CMAKE_RANLIB "$ranlib")
+# cc-rs supplies --target=*-apple-macosx. Clang may then miss the Darwin-prefixed
+# linker and fall back to /usr/bin/ld, even with the osxcross compiler wrapper.
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=$ld")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=$ld")
+set(CMAKE_MODULE_LINKER_FLAGS_INIT "-fuse-ld=$ld")
 EOF
 
 {
@@ -44,7 +54,17 @@ EOF
   echo "CXX_${env_target}=$cxx"
   echo "RANLIB_${env_target}=$ranlib"
   echo "CMAKE_TOOLCHAIN_FILE_${env_target}=$toolchain"
+  echo "CARGO_TARGET_${cargo_target}_LINKER=$cc"
   # setup-osxcross defaults to allowing undefined symbols. Require ordinary
   # framework/library resolution so missing dependencies fail during the build.
-  echo "CARGO_TARGET_${cargo_target}_RUSTFLAGS="
+  echo "CARGO_TARGET_${cargo_target}_RUSTFLAGS=-C link-arg=-fuse-ld=$ld"
 } >> "$GITHUB_ENV"
+
+# Exercise the same cc-rs target spelling before starting the full Rust build.
+# Neither check executes the Mach-O output on Linux.
+printf 'int main(void) { return 0; }\n' |
+  "$cc" --target="$arch-apple-macosx" "-fuse-ld=$ld" -x c - \
+    -o "target/osxcross/$target-smoke-c"
+printf '#include <vector>\nint main() { return std::vector<int>{1}.front() - 1; }\n' |
+  "$cxx" --target="$arch-apple-macosx" "-fuse-ld=$ld" -std=c++17 -x c++ - \
+    -o "target/osxcross/$target-smoke-cxx"
