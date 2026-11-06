@@ -167,6 +167,7 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
     let mut editor: Option<Box<dyn Editor>> = None;
     // Drop the image mapping before its native source editor on every exit path.
     let mut surface: Option<FrameMap> = None;
+    let mut refresh_frame = false;
     let mut editor_id = 0;
     let initial_metadata = metadata(instance.as_ref(), &editor, editor_id)?;
     let mut metadata_cache = initial_metadata.clone();
@@ -190,15 +191,7 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
         if with_native_pool(|| -> Result<bool> {
             pump_native()?;
             instance.idle();
-            if editor.as_mut().is_some_and(|e| !e.idle()) {
-                surface = None;
-                editor = None;
-            }
-            if let (Some(editor), Some(surface)) = (editor.as_mut(), surface.as_ref())
-                && let Some(frame) = editor.take_frame()
-            {
-                surface.publish(&frame)?;
-            }
+            service_editor(&mut editor, &mut surface, &mut refresh_frame)?;
             // Poll only for the start of a control frame. A quiet parent must not stop the
             // worker's AppKit/native event pump or its independently paced capture updates.
             if !request_pending(&mut socket)? {
@@ -246,6 +239,7 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                             bail!("invalid parameter value")
                         }
                         instance.set_param(id, v.clamp(0.0, 1.0));
+                        refresh_frame = true;
                     }
                     Command::Display(id, v) => {
                         if !v.is_finite() {
@@ -270,6 +264,7 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                             })?;
                         resume(&ctl)?;
                         loaded?;
+                        refresh_frame = true;
                     }
                     Command::Checkpoint => {
                         // The command loop is the plugin main thread; CLAP/VST3 state APIs
@@ -334,6 +329,7 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                                 editor.as_mut().filter(|editor| editor.is_captured())
                         {
                             editor.pointer(event)?;
+                            refresh_frame = true;
                         }
                     }
                     Command::Place(token, spot) => {
@@ -352,6 +348,7 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                         }
                         if token == editor_id && let Some(editor) = editor.as_mut() {
                             editor.set_display_scale(factor);
+                            refresh_frame = true;
                         }
                     }
                     Command::Close(token) => {
@@ -412,6 +409,30 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+fn service_editor(
+    editor: &mut Option<Box<dyn Editor>>,
+    surface: &mut Option<FrameMap>,
+    refresh_frame: &mut bool,
+) -> Result<()> {
+    let capture = surface
+        .as_ref()
+        .map_or(Ok(false), |surface| surface.needs_frame(*refresh_frame))?;
+    if editor.as_mut().is_some_and(|editor| {
+        !if capture { editor.idle() } else { editor.idle_without_capture() }
+    }) {
+        *surface = None;
+        *editor = None;
+        *refresh_frame = false;
+    }
+    if let (Some(editor), Some(surface)) = (editor.as_mut(), surface.as_ref())
+        && let Some(frame) = editor.take_frame()
+        && surface.publish(&frame)?
+    {
+        *refresh_frame = false;
+    }
+    Ok(())
 }
 
 fn editor_or_error(
@@ -757,6 +778,65 @@ impl Drop for ComInit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unread_images_pause_capture_but_keep_native_service_input_and_close_live() -> Result<()> {
+        use crate::plugins::{Spot, surface::EditorFrame};
+        use std::{cell::Cell, rc::Rc};
+
+        struct Probe {
+            captures: Rc<Cell<u32>>,
+            pumps: Rc<Cell<u32>>,
+            alive: Rc<Cell<bool>>,
+            pending: Option<EditorFrame>,
+        }
+        impl Editor for Probe {
+            fn placement(&self) -> Placement { Placement::Embedded(1) }
+            fn size(&self) -> (u32, u32) { (1, 1) }
+            fn place(&mut self, _: Option<&Spot>) {}
+            fn take_frame(&mut self) -> Option<EditorFrame> { self.pending.take() }
+            fn idle_without_capture(&mut self) -> bool {
+                self.pumps.set(self.pumps.get() + 1);
+                self.alive.get()
+            }
+            fn idle(&mut self) -> bool {
+                if !self.idle_without_capture() { return false; }
+                self.captures.set(self.captures.get() + 1);
+                self.pending = Some(EditorFrame {
+                    width: 1, height: 1, native_size: (1, 1),
+                    native_units_per_point: 1.0,
+                    rgba: vec![self.captures.get() as u8; 4], popups: Vec::new(),
+                });
+                true
+            }
+        }
+        let captures = Rc::new(Cell::new(0));
+        let pumps = Rc::new(Cell::new(0));
+        let alive = Rc::new(Cell::new(true));
+        let mut editor: Option<Box<dyn Editor>> = Some(Box::new(Probe {
+            captures: captures.clone(), pumps: pumps.clone(), alive: alive.clone(), pending: None,
+        }));
+        let parent = FrameMap::create(104, 30)?;
+        let mut surface = Some(FrameMap::open(&parent.descriptor())?);
+        let mut refresh = false;
+        service_editor(&mut editor, &mut surface, &mut refresh)?;
+        service_editor(&mut editor, &mut surface, &mut refresh)?;
+        assert_eq!(captures.get(), 1);
+        assert_eq!(pumps.get(), 2, "native timers and input still run with an unread image");
+
+        refresh = true;
+        service_editor(&mut editor, &mut surface, &mut refresh)?;
+        assert!(!refresh);
+        assert_eq!(parent.take_latest()?.unwrap().rgba, vec![2; 4]);
+        service_editor(&mut editor, &mut surface, &mut refresh)?;
+        assert_eq!(captures.get(), 3, "consumption requests another image");
+
+        alive.set(false);
+        service_editor(&mut editor, &mut surface, &mut refresh)?;
+        assert!(editor.is_none());
+        assert!(surface.is_none(), "close must work while the last image is unread");
+        Ok(())
+    }
 
     #[cfg(windows)]
     #[test]

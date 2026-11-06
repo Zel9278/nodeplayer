@@ -377,6 +377,10 @@ pub trait Editor {
     fn place(&mut self, spot: Option<&Spot>);
     /// Pumps the editor; returns `false` once the user closed its window.
     fn idle(&mut self) -> bool;
+    /// Services native input and timers while an unread captured image is waiting.
+    fn idle_without_capture(&mut self) -> bool {
+        self.idle()
+    }
 }
 
 pub struct Created {
