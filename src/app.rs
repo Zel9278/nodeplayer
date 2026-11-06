@@ -2976,11 +2976,12 @@ impl eframe::App for App {
                 NodeKind::Plugin(p) => p.instance.animating(),
                 _ => false,
             });
-        let captured = self.snarl.nodes().any(|node| {
+        let active_capture = self.snarl.nodes().any(|node| {
             matches!(&node.kind, NodeKind::Plugin(plugin)
-                if plugin.editor.as_ref().is_some_and(|editor| editor.is_captured()))
+                if plugin.editor.as_ref().is_some_and(|editor| editor.is_captured())
+                    && plugin.editor_view.animating())
         });
-        ctx.request_repaint_after(if captured {
+        ctx.request_repaint_after(if active_capture {
             crate::plugins::surface::CAPTURE_INTERVAL
         } else {
             Duration::from_millis(if animate { 16 } else { 30 })

@@ -295,6 +295,9 @@ impl Editor for CapturedEditor {
     fn place(&mut self, _spot: Option<&Spot>) {
         // Canvas overlap is applied to the image, never cut out of its native source.
     }
+    fn idle_without_capture(&mut self) -> bool {
+        self.source.idle()
+    }
     fn idle(&mut self) -> bool {
         if !self.source.idle() {
             return false;

@@ -63,10 +63,14 @@ with default worker hosting or `--in-process-plugins`. The legacy
 Captured editors use a private native rendering host. Graph zoom transforms the latest
 image on every frame without waiting for capture, resizing the source, or requesting a
 plugin UI-scale change. Popped-out editors use native windows.
-Capture and graph repaint scheduling target 240 Hz. Actual delivery depends on the
-plugin's renderer, native capture cost and event loop; delivered frames do not measure
-compositor presentation. Workers poll control readiness without blocking their native
-event pump. Windows prints each native client once per editor capture and retains
+Active capture and graph repaint scheduling target 240 Hz. An unchanged editor returns
+to the graph's ordinary idle cadence after 250 ms. Pixel, geometry and forwarded input
+changes restore fast repainting. Workers capture when the previous image has been read,
+or replace an unread image after input, parameter or display-density changes. Native
+input and timers continue to run while an image waits for the graph. Actual delivery
+depends on the plugin's renderer, native capture cost and event loop; delivered frames
+do not measure compositor presentation. Workers poll control readiness without blocking
+their native event pump. Windows prints the editor into a client-only DIB and retains
 layered popup uploads before their source bitmaps are reused. Captured native popups
 stay off the desktop, including position changes made by layered uploads. X11 capture
 resolves the current named pixmap on every read so compositor backing-store replacement

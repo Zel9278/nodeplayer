@@ -334,6 +334,18 @@ impl FrameMap {
         self.generation
     }
 
+    /// Capture only after consumption, unless input requires a newer unread image.
+    /// A reader's copy is never interrupted, even for an interactive refresh.
+    pub fn needs_frame(&self, refresh: bool) -> Result<bool> {
+        self.validate_header()?;
+        match self.header().state.load(Ordering::Acquire) {
+            FREE => Ok(true),
+            READY => Ok(refresh),
+            WRITING | READING => Ok(false),
+            _ => bail!("invalid editor surface ownership state"),
+        }
+    }
+
     /// False means the reader is copying (or another publisher owns the slot).
     /// This call never waits for the reader or queues an additional frame.
     pub fn publish(&self, frame: &EditorFrame) -> Result<bool> {
@@ -745,6 +757,29 @@ mod tests {
                 })
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn capture_demand_tracks_consumption_and_preserves_reader_ownership() -> Result<()> {
+        let parent = FrameMap::create(103, 29)?;
+        let child = FrameMap::open(&parent.descriptor())?;
+        assert!(child.needs_frame(false)?);
+        assert!(child.publish(&frame(1))?);
+        assert!(!child.needs_frame(false)?);
+        assert!(child.needs_frame(true)?, "input may replace an unread image");
+        assert!(child.publish(&frame(2))?);
+        assert_eq!(parent.take_latest()?.unwrap().rgba, frame(2).rgba);
+        assert!(child.needs_frame(false)?);
+        for state in [WRITING, READING] {
+            parent.header().state.store(state, Ordering::Release);
+            assert!(!child.needs_frame(false)?);
+            assert!(!child.needs_frame(true)?, "refresh must respect an active copy");
+            assert_eq!(parent.header().state.load(Ordering::Acquire), state);
+        }
+        parent.header().state.store(99, Ordering::Release);
+        assert!(child.needs_frame(false).is_err());
+        parent.header().state.store(FREE, Ordering::Release);
         Ok(())
     }
 

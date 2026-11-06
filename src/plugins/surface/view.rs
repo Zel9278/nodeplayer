@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use egui::{Pos2, Rect};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{EditorFrame, EditorPointer, PointerKind};
 use crate::plugins::{Editor, Spot};
@@ -20,6 +20,7 @@ pub struct EditorView {
     frames: u64,
     first_frame_at: Option<Instant>,
     last_frame_at: Option<Instant>,
+    last_activity: Option<Instant>,
     changed_frames: u64,
     last_frame_hash: Option<ring::digest::Digest>,
     popups: Vec<PopupTexture>,
@@ -180,6 +181,13 @@ pub struct EditorFrameStats {
 }
 
 impl EditorView {
+    /// Repeated captures keep delivery healthy without keeping the whole graph busy.
+    pub fn animating(&self) -> bool {
+        self.texture.is_none()
+            || self.buttons != 0
+            || self.last_activity.is_some_and(|time| time.elapsed() < Duration::from_millis(250))
+    }
+
     pub fn dimensions(&self) -> Option<((u32, u32), [usize; 2])> {
         Some((self.native_size?, self.texture.as_ref()?.size()))
     }
@@ -244,6 +252,9 @@ impl EditorView {
     }
 
     fn update_texture(&mut self, context: &egui::Context, frame: EditorFrame) {
+        let mut changed = self.native_size != Some(frame.native_size)
+            || self.native_units_per_point != Some(frame.native_units_per_point)
+            || self.popups.len() != frame.popups.len();
         self.frames = self.frames.saturating_add(1);
         self.last_frame_at = Some(Instant::now());
         self.first_frame_at.get_or_insert_with(Instant::now);
@@ -283,7 +294,11 @@ impl EditorView {
                 rgba: popup.rgba,
             };
             if let Some(previous) = self.popups.get_mut(index) {
+                changed |= previous.origin != popup.origin
+                    || previous.native_size != popup.native_size
+                    || previous.interactive != popup.interactive;
                 if previous.pixels != pixels {
+                    changed = true;
                     previous.texture.set(pixels.image(), egui::TextureOptions::LINEAR);
                     previous.pixels = pixels;
                 }
@@ -309,6 +324,7 @@ impl EditorView {
             rgba: frame.rgba,
         };
         if self.texture.is_none() || self.pixels.as_ref() != Some(&pixels) {
+            changed = true;
             let image = pixels.image();
             if let Some(texture) = &mut self.texture {
                 texture.set(image, egui::TextureOptions::LINEAR);
@@ -318,6 +334,9 @@ impl EditorView {
                 ));
             }
             self.pixels = Some(pixels);
+        }
+        if changed {
+            self.last_activity = Some(Instant::now());
         }
     }
 
@@ -577,6 +596,7 @@ impl EditorView {
             if matches!(kind, PointerKind::Down(_)) && popup.is_none() {
                 self.popup_anchor = Some(native_from_screen(screen, size, position));
             }
+            self.last_activity = Some(Instant::now());
             editor.pointer(EditorPointer {
                 timestamp_ms: super::pointer_timestamp_ms(),
                 modifiers: modifier_mask(modifiers),
@@ -598,6 +618,7 @@ impl EditorView {
             for button in 1..=3 {
                 let bit = 1 << (button - 1);
                 if self.buttons & bit != 0 {
+                    self.last_activity = Some(Instant::now());
                     editor.pointer(EditorPointer {
                         timestamp_ms: super::pointer_timestamp_ms(),
                         modifiers: 0,
@@ -654,6 +675,7 @@ impl EditorView {
         screen: Rect,
         size: (u32, u32),
     ) -> Result<()> {
+        self.last_activity = Some(Instant::now());
         let position =
             self.native_position(screen, size, self.last_position.unwrap_or(screen.min), None);
         for button in 1..=3 {
@@ -708,6 +730,49 @@ fn native_from_screen(screen: Rect, native_size: (u32, u32), position: Pos2) -> 
 mod tests {
     use super::*;
     use egui::Vec2;
+
+    #[test]
+    fn identical_delivery_can_idle_but_pixel_and_popup_changes_wake_repainting() {
+        let context = egui::Context::default();
+        let mut view = EditorView::default();
+        let mut frame = EditorFrame {
+            width: 1, height: 1, native_size: (1, 1), native_units_per_point: 1.0,
+            rgba: vec![23, 45, 67, 255],
+            popups: vec![super::super::EditorPopup {
+                origin: [1.0, 0.0], width: 1, height: 1, native_size: (1, 1),
+                rgba: vec![89, 12, 34, 255], interactive: true,
+            }],
+        };
+        assert!(view.animating(), "an opening editor needs fast repainting");
+        view.update_texture(&context, frame.clone());
+        assert!(view.animating());
+        let expired = Some(Instant::now() - Duration::from_secs(1));
+        view.last_activity = expired;
+        view.update_texture(&context, frame.clone());
+        assert!(!view.animating(), "identical images must not extend the active interval");
+        assert_eq!(view.frame_stats().unwrap().frames, 2);
+        assert!(view.frame_stats().unwrap().frame_age_seconds < 1.0);
+
+        frame.rgba[0] += 1;
+        view.update_texture(&context, frame.clone());
+        assert!(view.animating());
+        view.last_activity = expired;
+        frame.popups[0].origin[0] += 1.0;
+        view.update_texture(&context, frame.clone());
+        assert!(view.animating(), "popup motion matters even with identical pixels");
+        view.last_activity = expired;
+        frame.popups[0].rgba[0] += 1;
+        view.update_texture(&context, frame.clone());
+        assert!(view.animating(), "popup animation is independent of the root image");
+        view.last_activity = expired;
+        frame.native_units_per_point = 2.0;
+        view.update_texture(&context, frame.clone());
+        assert!(view.animating());
+        view.last_activity = expired;
+        frame.popups.clear();
+        view.update_texture(&context, frame);
+        assert!(view.animating(), "popup removal must repaint the uncovered editor");
+    }
 
     #[test]
     fn repeated_pixels_keep_textures_while_geometry_popups_and_delivery_advance() {
@@ -907,6 +972,8 @@ mod tests {
             visible: vec![PxRect { x: 0, y: 0, w: 200, h: 100 }],
         };
         let mut editor = RecordingEditor(Vec::new());
+        view.last_activity = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!view.animating());
         let mut output = context.run_ui(egui::RawInput {
             focused: true,
             events: vec![
@@ -930,6 +997,7 @@ mod tests {
         output.textures_delta.clear();
         assert_eq!(editor.0.iter().map(|event| event.modifiers).collect::<Vec<_>>(),
             [super::super::MOD_CONTROL, super::super::MOD_SHIFT, super::super::MOD_ALT]);
+        assert!(view.animating(), "forwarded input must wake repainting before new pixels arrive");
         assert!((editor.0[1].position[0] - 80.0).abs() < 0.001);
         assert!((editor.0[1].position[1] - 60.0).abs() < 0.001);
         drop(view);
