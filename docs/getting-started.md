@@ -83,6 +83,11 @@ Without FFmpeg, the files nodeplayer decodes itself still play.
   window. Right-click a tab and pick "Close" to close it (any but the graph); the "+" at the end
   of each tab bar opens closed ones again. The layout is kept for the next start.
 - **Graph**: where the sound goes. The default graph is Player → Output.
+- **Logs**: a dockable tab, also available from a tab bar's "+" menu. It keeps the latest
+  2,000 captured log entries with their level, module and time since startup. Filter by text
+  or level, follow the newest entry, copy the filtered text, or clear the buffer. Capture
+  follows `RUST_LOG`; by default nodeplayer's informational messages and other modules'
+  warnings/errors are included. Logs are kept for this run, rather than saved in the session.
 - **Status bar** (bottom): the output device, the latest message (hover it for the earlier
   ones) and "About", which shows the version, the author and the licenses.
 

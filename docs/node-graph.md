@@ -5,6 +5,17 @@ reaches an **Output** node is what you hear.
 
 ## Working with nodes
 
+Release a dragged wire over empty graph space to open matching node suggestions. The menu
+supports both input and output drags, filters audio and MIDI separately, and can search
+node names. Choose **Add and connect** to create a node at the drop point and wire it up,
+or select a compatible existing node. Connections that would make a feedback loop are
+excluded. Group input/output and Player suggestions respect the graph's existing nodes.
+
+Audio plugins and known MIDI-capable plugins appear with compatible suggestions. MIDI
+ports of a binary plugin that has not been loaded yet are checked on selection through
+**Other plugins…**. If it has no matching MIDI port, the node remains available to inspect
+and a message is logged; no incompatible wire is created.
+
 - **Add**: right-click an empty spot and pick a node from the menu. Plugins are added from
   the 🔌 Plugins tab with "+".
 - **Connect**: drag from an output pin (right side) to an input pin (left side). Several wires

@@ -214,6 +214,8 @@ type Cache = HashMap<PathBuf, (Stamp, TrackMeta)>;
 
 pub struct Library {
     pub sources: Vec<Source>,
+    /// Files removed from the track list, even when a watched folder still contains them.
+    pub excluded: HashSet<PathBuf>,
     pub tracks: Vec<Track>,
     pub current: Option<usize>,
     pub filter: String,
@@ -226,6 +228,9 @@ pub struct Library {
     pub revision: u64,
     /// Tracks played in shuffle mode, so "previous" can walk back.
     history: Vec<usize>,
+    /// The next row after a playing track that was removed, without highlighting another
+    /// track as playing or interrupting the file already loaded by the player.
+    removed_current: Option<usize>,
     scan_rx: Option<Receiver<(u64, Vec<Track>)>>,
     /// Bumped by every scan, so an older scan's result is dropped.
     generation: u64,
@@ -245,6 +250,7 @@ impl Default for Library {
             .map_or(1, |d| d.as_nanos() as u64);
         Self {
             sources: Vec::new(),
+            excluded: HashSet::new(),
             tracks: Vec::new(),
             current: None,
             filter: String::new(),
@@ -254,6 +260,7 @@ impl Default for Library {
             columns: Columns::default(),
             revision: 0,
             history: Vec::new(),
+            removed_current: None,
             scan_rx: None,
             generation: 0,
             meta_rx: None,
@@ -301,12 +308,16 @@ impl Library {
     /// Adds the sources the library doesn't have yet, with one scan for all of them.
     pub fn add_all(&mut self, sources: Vec<Source>) {
         let before = self.sources.len();
+        let mut restored = false;
         for source in sources {
+            if let Source::File(path) = &source {
+                restored |= self.excluded.remove(path);
+            }
             if !self.sources.contains(&source) {
                 self.sources.push(source);
             }
         }
-        if self.sources.len() > before {
+        if self.sources.len() > before || restored {
             self.rescan();
         }
     }
@@ -316,6 +327,37 @@ impl Library {
             self.sources.remove(i);
             self.rescan();
         }
+    }
+
+    /// Remove a row, not its media file. Filter pending scans too, and preserve the
+    /// current row/history indices and the next-track position when it is playing.
+    pub fn remove_track(&mut self, i: usize) -> Option<PathBuf> {
+        if i >= self.tracks.len() { return None; }
+        let path = self.tracks.remove(i).path;
+        self.excluded.insert(path.clone());
+        self.history.retain_mut(|index| {
+            if *index == i { return false; }
+            if *index > i { *index -= 1; }
+            true
+        });
+        if let Some(next) = &mut self.removed_current {
+            if i < *next { *next -= 1; }
+        }
+        self.current = match self.current {
+            Some(current) if current == i => {
+                self.removed_current = Some(i);
+                None
+            }
+            Some(current) if current > i => Some(current - 1),
+            current => current,
+        };
+        self.revision += 1;
+        Some(path)
+    }
+
+    pub fn restore_removed(&mut self) {
+        self.excluded.clear();
+        self.rescan();
     }
 
     /// Scans every source in the background; the list is replaced when it finishes.
@@ -339,6 +381,7 @@ impl Library {
         if generation != self.generation {
             return false;
         }
+        tracks.retain(|track| !self.excluded.contains(&track.path));
         let cache = self.cache.get_or_insert_with(load_cache);
         let mut missing = Vec::new();
         for t in &mut tracks {
@@ -513,6 +556,7 @@ impl Library {
         }
         self.history.clear();
         self.current = playing.and_then(|p| self.index_of(p));
+        self.removed_current = None;
         self.revision += 1;
     }
 
@@ -521,6 +565,7 @@ impl Library {
     }
 
     pub fn set_current(&mut self, i: usize) {
+        self.removed_current = None;
         if self.shuffle && self.current.is_some_and(|c| c != i) {
             self.history.extend(self.current);
         }
@@ -534,7 +579,13 @@ impl Library {
         if n == 0 {
             return None;
         }
-        let Some(cur) = self.current else { return Some(0) };
+        let Some(cur) = self.current else {
+            return match self.removed_current {
+                Some(next) if next < n => Some(next),
+                Some(_) if self.repeat == Repeat::Off => None,
+                _ => Some(0),
+            };
+        };
         if finished && matches!(self.repeat, Repeat::One | Repeat::Selection) {
             return Some(cur);
         }
@@ -563,7 +614,7 @@ impl Library {
         match self.current {
             Some(0) if self.repeat != Repeat::Off && n > 0 => Some(n - 1),
             Some(c) => Some(c.saturating_sub(1)),
-            None => (n > 0).then_some(0),
+            None => (n > 0).then(|| self.removed_current.unwrap_or(0).saturating_sub(1).min(n - 1)),
         }
     }
 
@@ -851,6 +902,71 @@ fn save_last_folder(root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rows(count: usize) -> Vec<Track> {
+        (0..count).map(|i| Track {
+            path: PathBuf::from(format!("{i}.wav")), dir: String::new(), name: format!("{i}.wav"),
+            meta: Some(TrackMeta::default()), order: i, stamp: (0, 0), added: 0,
+        }).collect()
+    }
+
+    #[test]
+    fn removing_rows_keeps_playback_cursor_and_shuffle_history_valid() {
+        let mut lib = Library { tracks: rows(5), current: Some(2), history: vec![0, 1, 3], ..Default::default() };
+        assert_eq!(lib.remove_track(1), Some(PathBuf::from("1.wav")));
+        assert_eq!(lib.current, Some(1));
+        assert_eq!(lib.history, [0, 2]);
+        lib.remove_track(1); // The file already playing remains loaded outside the library.
+        assert_eq!(lib.current, None);
+        assert_eq!(lib.next(true).map(|i| &lib.tracks[i].path), Some(&PathBuf::from("3.wav")));
+        lib.remove_track(0);
+        assert_eq!(lib.next(false), Some(0));
+        assert!(lib.history.iter().all(|&i| i < lib.tracks.len()));
+        lib.set_current(1);
+        lib.remove_track(1); // End of the list: stop unless repeat-all is enabled.
+        assert_eq!(lib.next(true), None);
+        lib.repeat = Repeat::All;
+        assert_eq!(lib.next(true), Some(0));
+        assert!(lib.remove_track(99).is_none());
+    }
+
+    #[test]
+    fn removing_a_track_does_not_delete_the_media_file() {
+        let dir = std::env::temp_dir().join(format!("nodeplayer-remove-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("keep.wav");
+        std::fs::write(&file, b"media remains on disk").unwrap();
+        let mut tracks = rows(1);
+        tracks[0].path = file.clone();
+        let mut lib = Library { tracks, ..Default::default() };
+        lib.remove_track(0);
+        assert_eq!(std::fs::read(&file).unwrap(), b"media remains on disk");
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn exclusions_survive_pending_scans_and_session_round_trip() {
+        let mut lib = Library { tracks: rows(3), ..Default::default() };
+        let removed = lib.tracks[1].path.clone();
+        lib.remove_track(1);
+        let session = crate::session::Session { library_excluded: lib.excluded.clone(), ..Default::default() };
+        let restored: crate::session::Session = serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        lib.excluded = restored.library_excluded;
+        lib.cache = Some(rows(3).into_iter().map(|track| (track.path, (track.stamp, TrackMeta::default()))).collect());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send((lib.generation, rows(3))).unwrap();
+        lib.scan_rx = Some(rx);
+        assert!(lib.poll(None));
+        assert!(lib.index_of(&removed).is_none());
+        assert_eq!(lib.tracks.len(), 2);
+        // Explicitly adding the file again clears the exclusion, even if its source
+        // already exists. Merely re-scanning a watched folder does not.
+        lib.sources.push(Source::File(removed.clone()));
+        lib.add(Source::File(removed.clone()));
+        assert!(!lib.excluded.contains(&removed));
+        assert!(lib.scanning());
+    }
 
     #[test]
     fn natural_order() {

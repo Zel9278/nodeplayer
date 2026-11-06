@@ -1,4 +1,5 @@
 mod diagnostic;
+mod node_menu;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crossbeam_channel::Receiver;
 use egui::{Color32, Pos2, pos2};
-use egui_snarl::ui::{PinInfo, SnarlPin, SnarlStyle, SnarlViewer, SnarlWidget};
+use egui_snarl::ui::{AnyPins, PinInfo, SnarlPin, SnarlStyle, SnarlViewer, SnarlWidget};
 use egui_snarl::{InPin, NodeId, OutPin, OutPinId, InPinId, Snarl};
 
 use crate::engine::eq::EqSettings;
@@ -79,10 +80,11 @@ pub(crate) enum Tab {
     Info,
     Lyrics,
     Video,
+    Logs,
 }
 
 impl Tab {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::Graph,
         Self::Library,
         Self::Presets,
@@ -93,11 +95,13 @@ impl Tab {
         Self::Info,
         Self::Lyrics,
         Self::Video,
+        Self::Logs,
     ];
 
     fn title(self) -> &'static str {
         match self {
             Self::Graph => "Graph",
+            Self::Logs => "Logs",
             Self::Library => "🎵 Library",
             Self::Presets => "💾 Presets",
             Self::Plugins => "🔌 Plugins",
@@ -130,7 +134,7 @@ fn add_new_tab(dock: &mut egui_dock::DockState<Tab>, tab: Tab) {
 /// The layout before any rearranging: the side tabs left of the graph.
 fn default_dock(extensions: bool) -> egui_dock::DockState<Tab> {
     let mut dock = egui_dock::DockState::new(vec![Tab::Graph]);
-    let mut side = vec![Tab::Library, Tab::Presets, Tab::Plugins, Tab::Misskey, Tab::Discord];
+    let mut side = vec![Tab::Library, Tab::Presets, Tab::Plugins, Tab::Misskey, Tab::Discord, Tab::Logs];
     if extensions {
         side.push(Tab::Extensions);
     }
@@ -170,6 +174,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
         }
         match tab {
             Tab::Graph => app.graph_ui(ui, self.actions),
+            Tab::Logs => app.logs.ui(ui),
             Tab::Library => app.library_panel(ui),
             Tab::Presets => app.presets_panel(ui),
             Tab::Plugins => app.plugin_panel(ui, self.actions),
@@ -250,6 +255,8 @@ enum Action {
     Leave(usize),
     LoadIntoGroup(NodeId, String),
     AddPlugin(PluginInfo, Pos2),
+    AddWired(node_menu::NewNode, Pos2, node_menu::WireDrag),
+    ConnectWired(NodeId, node_menu::WireDrag),
     Remove(NodeId),
     Changed,
     /// Ask for a name, then save the selected nodes as a node preset.
@@ -284,6 +291,7 @@ pub struct App {
     restarting: HashSet<u32>,
     yabridge: Yabridge,
     messages: Vec<String>,
+    logs: crate::logs::LogDock,
     seek_drag: Option<f64>,
     /// The transport's playback rate; Rate Shift nodes multiply it.
     rate: f32,
@@ -375,6 +383,7 @@ impl App {
         } {
             Ok(e) => Some(e),
             Err(e) => {
+                log::warn!("audio output unavailable: {e:#}");
                 messages.push(format!("audio output unavailable: {e:#}"));
                 None
             }
@@ -403,6 +412,7 @@ impl App {
             restarting: HashSet::new(),
             yabridge: Yabridge::default(),
             messages,
+            logs: Default::default(),
             seek_drag: None,
             rate: 1.0,
             added: 0,
@@ -487,6 +497,7 @@ impl App {
             app.loops.set_selection(&s.path, Some((s.start, s.end)));
         }
         app.library.sort = saved.library_sort;
+        app.library.excluded = saved.library_excluded.clone();
         app.library.columns = saved.library_columns.clone().unwrap_or_default();
         match files.as_slice() {
             // `nodeplayer <folder>` makes that folder the library.
@@ -525,7 +536,7 @@ impl App {
                     d.retain_tabs(|t| *t != Tab::Extensions);
                 }
                 // Panels added since the layout was saved (a panel closed then stays closed).
-                for tab in [Tab::Discord, Tab::Info] {
+                for tab in [Tab::Discord, Tab::Info, Tab::Logs] {
                     if !saved.tabs_seen.contains(&tab) && d.find_tab(&tab).is_none() {
                         add_new_tab(&mut d, tab);
                     }
@@ -1073,6 +1084,7 @@ impl App {
             graph: Some(self.with_root(|app| save_nodes_with_state(&app.snarl, None, capture))),
             library_root: None,
             library_sources: self.library.sources.clone(),
+            library_excluded: self.library.excluded.clone(),
             library_sort: self.library.sort,
             library_columns: Some(self.library.columns.clone()),
             track: status.path,
@@ -1900,6 +1912,12 @@ impl App {
     }
 
     fn library_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.library.excluded.is_empty()
+            && ui.small_button(format!("Restore removed tracks ({})", self.library.excluded.len()))
+                .on_hover_text("Show tracks removed from the list again; media files were not deleted.").clicked()
+        {
+            self.library.restore_removed();
+        }
         ui.horizontal(|ui| {
             let start = self.library.sources.last().map(|s| s.path().to_path_buf());
             let start = start.map(|p| if p.is_dir() { p } else { p.parent().map(Path::to_path_buf).unwrap_or(p) });
@@ -2025,6 +2043,7 @@ impl App {
 
         let current = lib.current;
         let mut play = None;
+        let mut remove_track = None;
         let mut new_sort = None;
         let mut resize: Option<(usize, f32)> = None;
         let mut toggle = None;
@@ -2147,6 +2166,18 @@ impl App {
                             if resp.clicked() {
                                 play = Some(i);
                             }
+                            resp.context_menu(|ui| {
+                                if ui.button("Play").clicked() {
+                                    play = Some(i);
+                                    ui.close();
+                                }
+                                if ui.button("Remove from list")
+                                    .on_hover_text("Keep the media file on disk.").clicked()
+                                {
+                                    remove_track = Some(t.path.clone());
+                                    ui.close();
+                                }
+                            });
                             resp.on_hover_text(t.path.display().to_string());
                         }
                     }
@@ -2164,6 +2195,13 @@ impl App {
         }
         if let Some(i) = play {
             self.play_track(i);
+        }
+        if let Some(path) = remove_track {
+            if let Some(path) = self.library.index_of(&path).and_then(|i| self.library.remove_track(i)) {
+                self.library_changed = true;
+                self.log(format!("removed from list: {}", path.display()));
+                self.persist_session(StateCapture::Cached);
+            }
         }
     }
 
@@ -2902,6 +2940,18 @@ impl eframe::App for App {
                 Action::AddPlugin(info, pos) => {
                     self.add_plugin(&info, pos);
                 }
+                Action::AddWired(choice, pos, wires) => {
+                    if wires.requirements(&self.snarl).is_some() {
+                        if let Some(node) = choice.create(self, pos) {
+                            if !wires.connect(&mut self.snarl, node) {
+                                self.log("the new node has no compatible connection for that wire");
+                            }
+                        }
+                    }
+                }
+                Action::ConnectWired(node, wires) => {
+                    if wires.connect(&mut self.snarl, node) { self.dirty = true; }
+                }
                 Action::Remove(id) => self.remove_node(id),
                 Action::Changed => self.dirty = true,
                 Action::NameNodePreset => self.naming = Some(self.selected.clone()),
@@ -3499,6 +3549,14 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
 
     fn has_graph_menu(&mut self, _pos: Pos2, _snarl: &mut Snarl<GraphNode>) -> bool {
         true
+    }
+
+    fn has_dropped_wire_menu(&mut self, pins: AnyPins, snarl: &mut Snarl<GraphNode>) -> bool {
+        node_menu::WireDrag::from_pins(pins).requirements(snarl).is_some()
+    }
+
+    fn show_dropped_wire_menu(&mut self, pos: Pos2, ui: &mut egui::Ui, pins: AnyPins, snarl: &mut Snarl<GraphNode>) {
+        node_menu::show(self, pos, ui, node_menu::WireDrag::from_pins(pins), snarl);
     }
 
     fn show_graph_menu(&mut self, pos: Pos2, ui: &mut egui::Ui, _snarl: &mut Snarl<GraphNode>) {

@@ -21,6 +21,7 @@ mod instance;
 mod jsfx;
 mod library;
 mod loop_editor;
+mod logs;
 mod lyrics;
 mod midi;
 mod midi_song;
@@ -70,10 +71,7 @@ fn main() -> Result<()> {
     updater::handle_hooks();
     #[cfg(all(windows, not(debug_assertions)))]
     attach_console();
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn,nodeplayer=info"),
-    )
-    .init();
+    logs::init()?;
     let mut parsed = runtime::parse_args(std::env::args_os().skip(1))?;
     if matches!(parsed.mode, runtime::Mode::Help) {
         print!("{}", runtime::HELP);

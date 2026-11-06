@@ -62,12 +62,26 @@ OS publisher signing.
 
 ## GitHub Actions
 
-Each of the four native platform jobs builds/tests, restores the pinned CLI, optionally
-downloads the previous full update package for its channel, and creates packages. Branch
-and PR runs validate packaging too. Tag runs upload directly to the draft GitHub release,
-so a full Actions artifact quota does not prevent releasing. Channel-specific file names
-avoid collisions between concurrent jobs. The draft becomes public only after every
-platform's packaging/tests succeed. The app reads public releases without a bundled token.
+Windows and Linux build and test natively. Both macOS architectures compile on Ubuntu
+using `mbround18/setup-osxcross@v3` with the macOS 14.5 SDK and an 11.0 deployment target.
+`packaging/macos/configure-osxcross.sh` selects target-specific C/C++ tools, the SDK and
+a CMake toolchain for ysfx and the Objective-C++ capture helpers. Linux host tools remain
+native, and unresolved symbols remain build errors.
+
+macOS test executables are also cross-compiled. A separate macOS job runs those binaries
+(x86_64 tests use Rosetta on Apple Silicon), signs the app, and makes the PKG, ZIP and
+update feed. That job needs macOS for `codesign`, `sips`, `iconutil`, `ditto`, `pkgbuild`
+and `productbuild`; no Rust compilation happens there. Windows, Linux and macOS reuse
+the packaging steps in `.github/actions/package/action.yml`.
+
+Branch and PR runs transfer the cross-built binaries through a one-day Actions artifact
+and validate packaging too. Tag runs transfer them through temporary draft-release assets
+and delete those assets after packaging. Final packages upload directly to the draft,
+so a full Actions artifact quota does not prevent releasing. Each packaging job restores
+the pinned CLI and optionally downloads the previous full update package for its channel.
+Channel-specific names avoid collisions between concurrent jobs. The draft becomes public
+only after every platform's packaging/tests succeed. The app reads public releases without
+a bundled token.
 
 The first Velopack release has no previous Velopack feed, so it publishes a full package;
 later releases can produce deltas automatically. A failure fetching an existing previous

@@ -121,10 +121,13 @@ health evidence and the requested outcome separately from the authoritative resu
 
 ## Releases
 
-Pushing a `v*` tag builds every platform and publishes a GitHub release with the archives,
-each with the license and the README: `.tar.gz` for Linux, `.zip` for Windows, and for macOS
-a `.zip` of `nodeplayer.app`, made (and ad-hoc signed) by `packaging/macos/make-app.sh` from
-`packaging/macos/Info.plist`. Every macOS CI run builds the app, so the bundle is checked too.
+Pushing a `v*` tag builds every platform and publishes a GitHub release with Velopack
+installers, portable packages and update feeds. See [Velopack packaging](../packaging/velopack/README.md)
+for the outputs and channel names. Windows and Linux build natively; macOS arm64 and
+x86_64 compile on Ubuntu with `mbround18/setup-osxcross@v3`. The cross-built test binaries
+then run on macOS, where the app bundle is ad-hoc signed and packaged without recompiling.
+Branch and PR runs check packaging too. `packaging/macos/make-app.sh` preserves the
+document associations and minimum macOS version from `packaging/macos/Info.plist`.
 
 Windows release builds are window apps: they open no terminal. Started from a terminal, they
 write their log there. Debug builds keep their console. Only one nodeplayer runs per user

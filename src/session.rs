@@ -132,6 +132,7 @@ pub struct Session {
     /// The library's single folder, as saved before several sources were possible.
     pub library_root: Option<PathBuf>,
     pub library_sources: Vec<crate::library::Source>,
+    pub library_excluded: std::collections::HashSet<PathBuf>,
     pub library_sort: Option<(crate::library::Column, bool)>,
     pub library_columns: Option<crate::library::Columns>,
     pub track: Option<PathBuf>,

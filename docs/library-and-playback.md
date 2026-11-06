@@ -18,6 +18,10 @@ The 🎵 Library tab is the track list.
   any column ("Sort by"). Drag a heading's right edge to resize the column. Playback follows the
   order shown.
 - **Filter**: matches file names, folders, titles, artists and albums.
+- **Removing a track**: right-click a track and choose **Remove from list**. The media file
+  stays on disk, and the removal is remembered across scans and restarts. A track already
+  playing can finish; the next track follows its former place in the list. **Restore removed
+  tracks** brings removed entries back, or explicitly add one file again to restore it.
 - **Play counts**: a play counts once half the track, or four minutes of it, has been listened
   to. Seeking doesn't count.
 
