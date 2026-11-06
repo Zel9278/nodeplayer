@@ -48,17 +48,19 @@ jobs:
             runtime: win-x64
             exe: nodeplayer.exe
             test: true
-          - name: macOS arm64
-            os: macos-latest
+          - name: macOS arm64 (osxcross)
+            os: ubuntu-24.04
             target: aarch64-apple-darwin
             runtime: osx-arm64
             exe: nodeplayer
-            test: true
-          - name: macOS x86_64
-            os: macos-latest
+            cross: true
+            test: false
+          - name: macOS x86_64 (osxcross)
+            os: ubuntu-24.04
             target: x86_64-apple-darwin
             runtime: osx-x64
             exe: nodeplayer
+            cross: true
             test: false
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
@@ -70,15 +72,24 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: actions/setup-dotnet@v4
+        if: ${{ !matrix.cross }}
         with:
           dotnet-version: '8.0.x'
       - name: Linux packages
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.cross
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config cmake libasound2-dev libfontconfig1-dev libfreetype-dev \
             libx11-dev libxkbcommon-dev libdbus-1-dev libfuse2t64 squashfs-tools
+      - uses: mbround18/setup-osxcross@v3
+        if: matrix.cross
+        with:
+          osx-version: '14.5'
+      - name: Configure native dependencies for osxcross
+        if: matrix.cross
+        shell: bash
+        run: bash packaging/macos/configure-osxcross.sh '${{ matrix.target }}'
       - name: Windows assembler
         if: runner.os == 'Windows'
         shell: pwsh
@@ -94,67 +105,114 @@ jobs:
       - name: Test
         if: matrix.test
         run: cargo test --release --locked --target ${{ matrix.target }}
-      - name: Restore pinned Velopack CLI
-        run: dotnet tool restore
-      - name: Download previous update package for deltas
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VPK_TOKEN: ${{ github.token }}
-        run: |
-          $names = gh release view --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name'
-          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the previous public release.' }
-          if ($names -contains 'releases.${{ matrix.runtime }}.json') {
-            dotnet tool run vpk -- --skip-updates --yes --legacyConsole download github --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" --channel '${{ matrix.runtime }}' --outputDir 'target/velopack/${{ matrix.runtime }}'
-            if ($LASTEXITCODE -ne 0) { throw 'Could not download the previous update package.' }
-          }
-      - name: Package installers and update feed
-        shell: pwsh
-        run: |
-          if ($env:GITHUB_REF_TYPE -eq 'tag') {
-            $cargo = Get-Content Cargo.toml -Raw
-            $version = [regex]::Match($cargo, '(?m)^version = "([^"]+)"').Groups[1].Value
-            if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Release tag and Cargo version differ.' }
-          }
-          ./packaging/velopack/package.ps1 -Binary 'target/${{ matrix.target }}/release/${{ matrix.exe }}' -Runtime '${{ matrix.runtime }}'
-      - name: Test portable Windows update
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./packaging/velopack/test-update.ps1 -Binary 'target/${{ matrix.target }}/release/${{ matrix.exe }}'
-      # Full artifact storage must not prevent publishing a tag release.
-      - uses: actions/upload-artifact@v4
-        continue-on-error: true
+      - name: Package native build
+        if: ${{ !matrix.cross }}
+        uses: ./.github/actions/package
         with:
-          name: nodeplayer-${{ matrix.runtime }}
-          path: |
-            target/velopack/${{ matrix.runtime }}/*.msi
-            target/velopack/${{ matrix.runtime }}/*.exe
-            target/velopack/${{ matrix.runtime }}/*.zip
-            target/velopack/${{ matrix.runtime }}/*.pkg
-            target/velopack/${{ matrix.runtime }}/*.AppImage
-            target/velopack/${{ matrix.runtime }}/*.nupkg
-            target/velopack/${{ matrix.runtime }}/*.json
-          if-no-files-found: error
-          retention-days: 7
-      - name: Upload to draft release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
+          target: ${{ matrix.target }}
+          runtime: ${{ matrix.runtime }}
+          exe: ${{ matrix.exe }}
+      - name: Stage macOS binaries and compiled tests
+        if: matrix.cross
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          RUNTIME: ${{ matrix.runtime }}
+        run: |
+          set -euo pipefail
+          stage="target/cross/$RUNTIME"
+          mkdir -p "$stage/tests"
+          cp "target/$TARGET/release/nodeplayer" "$stage/nodeplayer"
+          cargo test --release --locked --target "$TARGET" --no-run --message-format=json > target/cross-tests.json
+          jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' target/cross-tests.json |
+            while IFS= read -r test; do cp "$test" "$stage/tests/"; done
+          test -n "$(find "$stage/tests" -type f -print -quit)"
+          tar -czf "target/$RUNTIME-build.tar.gz" -C "$stage" .
+      # Tag runs transfer via the draft release, avoiding the Actions artifact quota.
+      - name: Upload macOS build to draft
+        if: matrix.cross && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RUNTIME: ${{ matrix.runtime }}
+        run: gh release upload "$GITHUB_REF_NAME" "target/$RUNTIME-build.tar.gz" --repo "$GITHUB_REPOSITORY" --clobber
+      - uses: actions/upload-artifact@v4
+        if: matrix.cross && !startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: cross-${{ matrix.runtime }}
+          path: target/${{ matrix.runtime }}-build.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  macos-package:
+    name: Package and test ${{ matrix.runtime }}
+    needs: build
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runtime: osx-arm64
+          - target: x86_64-apple-darwin
+            runtime: osx-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/download-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        with:
+          name: cross-${{ matrix.runtime }}
+          path: target/cross-download
+      - name: Download macOS build from draft
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNTIME: ${{ matrix.runtime }}
+        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern "$RUNTIME-build.tar.gz" --dir target/cross-download
+      - name: Extract and test cross-built binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          RUNTIME: ${{ matrix.runtime }}
+          CARGO_MANIFEST_DIR: ${{ github.workspace }}
         run: |
-          $files = Get-ChildItem 'target/velopack/${{ matrix.runtime }}' -File | Where-Object {
-            $_.Extension -in @('.msi', '.exe', '.zip', '.pkg', '.AppImage', '.nupkg', '.json') -or $_.Name.StartsWith('RELEASES')
-          }
-          foreach ($file in $files) {
-            gh release upload $env:GITHUB_REF_NAME $file.FullName --repo $env:GITHUB_REPOSITORY --clobber
-            if ($LASTEXITCODE -ne 0) { throw "Could not upload $($file.Name)." }
-          }
+          set -euo pipefail
+          mkdir -p "target/$TARGET/release"
+          tar -xzf "target/cross-download/$RUNTIME-build.tar.gz" -C "target/$TARGET/release"
+          arch="$(uname -m)"
+          if [[ "$RUNTIME" == osx-arm64 && "$arch" != arm64 ]]; then
+            echo "::error::Apple Silicon is required to run arm64 tests."
+            exit 1
+          fi
+          if [[ "$RUNTIME" == osx-x64 && "$arch" == arm64 ]]; then
+            /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+          fi
+          for test in target/"$TARGET"/release/tests/*; do
+            codesign --force --sign - "$test"
+            "$test"
+          done
+      - name: Package cross-built app
+        uses: ./.github/actions/package
+        with:
+          target: ${{ matrix.target }}
+          runtime: ${{ matrix.runtime }}
+          exe: nodeplayer
+      - name: Remove intermediate build from draft
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNTIME: ${{ matrix.runtime }}
+        run: gh release delete-asset "$GITHUB_REF_NAME" "$RUNTIME-build.tar.gz" --repo "$GITHUB_REPOSITORY" --yes
 
   publish:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, macos-package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

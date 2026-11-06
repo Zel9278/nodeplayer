@@ -1,0 +1,72 @@
+name: Package nodeplayer
+description: Build and verify Velopack installers and update feeds.
+inputs:
+  target:
+    required: true
+    description: Rust target triple
+  runtime:
+    required: true
+    description: Velopack update channel/runtime
+  exe:
+    required: true
+    description: Executable file name
+runs:
+  using: composite
+  steps:
+    - name: Restore pinned Velopack CLI
+      shell: pwsh
+      run: dotnet tool restore
+    - name: Download previous update package for deltas
+      if: startsWith(github.ref, 'refs/tags/v')
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VPK_TOKEN: ${{ github.token }}
+      run: |
+        $names = gh release view --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name'
+        if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the previous public release.' }
+        if ($names -contains 'releases.${{ inputs.runtime }}.json') {
+          dotnet tool run vpk -- --skip-updates --yes --legacyConsole download github --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" --channel '${{ inputs.runtime }}' --outputDir 'target/velopack/${{ inputs.runtime }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the previous update package.' }
+        }
+    - name: Package installers and update feed
+      shell: pwsh
+      run: |
+        if ($env:GITHUB_REF_TYPE -eq 'tag') {
+          $cargo = Get-Content Cargo.toml -Raw
+          $version = [regex]::Match($cargo, '(?m)^version = "([^"]+)"').Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Release tag and Cargo version differ.' }
+        }
+        ./packaging/velopack/package.ps1 -Binary 'target/${{ inputs.target }}/release/${{ inputs.exe }}' -Runtime '${{ inputs.runtime }}'
+    - name: Test portable Windows update
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: ./packaging/velopack/test-update.ps1 -Binary 'target/${{ inputs.target }}/release/${{ inputs.exe }}'
+    # Full artifact storage must not prevent publishing a tag release.
+    - uses: actions/upload-artifact@v4
+      continue-on-error: true
+      with:
+        name: nodeplayer-${{ inputs.runtime }}
+        path: |
+          target/velopack/${{ inputs.runtime }}/*.msi
+          target/velopack/${{ inputs.runtime }}/*.exe
+          target/velopack/${{ inputs.runtime }}/*.zip
+          target/velopack/${{ inputs.runtime }}/*.pkg
+          target/velopack/${{ inputs.runtime }}/*.AppImage
+          target/velopack/${{ inputs.runtime }}/*.nupkg
+          target/velopack/${{ inputs.runtime }}/*.json
+        if-no-files-found: error
+        retention-days: 7
+    - name: Upload to draft release
+      if: startsWith(github.ref, 'refs/tags/v')
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $files = Get-ChildItem 'target/velopack/${{ inputs.runtime }}' -File | Where-Object {
+          $_.Extension -in @('.msi', '.exe', '.zip', '.pkg', '.AppImage', '.nupkg', '.json') -or $_.Name.StartsWith('RELEASES')
+        }
+        foreach ($file in $files) {
+          gh release upload $env:GITHUB_REF_NAME $file.FullName --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not upload $($file.Name)." }
+        }

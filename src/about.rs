@@ -111,7 +111,9 @@ mod tests {
 
     /// The crate list as `cargo metadata` has it now.
     fn from_metadata() -> Crates {
-        let dir = env!("CARGO_MANIFEST_DIR");
+        // Cross-built tests run from another checkout on the target OS.
+        let dir = std::env::var("CARGO_MANIFEST_DIR")
+            .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").into());
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let out = std::process::Command::new(cargo)
             .args(["metadata", "--format-version", "1", "--locked"])
@@ -168,7 +170,8 @@ mod tests {
     fn about_crate_list_is_current() {
         let now = from_metadata();
         if std::env::var_os("NODEPLAYER_WRITE_LICENSES").is_some() {
-            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/licenses.json");
+            let path = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")
+                .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").into())).join("assets/licenses.json");
             std::fs::write(path, serde_json::to_string_pretty(&now).unwrap() + "\n").unwrap();
             return;
         }
