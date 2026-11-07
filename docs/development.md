@@ -75,6 +75,10 @@ layered popup uploads before their source bitmaps are reused. Captured native po
 stay off the desktop, including position changes made by layered uploads. X11 capture
 resolves the current named pixmap on every read so compositor backing-store replacement
 cannot leave it reading an abandoned image.
+On Windows, captured sources reserve a fixed offscreen origin across resizes. Cursor
+queries and warps inside captured editor callbacks use forwarded coordinates without
+moving the desktop cursor. The graph and other threads retain the normal cursor APIs.
+Cancellation restores normal cursor and foreground queries until the next pointer event.
 Forwarded X11 pointer events obtain timestamps from a private unmapped helper window,
 so native click tracking and focus/grab requests use the display's clock.
 See [plugins](plugins.md) for input and renderer limitations.

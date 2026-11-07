@@ -27,6 +27,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use super::{Placement, Spot, WinEvent, WindowId};
 
+mod cursor;
 pub(crate) mod layered;
 
 const CLASS: PCWSTR = w!("nodeplayer-plugin-editor");
@@ -84,6 +85,7 @@ thread_local! {
 /// while its callbacks run, and retains logical ownership between forwarded events.
 pub(crate) struct CaptureInput {
     root: HWND,
+    cursor: cursor::Cursor,
     capture: Cell<HWND>,
     focus: Cell<HWND>,
     depth: Cell<u32>,
@@ -99,8 +101,10 @@ pub(crate) struct CaptureInput {
 impl CaptureInput {
     pub(crate) fn new(root: HWND) -> Result<Rc<Self>> {
         layered::initialize()?;
+        cursor::initialize()?;
         let input = Rc::new(Self {
             root,
+            cursor: cursor::Cursor::new(root),
             capture: Cell::new(HWND::default()),
             focus: Cell::new(HWND::default()),
             depth: Cell::new(0),
@@ -289,6 +293,10 @@ impl CaptureInput {
         self.owns(hwnd)
     }
 
+    pub(crate) fn set_cursor(&self, position: POINT) {
+        self.cursor.set(position);
+    }
+
     fn for_window(hwnd: HWND) -> Option<Rc<Self>> {
         CAPTURE_INPUTS.with(|inputs| {
             inputs
@@ -300,6 +308,10 @@ impl CaptureInput {
     }
 
     pub(crate) fn cancel(&self) {
+        // Asynchronous menu timers must see the real foreground again after the
+        // graph dismisses them. The next forwarded pointer reactivates the cursor.
+        self.cursor.cancel();
+        let _cursor = self.cursor.enter();
         let capture = self.capture.replace(HWND::default());
         let focus = self.focus.replace(HWND::default());
         unsafe {
@@ -321,6 +333,7 @@ impl CaptureInput {
         self.depth.set(depth + 1);
         let mut scope = CaptureInputScope {
             input: self,
+            _cursor: self.cursor.enter(),
             previous_capture: HWND::default(),
             previous_focus: HWND::default(),
             temporary: Vec::new(),
@@ -355,6 +368,7 @@ impl CaptureInput {
 
 pub(crate) struct CaptureInputScope<'a> {
     input: &'a CaptureInput,
+    _cursor: cursor::Scope<'a>,
     previous_capture: HWND,
     previous_focus: HWND,
     temporary: Vec<HWND>,
@@ -700,14 +714,16 @@ fn outer_size(hwnd: HWND, (w, h): (u32, u32)) -> (i32, i32) {
 
 fn capture_origin((w, h): (i32, i32)) -> (i32, i32) {
     // The virtual desktop includes monitors left of and above the primary display.
-    // Keep the complete source outside that bounding rectangle, including after resize.
+    // Reserve the largest capturable size so resizing cannot move the source under
+    // a drag that uses screen coordinates. Larger rejected sources also stay offscreen.
+    let maximum = super::surface::MAX_DIMENSION as i32;
     unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN)
-                .saturating_sub(w.max(1))
+                .saturating_sub(w.max(maximum))
                 .saturating_sub(32),
             GetSystemMetrics(SM_YVIRTUALSCREEN)
-                .saturating_sub(h.max(1))
+                .saturating_sub(h.max(maximum))
                 .saturating_sub(32),
         )
     }

@@ -338,7 +338,6 @@ impl NativeCapture {
             self.input.cancel();
             return Ok(());
         }
-        let _input = self.input.enter();
         ensure!(
             event.position.iter().all(|n| n.is_finite()),
             "invalid editor pointer coordinates"
@@ -421,6 +420,13 @@ impl NativeCapture {
             } else {
                 let _ = MapWindowPoints(self.hwnd, target, std::slice::from_mut(&mut point));
             }
+            let mut cursor_point = point;
+            ensure!(
+                ClientToScreen(target, &mut cursor_point).as_bool(),
+                "locate editor pointer cursor"
+            );
+            self.input.set_cursor(cursor_point);
+            let _input = self.input.enter();
             let mut flags = 0u16;
             if event.buttons & 1 != 0 {
                 flags |= 1;
@@ -770,6 +776,10 @@ mod tests {
         cancels: Cell<u32>,
         last_cancel: Cell<u32>,
         desktop_moves: Cell<u32>,
+        cursor: Cell<Option<(i32, i32)>>,
+        physical_cursor: Cell<Option<(i32, i32)>>,
+        message_cursor: Cell<Option<(i32, i32)>>,
+        requested_cursor: Cell<Option<(i32, i32)>>,
     }
 
     struct TestWindow {
@@ -844,6 +854,18 @@ mod tests {
                         return LRESULT(0);
                     }
                     WM_MOUSEMOVE => {
+                        if let Some((x, y)) = state.requested_cursor.get() {
+                            let _ = SetCursorPos(x, y);
+                        }
+                        let mut cursor = POINT::default();
+                        if GetCursorPos(&mut cursor).is_ok() {
+                            state.cursor.set(Some((cursor.x, cursor.y)));
+                        }
+                        if GetPhysicalCursorPos(&mut cursor).is_ok() {
+                            state.physical_cursor.set(Some((cursor.x, cursor.y)));
+                        }
+                        let message = GetMessagePos();
+                        state.message_cursor.set(Some((message as i16 as i32, (message >> 16) as i16 as i32)));
                         state.last_move.set(Some(point));
                         return LRESULT(0);
                     }
@@ -934,6 +956,10 @@ mod tests {
             cancels: Cell::new(0),
             last_cancel: Cell::new(0),
             desktop_moves: Cell::new(0),
+            cursor: Cell::new(None),
+            physical_cursor: Cell::new(None),
+            message_cursor: Cell::new(None),
+            requested_cursor: Cell::new(None),
         });
         unsafe {
             let style =
@@ -986,6 +1012,82 @@ mod tests {
         let mut after = [0; 256];
         unsafe { GetKeyboardState(&mut after) }?;
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn forwarded_cursor_queries_and_warps_leave_the_desktop_cursor_unchanged() -> Result<()> {
+        use crate::plugins::{Placement, window::HostWindow};
+
+        let host = HostWindow::create(Placement::CaptureSource, 640, 360, "cursor regression", false)?;
+        let root = HWND(host.handle() as *mut c_void);
+        let child = fixture(Some(root), (20, 24), (240, 180), [38, 139, 188])?;
+        let mut capture = NativeCapture::new(host.handle())?;
+        let mut physical = POINT::default();
+        unsafe { GetCursorPos(&mut physical) }?;
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut origin = POINT::default();
+        ensure!(unsafe { ClientToScreen(root, &mut origin) }.as_bool(), "read source origin");
+
+        let pointer = EditorPointer {
+            timestamp_ms: None, modifiers: 0, click_count: 0,
+            position: [40.0, 40.0], kind: PointerKind::Move, buttons: 0,
+        };
+        capture.pointer(pointer)?;
+        let expected = (origin.x + 40, origin.y + 40);
+        assert_eq!(child.state.cursor.get(), Some(expected));
+        assert_eq!(child.state.physical_cursor.get(), Some(expected));
+        assert_eq!(child.state.message_cursor.get(), Some(expected));
+
+        let warped = (expected.0 + 7, expected.1 - 9);
+        child.state.requested_cursor.set(Some(warped));
+        capture.pointer(pointer)?;
+        assert_eq!(child.state.cursor.get(), Some(warped));
+        assert_eq!(child.state.physical_cursor.get(), Some(warped));
+        assert_eq!(child.state.message_cursor.get(), Some(expected), "a cursor warp does not rewrite the input message");
+
+        let mut after = POINT::default();
+        unsafe { GetCursorPos(&mut after) }?;
+        assert_eq!((after.x, after.y), (physical.x, physical.y));
+        // Timer/paint callbacks retain the last virtual position, but other threads
+        // and the host's code outside a captured callback still read the real cursor.
+        {
+            let _scope = capture.input.enter();
+            assert_eq!(unsafe { GetForegroundWindow() }, root);
+            unsafe { GetCursorPos(&mut after) }?;
+            assert_eq!((after.x, after.y), warped);
+            let other = std::thread::spawn(|| -> Result<((i32, i32), usize)> {
+                let mut point = POINT::default();
+                unsafe { GetCursorPos(&mut point) }?;
+                Ok(((point.x, point.y), unsafe { GetForegroundWindow() }.0 as usize))
+            }).join().expect("cursor-query thread panicked")?;
+            assert_eq!(other, ((physical.x, physical.y), foreground.0 as usize));
+        }
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+
+        capture.pointer(EditorPointer { kind: PointerKind::Cancel, ..pointer })?;
+        {
+            let _scope = capture.input.enter();
+            assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+            unsafe { GetCursorPos(&mut after) }?;
+            assert_eq!((after.x, after.y), (physical.x, physical.y));
+        }
+        capture.pointer(pointer)?;
+        {
+            let _scope = capture.input.enter();
+            assert_eq!(unsafe { GetForegroundWindow() }, root);
+            unsafe { GetCursorPos(&mut after) }?;
+            assert_eq!((after.x, after.y), warped);
+        }
+
+        host.resize(960, 510);
+        let mut resized_origin = POINT::default();
+        ensure!(unsafe { ClientToScreen(root, &mut resized_origin) }.as_bool(), "read resized source origin");
+        assert_eq!((resized_origin.x, resized_origin.y), (origin.x, origin.y));
+        let frame = capture.capture((640, 360))?;
+        assert_eq!((frame.width, frame.height), (960, 510));
+        assert_eq!(frame.native_size, (960, 510));
         Ok(())
     }
 
@@ -1281,6 +1383,10 @@ mod tests {
             cancels: Cell::new(0),
             last_cancel: Cell::new(0),
             desktop_moves: Cell::new(0),
+            cursor: Cell::new(None),
+            physical_cursor: Cell::new(None),
+            message_cursor: Cell::new(None),
+            requested_cursor: Cell::new(None),
         });
         let popup = unsafe {
             let hwnd = CreateWindowExW(
