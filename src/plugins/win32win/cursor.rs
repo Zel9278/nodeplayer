@@ -20,6 +20,30 @@ pub(super) struct Cursor {
 
 thread_local! {
     static CURRENT: Cell<*const Cursor> = const { Cell::new(std::ptr::null()) };
+    static COORDINATES: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) struct CoordinateScope(bool);
+
+pub(super) fn coordinates(enabled: bool) -> CoordinateScope {
+    CoordinateScope(COORDINATES.with(|current| current.replace(enabled)))
+}
+
+impl Drop for CoordinateScope {
+    fn drop(&mut self) {
+        let _ = COORDINATES.try_with(|current| current.set(self.0));
+    }
+}
+
+fn offset(hwnd: HWND) -> POINT {
+    if !COORDINATES.try_with(Cell::get).unwrap_or(false) {
+        return POINT::default();
+    }
+    // Host-side geometry reads inside popup_offset must retain physical coordinates.
+    let _physical = coordinates(false);
+    super::CaptureInput::current()
+        .and_then(|input| input.popup_offset(hwnd))
+        .unwrap_or_default()
 }
 
 impl Cursor {
@@ -88,7 +112,7 @@ mod hooks {
         OnceLock,
         atomic::{AtomicPtr, Ordering},
     };
-    use windows::Win32::Foundation::{BOOL, ERROR_NOACCESS, SetLastError};
+    use windows::Win32::Foundation::{BOOL, ERROR_NOACCESS, RECT, SetLastError};
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows::core::{PCSTR, w};
 
@@ -96,11 +120,20 @@ mod hooks {
     type Write = unsafe extern "system" fn(i32, i32) -> BOOL;
     type Message = unsafe extern "system" fn() -> u32;
     type Foreground = unsafe extern "system" fn() -> HWND;
+    type Bounds = unsafe extern "system" fn(HWND, *mut RECT) -> BOOL;
+    type Convert = unsafe extern "system" fn(HWND, *mut POINT) -> BOOL;
+    type Map = unsafe extern "system" fn(HWND, HWND, *mut POINT, u32) -> i32;
+    type WindowAt = unsafe extern "system" fn(POINT) -> HWND;
     static GET: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static PHYSICAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static SET: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static MESSAGE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static FOREGROUND: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static BOUNDS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static TO_SCREEN: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static FROM_SCREEN: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static MAP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static AT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static INSTALLED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
     pub(super) fn initialize() -> Result<()> {
@@ -143,6 +176,31 @@ mod hooks {
                 b"GetForegroundWindow\0".as_slice(),
                 foreground as *const () as *mut c_void,
                 &FOREGROUND,
+            ),
+            (
+                b"GetWindowRect\0".as_slice(),
+                bounds as *const () as *mut c_void,
+                &BOUNDS,
+            ),
+            (
+                b"ClientToScreen\0".as_slice(),
+                to_screen as *const () as *mut c_void,
+                &TO_SCREEN,
+            ),
+            (
+                b"ScreenToClient\0".as_slice(),
+                from_screen as *const () as *mut c_void,
+                &FROM_SCREEN,
+            ),
+            (
+                b"MapWindowPoints\0".as_slice(),
+                map as *const () as *mut c_void,
+                &MAP,
+            ),
+            (
+                b"WindowFromPoint\0".as_slice(),
+                window_at as *const () as *mut c_void,
+                &AT,
             ),
         ] {
             let result = (|| -> Result<()> {
@@ -254,5 +312,75 @@ mod hooks {
         let original: Foreground =
             unsafe { std::mem::transmute(FOREGROUND.load(Ordering::Acquire)) };
         unsafe { original() }
+    }
+
+    unsafe extern "system" fn bounds(hwnd: HWND, rect: *mut RECT) -> BOOL {
+        let original: Bounds = unsafe { std::mem::transmute(BOUNDS.load(Ordering::Acquire)) };
+        let result = unsafe { original(hwnd, rect) };
+        if result.as_bool()
+            && let Some(rect) = unsafe { rect.as_mut() }
+        {
+            let delta = offset(hwnd);
+            rect.left = rect.left.saturating_add(delta.x);
+            rect.right = rect.right.saturating_add(delta.x);
+            rect.top = rect.top.saturating_add(delta.y);
+            rect.bottom = rect.bottom.saturating_add(delta.y);
+        }
+        result
+    }
+
+    unsafe extern "system" fn to_screen(hwnd: HWND, point: *mut POINT) -> BOOL {
+        let original: Convert = unsafe { std::mem::transmute(TO_SCREEN.load(Ordering::Acquire)) };
+        let result = unsafe { original(hwnd, point) };
+        if result.as_bool()
+            && let Some(point) = unsafe { point.as_mut() }
+        {
+            let delta = offset(hwnd);
+            point.x = point.x.saturating_add(delta.x);
+            point.y = point.y.saturating_add(delta.y);
+        }
+        result
+    }
+
+    unsafe extern "system" fn from_screen(hwnd: HWND, point: *mut POINT) -> BOOL {
+        let original: Convert = unsafe { std::mem::transmute(FROM_SCREEN.load(Ordering::Acquire)) };
+        let delta = offset(hwnd);
+        if let Some(point) = unsafe { point.as_mut() } {
+            point.x = point.x.saturating_sub(delta.x);
+            point.y = point.y.saturating_sub(delta.y);
+        }
+        unsafe { original(hwnd, point) }
+    }
+
+    unsafe extern "system" fn map(from: HWND, to: HWND, points: *mut POINT, count: u32) -> i32 {
+        let original: Map = unsafe { std::mem::transmute(MAP.load(Ordering::Acquire)) };
+        let result = unsafe { original(from, to, points, count) };
+        let source = offset(from);
+        let destination = offset(to);
+        let dx = source.x.saturating_sub(destination.x);
+        let dy = source.y.saturating_sub(destination.y);
+        if (dx, dy) == (0, 0) || points.is_null() {
+            return result;
+        }
+        for point in unsafe { std::slice::from_raw_parts_mut(points, count as usize) } {
+            point.x = point.x.saturating_add(dx);
+            point.y = point.y.saturating_add(dy);
+        }
+        let x = (result as i16 as i32).saturating_add(dx);
+        let y = ((result >> 16) as i16 as i32).saturating_add(dy);
+        (u32::from(x as u16) | (u32::from(y as u16) << 16)) as i32
+    }
+
+    unsafe extern "system" fn window_at(point: POINT) -> HWND {
+        if COORDINATES.try_with(Cell::get).unwrap_or(false) {
+            let _physical = coordinates(false);
+            if let Some(target) = super::super::CaptureInput::current()
+                .and_then(|input| input.window_from_point(point))
+            {
+                return target;
+            }
+        }
+        let original: WindowAt = unsafe { std::mem::transmute(AT.load(Ordering::Acquire)) };
+        unsafe { original(point) }
     }
 }

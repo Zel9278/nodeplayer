@@ -223,10 +223,11 @@ impl NativeCapture {
                     (bounds.right - bounds.left).max(0) as u32,
                     (bounds.bottom - bounds.top).max(0) as u32,
                 );
+                // Menus can briefly retain WS_VISIBLE while being resized to zero
+                // during dismissal. They do not contribute an image in that state.
+                if width == 0 || height == 0 { continue; }
                 ensure!(
-                    width > 0
-                        && height > 0
-                        && width <= MAX_DIMENSION
+                    width <= MAX_DIMENSION
                         && height <= MAX_DIMENSION
                         && u64::from(width) * u64::from(height) <= remaining,
                     "editor popups exceed capture dimensions or pixel budget"
@@ -248,30 +249,31 @@ impl NativeCapture {
                         .map_or_else(|| Bitmap::new(hwnd, width, height), Ok)?;
                     std::ptr::write_bytes(bitmap.bits, 0, width as usize * height as usize * 4);
                     let mut popup_budget = 512;
-                    print_tree(
-                        hwnd,
-                        bitmap.memory_dc,
-                        POINT {
-                            x: bounds.left,
-                            y: bounds.top,
-                        },
-                        RECT {
-                            left: 0,
-                            top: 0,
-                            right: width as i32,
-                            bottom: height as i32,
-                        },
-                        0,
-                        &mut popup_budget,
-                        false,
-                    )?;
+                    let popup_origin = POINT { x: bounds.left, y: bounds.top };
+                    let popup_clip = RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 };
+                    // Prefer the popup's WM_PRINT handler. PrintWindow can succeed
+                    // with an incomplete image before an offscreen popup's first paint.
+                    print_tree(hwnd, bitmap.memory_dc, popup_origin, popup_clip, 0, &mut popup_budget, false)?;
+                    let _ = GdiFlush();
+                    let painted = std::slice::from_raw_parts(
+                        bitmap.bits.cast::<u8>(), width as usize * height as usize * 4,
+                    ).iter().any(|byte| *byte != 0);
+                    if !painted {
+                        // Retain editors that implement PrintWindow but ignore WM_PRINT.
+                        std::ptr::write_bytes(bitmap.bits, 0, width as usize * height as usize * 4);
+                        let printed = {
+                            let _saved = SavedDc::new(bitmap.memory_dc)?;
+                            PrintWindow(hwnd.0, bitmap.memory_dc.0, 2) != 0
+                        };
+                        if printed {
+                            print_children(hwnd, bitmap.memory_dc, popup_origin, popup_clip, 0, &mut popup_budget)?;
+                        }
+                    }
                     let _ = GdiFlush();
                     let pixels = std::slice::from_raw_parts(
                         bitmap.bits.cast::<u8>(),
                         width as usize * height as usize * 4,
                     );
-                    let alpha =
-                        !layered && pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0);
                     let mut rgba = Vec::with_capacity(pixels.len());
                     for pixel in pixels.as_chunks::<4>().0 {
                         let a = if layered {
@@ -285,25 +287,15 @@ impl NativeCapture {
                             } else {
                                 255
                             }
-                        } else if alpha {
-                            pixel[3]
                         } else {
+                            // BI_RGB alpha is undefined for opaque popup HWNDs,
+                            // even when a plugin happens to write some alpha bytes.
                             255
                         };
-                        let straight = |v: u8| {
-                            if a == 0 {
-                                0
-                            } else if layered {
-                                v
-                            } else {
-                                ((u32::from(v) * 255 + u32::from(a) / 2) / u32::from(a)).min(255)
-                                    as u8
-                            }
-                        };
                         rgba.extend_from_slice(&[
-                            straight(pixel[2]),
-                            straight(pixel[1]),
-                            straight(pixel[0]),
+                            pixel[2],
+                            pixel[1],
+                            pixel[0],
                             a,
                         ]);
                     }
@@ -425,7 +417,7 @@ impl NativeCapture {
                 ClientToScreen(target, &mut cursor_point).as_bool(),
                 "locate editor pointer cursor"
             );
-            self.input.set_cursor(cursor_point);
+            self.input.set_cursor(self.input.cursor_position(target, cursor_point));
             let _input = self.input.enter();
             let mut flags = 0u16;
             if event.buttons & 1 != 0 {
@@ -765,6 +757,7 @@ mod tests {
 
     struct State {
         color: [u8; 3],
+        mixed_alpha: Cell<bool>,
         timer_ticks: Cell<u32>,
         down: Cell<bool>,
         clicks: Cell<u32>,
@@ -814,6 +807,13 @@ mod tests {
             ));
             FillRect(dc, &rect, brush);
             let _ = DeleteObject(brush);
+            if state.mixed_alpha.get() {
+                if let Ok(bitmap) = Bitmap::new(hwnd, 2, 1) {
+                    let pixels = [b, g, r, 0, b, g, r, 128];
+                    std::ptr::copy_nonoverlapping(pixels.as_ptr(), bitmap.bits.cast::<u8>(), pixels.len());
+                    let _ = BitBlt(dc, 0, 0, 2, 1, bitmap.memory_dc, 0, 0, SRCCOPY);
+                }
+            }
         }
     }
 
@@ -827,6 +827,11 @@ mod tests {
             if let Some(state) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const State).as_ref() {
                 let point = (position.0 as i16 as i32, (position.0 >> 16) as i16 as i32);
                 match message {
+                    WM_APP => {
+                        let callback = &*(position.0 as *const &dyn Fn());
+                        callback();
+                        return LRESULT(0);
+                    }
                     WM_PAINT => {
                         let mut paint_info = PAINTSTRUCT::default();
                         let dc = BeginPaint(hwnd, &mut paint_info);
@@ -900,6 +905,7 @@ mod tests {
                         return LRESULT(0);
                     }
                     WM_WINDOWPOSCHANGED => {
+                        let _physical = crate::plugins::window::physical_coordinates();
                         let mut bounds = RECT::default();
                         if GetWindowRect(hwnd, &mut bounds).is_ok()
                             && bounds.right > GetSystemMetrics(SM_XVIRTUALSCREEN)
@@ -945,6 +951,7 @@ mod tests {
             .map_err(|error| anyhow::anyhow!("register adapter-test window: {error}"))?;
         let state = Box::new(State {
             color,
+            mixed_alpha: Cell::new(false),
             timer_ticks: Cell::new(0),
             down: Cell::new(false),
             clicks: Cell::new(0),
@@ -1088,6 +1095,159 @@ mod tests {
         let frame = capture.capture((640, 360))?;
         assert_eq!((frame.width, frame.height), (960, 510));
         assert_eq!(frame.native_size, (960, 510));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a Windows window station"]
+    fn worker_helper_callbacks_keep_the_editor_context_and_capture_opaque_popups() -> Result<()> {
+        use crate::plugins::window::dispatch_worker_message;
+        use std::cell::RefCell;
+
+        // Like JUCE's message window, this helper exists before capture attaches
+        // and has no owner relationship with the editor.
+        let helper = fixture(None, (-2400, -2000), (1, 1), [0, 0, 0])?;
+        unsafe { let _ = ShowWindow(helper.hwnd, SW_HIDE); }
+        let root = fixture(None, (-1400, -1000), (400, 300), [23, 28, 38])?;
+        let mut capture = NativeCapture::new(root.hwnd.0 as usize)?;
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut physical = POINT::default();
+        unsafe { GetCursorPos(&mut physical) }?;
+        capture.input.set_cursor(POINT { x: -1350, y: -960 });
+        let observed = RefCell::new(None);
+        let callback: &dyn Fn() = &|| {
+            let mut position = POINT::default();
+            let read = unsafe { GetCursorPos(&mut position) };
+            let popup = fixture(None, (-1360, -970), (120, 90), [180, 90, 30])
+                .and_then(|popup| {
+                    let mut bounds = RECT::default();
+                    unsafe { GetWindowRect(popup.hwnd, &mut bounds) }?;
+                    assert_eq!((bounds.left, bounds.top, bounds.right, bounds.bottom), (-1360, -970, -1240, -880));
+                    let mut point = POINT { x: 17, y: 23 };
+                    assert!(unsafe { ClientToScreen(popup.hwnd, &mut point) }.as_bool());
+                    assert_eq!((point.x, point.y), (-1343, -947));
+                    assert!(unsafe { ScreenToClient(popup.hwnd, &mut point) }.as_bool());
+                    assert_eq!((point.x, point.y), (17, 23));
+                    let mut mapped = [POINT { x: 17, y: 23 }];
+                    unsafe { MapWindowPoints(popup.hwnd, root.hwnd, &mut mapped); }
+                    assert_eq!((mapped[0].x, mapped[0].y), (57, 53));
+                    assert_eq!(unsafe { WindowFromPoint(POINT { x: -1343, y: -947 }) }, popup.hwnd);
+                    let child = fixture(Some(popup.hwnd), (8, 10), (30, 30), [40, 100, 160])?;
+                    assert_eq!(unsafe { WindowFromPoint(POINT { x: -1343, y: -947 }) }, child.hwnd);
+                    Ok(popup)
+                });
+            observed.replace(Some((unsafe { GetForegroundWindow() }, position, read, popup)));
+        };
+        dispatch_worker_message(&MSG {
+            hwnd: helper.hwnd,
+            message: WM_APP,
+            lParam: LPARAM(&callback as *const &dyn Fn() as isize),
+            ..Default::default()
+        });
+        let (active, position, read, popup) = observed.into_inner().expect("helper was not dispatched");
+        read?;
+        let popup = popup?;
+        popup.state.mixed_alpha.set(true);
+        assert_eq!(active, root.hwnd);
+        assert_eq!((position.x, position.y), (-1350, -960));
+        assert!(capture.input.contains(popup.hwnd));
+        assert!(!capture.input.contains(helper.hwnd));
+        let frame = capture.capture((400, 300))?;
+        assert_eq!(frame.popups.len(), 1);
+        assert_eq!(frame.popups[0].origin, [40.0, 30.0]);
+        assert_eq!(&frame.popups[0].rgba[..8], &[180, 90, 30, 255, 180, 90, 30, 255]);
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+        let mut after = POINT::default();
+        unsafe { GetCursorPos(&mut after) }?;
+        assert_eq!((after.x, after.y), (physical.x, physical.y));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a Windows window station"]
+    fn monitor_clamped_submenus_keep_logical_geometry_and_pointer_queries() -> Result<()> {
+        use crate::plugins::window::dispatch_worker_message;
+        use std::cell::RefCell;
+
+        let helper = fixture(None, (-2400, -2000), (1, 1), [0, 0, 0])?;
+        unsafe {
+            let _ = ShowWindow(helper.hwnd, SW_HIDE);
+        }
+        let root = fixture(None, (-1400, -1000), (400, 300), [23, 28, 38])?;
+        let mut capture = NativeCapture::new(root.hwnd.0 as usize)?;
+        let windows = RefCell::new(None);
+        let create: &dyn Fn() = &|| {
+            windows.replace(Some((|| -> Result<_> {
+                // JUCE clamps its menu to a monitor even though the editor is offscreen.
+                let menu = fixture(None, (10, 20), (120, 90), [180, 90, 30])?;
+                let submenu = fixture(None, (130, 30), (100, 120), [40, 100, 160])?;
+                let shadow = fixture(None, (130, 30), (110, 130), [0, 0, 0])?;
+                unsafe {
+                    let style = GetWindowLongW(shadow.hwnd, GWL_EXSTYLE) as u32;
+                    SetWindowLongW(
+                        shadow.hwnd,
+                        GWL_EXSTYLE,
+                        (style | WS_EX_TRANSPARENT.0) as i32,
+                    );
+                }
+                Ok((menu, submenu, shadow))
+            })()));
+        };
+        dispatch_worker_message(&MSG {
+            hwnd: helper.hwnd,
+            message: WM_APP,
+            lParam: LPARAM(&create as *const &dyn Fn() as isize),
+            ..Default::default()
+        });
+        let (menu, submenu, _shadow) = windows.into_inner().expect("helper was not dispatched")?;
+        capture.pointer(EditorPointer {
+            timestamp_ms: None,
+            modifiers: 0,
+            click_count: 0,
+            position: [1545.0, 1047.0],
+            kind: PointerKind::Move,
+            buttons: 0,
+        })?;
+        assert_eq!(submenu.state.last_move.get(), Some((15, 17)));
+        assert_eq!(submenu.state.cursor.get(), Some((145, 47)));
+        assert_eq!(submenu.state.message_cursor.get(), Some((145, 47)));
+
+        let verify: &dyn Fn() = &|| unsafe {
+            let mut bounds = RECT::default();
+            GetWindowRect(submenu.hwnd, &mut bounds).unwrap();
+            assert_eq!(
+                (bounds.left, bounds.top, bounds.right, bounds.bottom),
+                (130, 30, 230, 150)
+            );
+            let mut point = POINT { x: 15, y: 17 };
+            assert!(ClientToScreen(submenu.hwnd, &mut point).as_bool());
+            assert_eq!((point.x, point.y), (145, 47));
+            assert_eq!(
+                WindowFromPoint(point),
+                submenu.hwnd,
+                "the shadow must not intercept menu hit testing"
+            );
+            assert_eq!(WindowFromPoint(POINT { x: 25, y: 37 }), menu.hwnd);
+            GetCursorPos(&mut point).unwrap();
+            assert_eq!((point.x, point.y), (145, 47));
+        };
+        dispatch_worker_message(&MSG {
+            hwnd: helper.hwnd,
+            message: WM_APP,
+            lParam: LPARAM(&verify as *const &dyn Fn() as isize),
+            ..Default::default()
+        });
+        let mut physical = RECT::default();
+        unsafe { GetWindowRect(submenu.hwnd, &mut physical) }?;
+        assert!(physical.right < unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) });
+        assert!(physical.bottom < unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) });
+        let frame = capture.capture((400, 300))?;
+        assert!(
+            frame
+                .popups
+                .iter()
+                .any(|popup| popup.origin == [1530.0, 1030.0])
+        );
         Ok(())
     }
 
@@ -1364,6 +1524,59 @@ mod tests {
 
     #[test]
     #[ignore = "requires a Windows window station"]
+    fn captures_unowned_popups_only_for_the_callback_that_created_them() -> Result<()> {
+        let foreground = unsafe { GetForegroundWindow() };
+        let root = fixture(None, (-1400, -1000), (400, 300), [23, 28, 38])?;
+        let mut capture = NativeCapture::new(root.hwnd.0 as usize)?;
+        let second = fixture(None, (-2400, -1800), (400, 300), [30, 40, 50])?;
+        let mut second_capture = NativeCapture::new(second.hwnd.0 as usize)?;
+        let unrelated = fixture(None, (-2000, -1500), (100, 80), [70, 80, 90])?;
+        let (popup, nested) = {
+            let _scope = capture.input.enter();
+            let nested = {
+                let _nested = second_capture.input.enter();
+                fixture(None, (-2380, -1770), (120, 90), [50, 100, 150])?
+            };
+            let popup = fixture(None, (-1370, -960), (160, 120), [180, 90, 30])?;
+            (popup, nested)
+        };
+        unsafe {
+            assert!(GetWindow(popup.hwnd, GW_OWNER).is_err());
+            assert!(GetWindow(nested.hwnd, GW_OWNER).is_err());
+            let mut bounds = RECT::default();
+            GetWindowRect(popup.hwnd, &mut bounds)?;
+            assert!(bounds.right < GetSystemMetrics(SM_XVIRTUALSCREEN));
+            assert!(bounds.bottom < GetSystemMetrics(SM_YVIRTUALSCREEN));
+        }
+        assert!(capture.input.contains(popup.hwnd));
+        assert!(!capture.input.contains(nested.hwnd));
+        assert!(!capture.input.contains(unrelated.hwnd));
+        let frame = capture.capture((400, 300))?;
+        assert_eq!(frame.popups.len(), 1);
+        assert_eq!(frame.popups[0].origin, [30.0, 40.0]);
+        assert_eq!(&frame.popups[0].rgba[..4], &[180, 90, 30, 255]);
+        let second_frame = second_capture.capture((400, 300))?;
+        assert_eq!(second_frame.popups.len(), 1);
+        assert_eq!(second_frame.popups[0].origin, [20.0, 30.0]);
+        assert_eq!(&second_frame.popups[0].rgba[..4], &[50, 100, 150, 255]);
+        for kind in [PointerKind::Down(1), PointerKind::Up(1)] {
+            capture.pointer(EditorPointer {
+                timestamp_ms: None, modifiers: 0, click_count: 1,
+                position: [50.0, 60.0], kind,
+                buttons: u8::from(matches!(kind, PointerKind::Down(_))),
+            })?;
+        }
+        assert_eq!(popup.state.clicks.get(), 1);
+        assert_eq!(popup.state.last_up.get(), Some((20, 20)));
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+        drop(popup);
+        assert!(capture.capture((400, 300))?.popups.is_empty());
+        assert_eq!(second_capture.capture((400, 300))?.popups.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a Windows window station"]
     fn captures_owned_popup_without_exposing_it_on_the_desktop() -> Result<()> {
         let foreground = unsafe { GetForegroundWindow() };
         let root = fixture(None, (-1400, -1000), (400, 300), [23, 28, 38])?;
@@ -1372,6 +1585,7 @@ mod tests {
         let _second_capture = NativeCapture::new(second.hwnd.0 as usize)?;
         let mut state = Box::new(State {
             color: [180, 90, 30],
+            mixed_alpha: Cell::new(false),
             timer_ticks: Cell::new(0),
             down: Cell::new(false),
             clicks: Cell::new(0),

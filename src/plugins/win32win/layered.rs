@@ -546,6 +546,7 @@ mod hooks {
         has_size: bool,
         forward: impl FnOnce(*const POINT) -> BOOL,
     ) -> BOOL {
+        let _physical = super::super::cursor::coordinates(false);
         let incoming_error = unsafe { GetLastError() };
         let scope = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Scope::enter(hwnd)))
             .ok()

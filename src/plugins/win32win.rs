@@ -15,7 +15,7 @@ use std::sync::Once;
 use anyhow::{Context, Result, ensure};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BLACK_BRUSH, ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, GetStockObject, HBRUSH, HRGN, RDW_ALLCHILDREN, RDW_UPDATENOW, RGN_OR,
+    BLACK_BRUSH, ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, GetStockObject, HBRUSH, HRGN, MapWindowPoints, RDW_ALLCHILDREN, RDW_UPDATENOW, RGN_OR,
     RedrawWindow, SetWindowRgn,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -79,6 +79,7 @@ unsafe extern "system" {
 
 thread_local! {
     static CAPTURE_INPUTS: RefCell<Vec<Weak<CaptureInput>>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_INPUT: Cell<*const CaptureInput> = const { Cell::new(std::ptr::null()) };
 }
 
 /// Graph input owns physical capture/focus. The private editor sees native ownership
@@ -173,7 +174,12 @@ impl CaptureInput {
         if hwnd.0.is_null() || !unsafe { IsWindow(hwnd) }.as_bool() {
             return false;
         }
-        if hwnd == self.root || unsafe { IsChild(self.root, hwnd) }.as_bool() {
+        if hwnd == self.root
+            || unsafe { IsChild(self.root, hwnd) }.as_bool()
+            || self.popup_origins.borrow().iter().any(|(popup, _)| {
+                hwnd == *popup || unsafe { IsChild(*popup, hwnd) }.as_bool()
+            })
+        {
             return true;
         }
         let mut top = unsafe { GetAncestor(hwnd, GA_ROOT) };
@@ -181,7 +187,10 @@ impl CaptureInput {
             let Ok(owner) = (unsafe { GetWindow(top, GW_OWNER) }) else {
                 return false;
             };
-            if owner == self.root || unsafe { IsChild(self.root, owner) }.as_bool() {
+            if owner == self.root
+                || unsafe { IsChild(self.root, owner) }.as_bool()
+                || self.popup_origins.borrow().iter().any(|(popup, _)| *popup == owner)
+            {
                 return true;
             }
             top = owner;
@@ -223,7 +232,7 @@ impl CaptureInput {
         self.hook(self.root)?;
         let mut pending = vec![self.root];
         pending.extend(self.popup_origins.borrow().iter().filter_map(|(window, _)| {
-            self.owns(*window).then_some(*window)
+            unsafe { IsWindow(*window) }.as_bool().then_some(*window)
         }));
         let mut count = 0;
         while let Some(parent) = pending.pop() {
@@ -285,6 +294,62 @@ impl CaptureInput {
         }
     }
 
+    fn popup_offset(&self, hwnd: HWND) -> Option<POINT> {
+        let top = unsafe { GetAncestor(hwnd, GA_ROOT) };
+        let origin = self.popup_origins.borrow().iter()
+            .find_map(|(window, origin)| (*window == top).then_some(*origin))?;
+        let _physical = cursor::coordinates(false);
+        let mut root = POINT::default();
+        let mut actual = RECT::default();
+        if !unsafe { ClientToScreen(self.root, &mut root) }.as_bool()
+            || unsafe { GetWindowRect(top, &mut actual) }.is_err()
+        { return None; }
+        Some(POINT {
+            x: root.x.saturating_add(origin.x).saturating_sub(actual.left),
+            y: root.y.saturating_add(origin.y).saturating_sub(actual.top),
+        })
+    }
+
+    pub(crate) fn cursor_position(&self, hwnd: HWND, mut point: POINT) -> POINT {
+        if let Some(offset) = self.popup_offset(hwnd) {
+            point.x = point.x.saturating_add(offset.x);
+            point.y = point.y.saturating_add(offset.y);
+        }
+        point
+    }
+
+    fn window_from_point(&self, point: POINT) -> Option<HWND> {
+        let _physical = cursor::coordinates(false);
+        let mut windows = self.popups().ok()?;
+        let mut root = RECT::default();
+        unsafe { GetWindowRect(self.root, &mut root) }.ok()?;
+        windows.insert(0, (self.root, POINT { x: root.left, y: root.top }));
+        for (mut hwnd, origin) in windows.into_iter().rev() {
+            let mut rect = RECT::default();
+            if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err()
+                || unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TRANSPARENT.0 != 0
+                || point.x < origin.x || point.y < origin.y
+                || point.x >= origin.x.saturating_add(rect.right - rect.left)
+                || point.y >= origin.y.saturating_add(rect.bottom - rect.top)
+            { continue; }
+            let mut local = POINT {
+                x: point.x.saturating_sub(origin.x).saturating_add(rect.left),
+                y: point.y.saturating_sub(origin.y).saturating_add(rect.top),
+            };
+            if !unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut local) }.as_bool() {
+                continue;
+            }
+            for _ in 0..32 {
+                let child = unsafe { ChildWindowFromPointEx(hwnd, local, CWP_SKIPDISABLED | CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT) };
+                if child.0.is_null() || child == hwnd { break; }
+                unsafe { MapWindowPoints(hwnd, child, std::slice::from_mut(&mut local)); }
+                hwnd = child;
+            }
+            return Some(hwnd);
+        }
+        None
+    }
+
     pub(crate) fn owner(&self) -> Option<HWND> {
         self.owns(self.capture.get()).then(|| self.capture.get())
     }
@@ -305,6 +370,14 @@ impl CaptureInput {
                 .filter_map(Weak::upgrade)
                 .find(|input| input.owns(hwnd))
         })
+    }
+
+    fn current() -> Option<Rc<Self>> {
+        let current = CURRENT_INPUT.try_with(Cell::get).ok()?;
+        CAPTURE_INPUTS.try_with(|inputs| {
+            inputs.borrow().iter().filter_map(Weak::upgrade)
+                .find(|input| std::ptr::eq(Rc::as_ptr(input), current))
+        }).ok().flatten()
     }
 
     pub(crate) fn cancel(&self) {
@@ -333,6 +406,7 @@ impl CaptureInput {
         self.depth.set(depth + 1);
         let mut scope = CaptureInputScope {
             input: self,
+            previous_input: CURRENT_INPUT.with(|current| current.replace(self)),
             _cursor: self.cursor.enter(),
             previous_capture: HWND::default(),
             previous_focus: HWND::default(),
@@ -368,6 +442,7 @@ impl CaptureInput {
 
 pub(crate) struct CaptureInputScope<'a> {
     input: &'a CaptureInput,
+    previous_input: *const CaptureInput,
     _cursor: cursor::Scope<'a>,
     previous_capture: HWND,
     previous_focus: HWND,
@@ -410,6 +485,7 @@ impl Drop for CaptureInputScope<'_> {
             input.returning_focus.set(HWND::default());
         }
         input.depth.set(input.depth.get().saturating_sub(1));
+        CURRENT_INPUT.with(|current| current.set(self.previous_input));
     }
 }
 
@@ -421,6 +497,7 @@ unsafe extern "system" fn capture_input_proc(
     id: usize,
     data: usize,
 ) -> LRESULT {
+    let _physical = cursor::coordinates(false);
     // NativeCapture retains the Rc until every subclass is removed. All access and
     // destruction are confined to this HWND's thread; no Rust mutable borrow spans a call.
     let input = unsafe { &*(data as *const CaptureInput) };
@@ -514,9 +591,36 @@ unsafe extern "system" fn capture_input_proc(
         }
     }
     let _scope = (input.owns(hwnd)
-        && matches!(message, WM_TIMER | WM_PAINT | WM_PRINT | WM_PRINTCLIENT | WM_MOUSELEAVE))
+        && matches!(message, WM_TIMER | WM_PAINT | WM_PRINT | WM_PRINTCLIENT | WM_MOUSELEAVE
+            | WM_WINDOWPOSCHANGING | WM_WINDOWPOSCHANGED))
     .then(|| input.enter());
-    let result = unsafe { DefSubclassProc(hwnd, message, value, position) };
+    let mut logical = (input.popup_offset(hwnd).is_some()
+        && matches!(message, WM_WINDOWPOSCHANGING | WM_WINDOWPOSCHANGED))
+        .then(|| unsafe { (position.0 as *const WINDOWPOS).as_ref() }.copied()).flatten();
+    if let Some(change) = &mut logical
+        && let Some(offset) = input.popup_offset(hwnd)
+    {
+        change.x = change.x.saturating_add(offset.x);
+        change.y = change.y.saturating_add(offset.y);
+    }
+    let forwarded = logical.as_mut().map_or(position, |change| LPARAM(change as *mut WINDOWPOS as isize));
+    let result = {
+        let _logical = cursor::coordinates(true);
+        unsafe { DefSubclassProc(hwnd, message, value, forwarded) }
+    };
+    if message == WM_WINDOWPOSCHANGING
+        && input.popup_offset(hwnd).is_some()
+        && let Some(change) = logical
+        && let Some(actual) = unsafe { (position.0 as *mut WINDOWPOS).as_mut() }
+    {
+        if change.flags & SWP_NOMOVE != SWP_NOMOVE {
+            input.remember_popup(hwnd, POINT { x: change.x, y: change.y });
+        }
+        *actual = change;
+        (actual.x, actual.y) = capture_origin((actual.cx, actual.cy));
+        actual.flags &= !SWP_NOMOVE;
+        actual.flags |= SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    }
     if message == WM_NCCREATE {
         input.make_popup_passive(hwnd);
     }
@@ -528,6 +632,7 @@ unsafe extern "system" fn capture_create_proc(
     value: WPARAM,
     position: LPARAM,
 ) -> LRESULT {
+    let _physical = cursor::coordinates(false);
     // A captured editor's menus belong to the graph. Allow their native focus and
     // capture bookkeeping without activating a private top-level window, which
     // would deactivate the app and briefly change its window decorations.
@@ -541,9 +646,14 @@ unsafe extern "system" fn capture_create_proc(
         && let Some(details) = unsafe { create.lpcs.as_mut() }
         && details.style as u32 & WS_CHILD.0 == 0
     {
-        let input = CaptureInput::for_window(details.hwndParent);
+        // JUCE menus and their shadows can be top-level windows with no owner.
+        // Associate them at creation, while the originating editor callback is
+        // still scoped, rather than claiming every window on the worker thread.
+        let hwnd = HWND(value.0 as *mut _);
+        let input = CaptureInput::for_window(details.hwndParent)
+            .or_else(|| CaptureInput::for_window(hwnd))
+            .or_else(|| details.hwndParent.0.is_null().then(CaptureInput::current).flatten());
         if let Some(input) = input {
-            let hwnd = HWND(value.0 as *mut _);
             // Every capture source installs this thread-wide callback. Later hook
             // invocations see the already parked creation structure; retain the first
             // logical origin recorded for this HWND.
@@ -585,6 +695,30 @@ fn with_capture_input<T>(hwnd: HWND, operation: impl FnOnce() -> T) -> T {
     let input = CaptureInput::for_window(hwnd);
     let _scope = input.as_ref().map(|input| input.enter());
     operation()
+}
+
+#[cfg(test)]
+pub(crate) fn physical_coordinates() -> impl Drop {
+    cursor::coordinates(false)
+}
+
+/// A worker hosts a single editor. JUCE dispatches timers and asynchronous menu
+/// creation through an ownerless message window, outside the editor HWND tree.
+pub(crate) fn dispatch_worker_message(message: &MSG) {
+    let input = CaptureInput::for_window(message.hwnd).or_else(|| {
+        CAPTURE_INPUTS.with(|inputs| {
+            let inputs = inputs.borrow();
+            let mut live = inputs.iter().filter_map(Weak::upgrade);
+            let input = live.next()?;
+            live.next().is_none().then_some(input)
+        })
+    });
+    let _scope = input.as_ref().map(|input| input.enter());
+    let _logical = cursor::coordinates(true);
+    unsafe {
+        let _ = TranslateMessage(message);
+        DispatchMessageW(message);
+    }
 }
 
 /// Cuts `container` to the parts of it nothing covers. A window region clips drawing, the
