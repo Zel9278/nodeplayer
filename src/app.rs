@@ -2807,7 +2807,10 @@ impl eframe::App for App {
         }
         // Space plays and pauses, unless something is being typed. Taken before any widget
         // sees it, so it doesn't also press the focused button.
-        if !ctx.text_edit_focused() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+        let plugin_keyboard_focused = every_node(&mut self.snarl, &mut self.outer).into_iter().any(|node| {
+            matches!(&node.kind, NodeKind::Plugin(plugin) if plugin.editor.is_some() && plugin.editor_view.has_keyboard_focus(&ctx))
+        });
+        if !ctx.text_edit_focused() && !plugin_keyboard_focused && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
             if self.player.is_playing() {
                 self.player.set_playing(false);
             } else {

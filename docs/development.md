@@ -83,11 +83,13 @@ Ownerless popup windows created during editor callbacks stay with that editor. W
 helper callbacks retain the same input context so asynchronous JUCE menus stay open.
 Captured popup geometry and hit tests use the menu's logical position while its HWND
 stays offscreen, including when a plugin clamps menus to a monitor.
-Captured Windows editors accept keyboard focus, key transitions, translated text, and
-clipboard shortcuts through the editor interface. Translated characters are queued
-before key-down so JUCE does not synthesize the same character again. Focus and polled
-key and mouse-button state use logical editor state inside plugin callbacks, while
-physical focus and the keyboard table stay with the host. Blur releases held keys.
+Windows captured editors also forward keyboard focus, key transitions, translated text,
+committed host IME text, and clipboard shortcuts. Pointer and keyboard messages share
+one ordered queue, with worker generation and editor token checks on delivery.
+Focus loss releases held keys. Translated character messages are queued before their
+key-down callback so JUCE does not synthesize the same character a second time.
+Plugin focus and asynchronous key and mouse-button queries use that editor's logical input state
+inside callbacks, while graph focus and the physical keyboard remain with the host.
 Forwarded X11 pointer events obtain timestamps from a private unmapped helper window,
 so native click tracking and focus/grab requests use the display's clock.
 See [plugins](plugins.md) for input and renderer limitations.
