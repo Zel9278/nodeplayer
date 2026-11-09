@@ -64,7 +64,7 @@ Pointer events retain Shift, Control and Alt/Option state for modified and fine 
 On macOS and Windows, double-clicks follow the system's timing settings.
 On macOS and Windows, attached or owned popup windows appear over the graph and accept pointer input,
 including outside the editor image. Escape or a click outside closes the popup.
-On macOS, Metal popup windows also use drawable capture.
+On macOS, Metal popup windows also use drawable capture, including reused menus.
 Windows layered menus retain their uploaded pixels and transparency in the graph.
 Keyboard/IME, drag-and-drop, blocking native menus, and unrelated popup windows are
 not forwarded; use **Pop out** for those interactions. Capture can

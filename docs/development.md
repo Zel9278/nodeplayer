@@ -88,6 +88,8 @@ so native click tracking and focus/grab requests use the display's clock.
 See [plugins](plugins.md) for input and renderer limitations.
 
 On macOS, each Metal popup uses its own completed-drawable capture adapter.
+Capture sources remember weak references to explicitly attached popup windows,
+including when AppKit detaches a hidden window that the plugin later reuses.
 Local event monitors installed while handling captured editor input leave the
 graph's original pointer events to the host while that editor has an interactive popup.
 The graph forwards selections and outside-click cancellation in native coordinates.

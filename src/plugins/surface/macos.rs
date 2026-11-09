@@ -489,18 +489,17 @@ fn capture_view(view: &NSView, cache: &mut BitmapCache, pixel_budget: u64) -> Re
     rgba_frame(bitmap, native_size)
 }
 
-/// Only attached windows belong to this editor; never capture unrelated app windows.
+/// Include reused former children, but never claim unrelated application windows.
 fn popup_windows(root: &NSWindow) -> Result<Vec<Retained<NSWindow>>> {
     fn children(root: &NSWindow, result: &mut Vec<Retained<NSWindow>>) -> Result<()> {
-        if let Some(windows) = root.childWindows() {
-            for child in windows.iter().filter(|window| window.isVisible()) {
-                ensure!(result.len() < MAX_POPUPS, "too many native editor popups");
-                // The private host hides direct children before AppKit orders them.
-                // Keep any deeper attached windows private as well.
-                child.setAlphaValue(0.0);
-                result.push(child.clone());
-                children(&child, result)?;
-            }
+        for child in crate::plugins::window::captured_popup_windows(root).into_iter().filter(|window| window.isVisible()) {
+            if result.contains(&child) { continue; }
+            ensure!(result.len() < MAX_POPUPS, "too many native editor popups");
+            // The private host hides direct children before AppKit orders them.
+            // Keep any deeper attached windows private as well.
+            child.setAlphaValue(0.0);
+            result.push(child.clone());
+            children(&child, result)?;
         }
         Ok(())
     }

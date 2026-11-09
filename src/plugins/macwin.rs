@@ -11,7 +11,7 @@
 use std::cell::{Cell, RefCell};
 
 use anyhow::{Context, Result};
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{DefinedClass, Encoding, MainThreadMarker, MainThreadOnly, RefEncode, define_class, msg_send, sel};
 use objc2_app_kit::{NSBackingStoreType, NSResponder, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask};
@@ -24,6 +24,13 @@ struct ContainerIvars {
     /// The parts of the container nothing covers, in its own coordinates; empty when it's
     /// all visible.
     visible: RefCell<Vec<NSRect>>,
+}
+
+#[derive(Default)]
+struct CaptureWindowIvars {
+    // AppKit can detach an ordered-out child that the plugin later reuses.
+    // Remember only windows explicitly attached to this capture source.
+    popups: RefCell<Vec<Weak<NSWindow>>>,
 }
 
 define_class!(
@@ -70,6 +77,7 @@ define_class!(
     #[unsafe(super(NSWindow, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "NodeplayerCaptureWindow"]
+    #[ivars = CaptureWindowIvars]
     struct CaptureWindow;
 
     impl CaptureWindow {
@@ -81,6 +89,13 @@ define_class!(
 
         #[unsafe(method(addChildWindow:ordered:))]
         fn add_child(&self, child: &NSWindow, ordering: NSWindowOrderingMode) {
+            {
+                let mut popups = self.ivars().popups.borrow_mut();
+                popups.retain(|popup| popup.load().is_some());
+                if !popups.iter().any(|popup| popup.load().is_some_and(|popup| &*popup == child)) {
+                    popups.push(Weak::new(child));
+                }
+            }
             // Menus may check isVisible on their parent. Keep both windows ordered,
             // but capture their views instead of showing them on the desktop.
             child.setAlphaValue(0.0);
@@ -89,6 +104,23 @@ define_class!(
         }
     }
 );
+
+pub(crate) fn captured_popup_windows(root: &NSWindow) -> Vec<Retained<NSWindow>> {
+    let mut windows: Vec<_> = root.childWindows().into_iter()
+        .flat_map(|windows| windows.to_vec()).collect();
+    if let Some(capture) = root.downcast_ref::<CaptureWindow>() {
+        capture.ivars().popups.borrow_mut().retain(|popup| {
+            let Some(popup) = popup.load() else { return false };
+            // A plugin may transfer a reusable window to another editor.
+            if popup.parentWindow().is_some_and(|parent| &*parent != root) {
+                return false;
+            }
+            if !windows.contains(&popup) { windows.push(popup); }
+            true
+        });
+    }
+    windows
+}
 
 /// Core Graphics' color, only passed from NSColor to CALayer here.
 #[repr(C)]
@@ -206,8 +238,9 @@ impl HostWindow {
                 (None, Some(window))
             }
             Placement::CaptureSource => {
+                let window = CaptureWindow::alloc(mtm).set_ivars(CaptureWindowIvars::default());
                 let window: Retained<CaptureWindow> = unsafe {
-                    msg_send![CaptureWindow::alloc(mtm), initWithContentRect: frame,
+                    msg_send![super(window), initWithContentRect: frame,
                         styleMask: NSWindowStyleMask::Borderless,
                         backing: NSBackingStoreType::Buffered, defer: false,
                     ]
