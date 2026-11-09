@@ -719,7 +719,7 @@ fn audio_loop(
 #[cfg(windows)]
 fn pump_native() -> Result<()> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+        MSG, PM_REMOVE, PeekMessageW,
     };
     let started = Instant::now();
     unsafe {
@@ -728,8 +728,7 @@ fn pump_native() -> Result<()> {
             if !PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 break;
             }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            crate::plugins::window::dispatch_worker_message(&msg);
             // A plugin can keep invalidating its editor from WM_PAINT. Leave
             // queued messages for the next pass so capture and control requests
             // run between paints. One native callback still runs to completion.
