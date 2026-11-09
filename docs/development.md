@@ -87,7 +87,8 @@ Forwarded X11 pointer events obtain timestamps from a private unmapped helper wi
 so native click tracking and focus/grab requests use the display's clock.
 See [plugins](plugins.md) for input and renderer limitations.
 
-On macOS, local event monitors installed while handling captured editor input leave the
+On macOS, each Metal popup uses its own completed-drawable capture adapter.
+Local event monitors installed while handling captured editor input leave the
 graph's original pointer events to the host while that editor has an interactive popup.
 The graph forwards selections and outside-click cancellation in native coordinates.
 Run the AppKit monitor regression on macOS, from the repository root:
