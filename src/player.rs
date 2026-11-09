@@ -55,6 +55,8 @@ struct Shared {
     finished: AtomicBool,
     /// Frames of the file played since `base_secs` (at the device rate, before the rate shift).
     frames_played: AtomicU64,
+    /// Output frames actually processed, independent of file position, seeks and rate.
+    listened_frames: AtomicU64,
     base_secs: AtomicU64,
     /// Playback rate as f32 bits.
     rate: AtomicU32,
@@ -306,6 +308,12 @@ impl Player {
             return self.midi().player.status().position;
         }
         self.shared.position(self.device_rate)
+    }
+
+    /// Drain listening time for the statistics collector. No file-position arithmetic:
+    /// pauses, seeks and PCM underruns add nothing, and rate shifts count output time.
+    pub fn take_listened_seconds(&self) -> f64 {
+        self.shared.listened_frames.swap(0, Ordering::AcqRel) as f64 / self.device_rate as f64
     }
 
     /// The file played to the end and hasn't been started again.
@@ -1274,6 +1282,11 @@ impl Processor for PlayerSource {
     ) {
         self.process(n, inputs, outputs);
         let rate = f32::from_bits(self.shared.rate.load(Ordering::Acquire));
+        if self.shared.midi_active.load(Ordering::Acquire)
+            && self.midi.clock.try_snapshot().is_some_and(|(playing, _, speed)| playing && speed > 0.0)
+        {
+            self.shared.listened_frames.fetch_add(n as u64, Ordering::Relaxed);
+        }
         self.midi.run(n, midi_out, rate);
         self.transport = self.transport.at_offset(n);
     }
@@ -1303,6 +1316,7 @@ impl Processor for PlayerSource {
             o.l[m..n].fill(0.0);
             o.r[m..n].fill(0.0);
             s.frames_played.fetch_add(used as u64, Ordering::AcqRel);
+            s.listened_frames.fetch_add(m as u64, Ordering::Relaxed);
             if m < n && s.eof.load(Ordering::Acquire) {
                 s.playing.store(false, Ordering::Release);
                 s.ended.store(true, Ordering::Release);
@@ -1329,6 +1343,7 @@ impl Processor for PlayerSource {
         o.l[m..n].fill(0.0);
         o.r[m..n].fill(0.0);
         s.frames_played.fetch_add(m as u64, Ordering::AcqRel);
+        s.listened_frames.fetch_add(m as u64, Ordering::Relaxed);
         if m < n && s.eof.load(Ordering::Acquire) {
             s.playing.store(false, Ordering::Release);
             s.ended.store(true, Ordering::Release);
@@ -1340,6 +1355,33 @@ impl Processor for PlayerSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listening_clock_counts_output_time_not_seeks_pauses_or_buffer_underruns() {
+        let player = Player::new(48_000);
+        let (mut producer, ring) = rtrb::RingBuffer::new(96_000);
+        for _ in 0..48_000 { producer.push(0.25).unwrap(); producer.push(0.25).unwrap(); }
+        let shared = player.shared.clone();
+        let mut source = PlayerSource { ring, shared: shared.clone(), varispeed: Varispeed::new(), midi: MidiSong::new().feed(48_000.0), device_rate: 48_000, position_anchor: (0, 0.0), transport: Transport::default() };
+        let mut output = [StereoBuf::new()];
+        shared.playing.store(true, Ordering::Release);
+        source.process(512, &mut [], &mut output);
+        assert_eq!(player.take_listened_seconds(), 512.0 / 48_000.0);
+        assert_eq!(player.take_listened_seconds(), 0.0);
+        shared.playing.store(false, Ordering::Release);
+        source.process(512, &mut [], &mut output);
+        assert_eq!(player.take_listened_seconds(), 0.0);
+        shared.playing.store(true, Ordering::Release);
+        shared.rate.store(2.0f32.to_bits(), Ordering::Release);
+        source.process(512, &mut [], &mut output);
+        assert_eq!(player.take_listened_seconds(), 512.0 / 48_000.0);
+        shared.flush.store(true, Ordering::Release); // Seek: discard all old buffered samples.
+        shared.base_secs.store(10_000f64.to_bits(), Ordering::Release);
+        source.process(512, &mut [], &mut output);
+        assert_eq!(player.take_listened_seconds(), 0.0);
+        source.process(512, &mut [], &mut output); // No data and not EOF: buffering.
+        assert_eq!(player.take_listened_seconds(), 0.0);
+    }
 
     #[test]
     fn transport_follows_pause_seek_stop_and_eof() {
@@ -1658,6 +1700,7 @@ mod tests {
         player.set_loop(Some((0.25, 0.5)));
         assert!(wait_for(|| player.status().path.is_some()));
         let (l, pos) = pull(&mut src, &player, 48_000 + 512);
+        assert_eq!(player.take_listened_seconds(), l.len() as f64 / 48_000.0);
         let step = 1.0 / 48_000.0;
         // Up to the end as it is, then from the start again: one frame to the next, the
         // ramp goes on or jumps back by the loop's length. The fade is over in 5 ms.
@@ -1796,6 +1839,15 @@ mod tests {
         assert!((0.2..0.45).contains(&last), "position {last}");
         assert!(seen.iter().all(|p| *p < 0.45), "stays inside: {:?}", seen.iter().fold(0.0f64, |m, p| m.max(*p)));
         assert!(player.is_playing() && !player.take_ended());
+        let mut output = [StereoBuf::new()];
+        let mut messages = MidiBuf::new();
+        assert!(wait_for(|| {
+            src.process_midi(512, &mut [], &mut output, &[], &mut messages);
+            player.take_listened_seconds() == 512.0 / 48_000.0
+        }), "running MIDI contributes processed output time");
+        player.set_playing(false);
+        src.process_midi(512, &mut [], &mut output, &[], &mut messages);
+        assert_eq!(player.take_listened_seconds(), 0.0, "paused MIDI adds no listening time");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

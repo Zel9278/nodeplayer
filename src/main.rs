@@ -40,6 +40,7 @@ mod r2;
 mod runtime;
 mod session;
 mod setup;
+mod statistics;
 mod titleformat;
 mod updater;
 mod video;

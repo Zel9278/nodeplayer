@@ -25,6 +25,28 @@ The 🎵 Library tab is the track list.
 - **Play counts**: a play counts once half the track, or four minutes of it, has been listened
   to. Seeking doesn't count.
 
+## Listening statistics
+
+Open **Statistics** from a tab bar's "+" menu. It shows total running time, total listening
+time and the cumulative listening time for each file, including files removed from the
+library. Search the track ranking by title, artist or path; selecting a row shows that
+track's daily history. **All tracks** restores the overall chart. Bars and lines support
+daily and lifetime cumulative totals over the last 7, 30, 90 or 365 days, including empty
+days. The running-time chart is separate from listening. Graph dates follow the PC's local time zone, with each date saved as recorded.
+
+Listening time measures playback processed by the Player node, including silent passages
+and repeats. Pauses, PCM buffering gaps and skipped time from seeking do not count. A
+minute at 2× speed counts as one minute of listening, rather than two minutes of source
+material. MIDI files count while their playback clock is running and the Player node is
+processing. These statistics do not infer whether the output is muted or audible.
+
+History starts when this version is first run. It is stored in `statistics.json` in the
+application's state folder, saved every minute and on normal exit; a crash can lose the
+unsaved minute. Each file is identified by its path. Concurrent app instances merge their
+unsaved additions under a file lock; running time counts the sum of instance runtimes.
+Diagnostics do not save usage statistics. An unreadable or newer statistics file is left
+untouched and reported in the dock.
+
 ## The transport
 
 | Control | What it does |

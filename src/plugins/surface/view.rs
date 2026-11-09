@@ -862,7 +862,7 @@ mod tests {
         focused: bool,
         visible: bool,
     ) -> egui::FullOutput {
-        context.run_ui(egui::RawInput {
+        let mut output = context.run_ui(egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
             focused, events, ..Default::default()
         }, |ui| {
@@ -884,7 +884,10 @@ mod tests {
                 let spot = Spot { clip, origin: (clip.x, clip.y), visible: vec![clip] };
                 view.dispatch(context, editor, visible.then_some(&spot), 1.0).unwrap();
             }
-        })
+        });
+        // This input-only harness has no renderer to consume texture uploads.
+        output.textures_delta.clear();
+        output
     }
 
     fn click(position: Pos2) -> Vec<egui::Event> {

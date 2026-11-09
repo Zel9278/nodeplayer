@@ -88,6 +88,12 @@ Without FFmpeg, the files nodeplayer decodes itself still play.
   or level, follow the newest entry, copy the filtered text, or clear the buffer. Capture
   follows `RUST_LOG`; by default nodeplayer's informational messages and other modules'
   warnings/errors are included. Logs are kept for this run, rather than saved in the session.
+- **Statistics**: total application running time, total listening time and a track ranking.
+  Select a track to graph its listening history, or use **All tracks** for the overall view.
+  Switch between bars and lines, daily and cumulative values, and 7/30/90/365 days. Hover
+  a graph to see the date and time. Daily buckets follow the PC's local time zone.
+  Recording starts with this version; earlier listening cannot be reconstructed. Totals are saved every minute and
+  on normal exit, independently of the dock layout.
 - **Status bar** (bottom): the output device, the latest message (hover it for the earlier
   ones) and "About", which shows the version, the author and the licenses.
 

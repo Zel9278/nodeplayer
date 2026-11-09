@@ -81,10 +81,11 @@ pub(crate) enum Tab {
     Lyrics,
     Video,
     Logs,
+    Statistics,
 }
 
 impl Tab {
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::Graph,
         Self::Library,
         Self::Presets,
@@ -96,12 +97,14 @@ impl Tab {
         Self::Lyrics,
         Self::Video,
         Self::Logs,
+        Self::Statistics,
     ];
 
     fn title(self) -> &'static str {
         match self {
             Self::Graph => "Graph",
             Self::Logs => "Logs",
+            Self::Statistics => "Statistics",
             Self::Library => "🎵 Library",
             Self::Presets => "💾 Presets",
             Self::Plugins => "🔌 Plugins",
@@ -134,7 +137,7 @@ fn add_new_tab(dock: &mut egui_dock::DockState<Tab>, tab: Tab) {
 /// The layout before any rearranging: the side tabs left of the graph.
 fn default_dock(extensions: bool) -> egui_dock::DockState<Tab> {
     let mut dock = egui_dock::DockState::new(vec![Tab::Graph]);
-    let mut side = vec![Tab::Library, Tab::Presets, Tab::Plugins, Tab::Misskey, Tab::Discord, Tab::Logs];
+    let mut side = vec![Tab::Library, Tab::Presets, Tab::Plugins, Tab::Misskey, Tab::Discord, Tab::Logs, Tab::Statistics];
     if extensions {
         side.push(Tab::Extensions);
     }
@@ -175,6 +178,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
         match tab {
             Tab::Graph => app.graph_ui(ui, self.actions),
             Tab::Logs => app.logs.ui(ui),
+            Tab::Statistics => app.statistics.ui(ui),
             Tab::Library => app.library_panel(ui),
             Tab::Presets => app.presets_panel(ui),
             Tab::Plugins => app.plugin_panel(ui, self.actions),
@@ -292,6 +296,7 @@ pub struct App {
     yabridge: Yabridge,
     messages: Vec<String>,
     logs: crate::logs::LogDock,
+    statistics: crate::statistics::Statistics,
     seek_drag: Option<f64>,
     /// The transport's playback rate; Rate Shift nodes multiply it.
     rate: f32,
@@ -375,6 +380,7 @@ pub struct App {
 
 impl App {
     pub fn new(files: Vec<PathBuf>, ctx: &egui::Context) -> Self {
+        let statistics = crate::statistics::Statistics::new();
         let mut messages = Vec::new();
         let engine = match if crate::runtime::get().allow_audio_device() {
             Engine::start()
@@ -413,6 +419,7 @@ impl App {
             yabridge: Yabridge::default(),
             messages,
             logs: Default::default(),
+            statistics,
             seek_drag: None,
             rate: 1.0,
             added: 0,
@@ -515,7 +522,7 @@ impl App {
                     app.open_paths(files);
                 } else if let Some(track) = saved.track.filter(|t| t.is_file()) {
                     // Bring back the last track, paused where it was.
-                    app.player.load(&track);
+                    app.load_file(&track);
                     app.player.set_playing(false);
                     app.restored_track = Some(track);
                     if saved.position > 0.0 {
@@ -536,7 +543,7 @@ impl App {
                     d.retain_tabs(|t| *t != Tab::Extensions);
                 }
                 // Panels added since the layout was saved (a panel closed then stays closed).
-                for tab in [Tab::Discord, Tab::Info, Tab::Logs] {
+                for tab in [Tab::Discord, Tab::Info, Tab::Logs, Tab::Statistics] {
                     if !saved.tabs_seen.contains(&tab) && d.find_tab(&tab).is_none() {
                         add_new_tab(&mut d, tab);
                     }
@@ -1200,8 +1207,15 @@ impl App {
         }
     }
 
+    /// Sample before track changes too, so the previous file keeps its last frames.
+    fn tick_statistics(&mut self) {
+        self.statistics.tick(self.player.take_listened_seconds(), &self.player.status());
+    }
+
     /// Loads a file picked outside the track list; it becomes current if the list has it.
     fn load_file(&mut self, path: &Path) {
+        self.tick_statistics();
+        self.statistics.set_track(path);
         self.player.load(path);
         if let Some(i) = self.library.index_of(path) {
             self.library.set_current(i);
@@ -1217,7 +1231,8 @@ impl App {
 
     fn play_track(&mut self, i: usize) {
         let Some(t) = self.library.tracks.get(i) else { return };
-        self.player.load(&t.path);
+        let path = t.path.clone();
+        self.load_file(&path);
         self.library.set_current(i);
         self.reveal_current = true;
     }
@@ -1342,9 +1357,13 @@ impl App {
         if self.engine.as_mut().is_some_and(|engine| !engine.shutdown()) {
             self.retain_audio_owners();
             self.engine = None;
+            self.tick_statistics();
+            self.statistics.save();
             return;
         }
         self.engine = None;
+        self.tick_statistics();
+        self.statistics.save();
         // Plugin instances still exist, and their processors can no longer race state
         // serialization or editor teardown. A failed handshake never enters plugin UI.
         self.save_session();
@@ -2729,6 +2748,7 @@ impl eframe::App for App {
         if self.shut_down {
             return;
         }
+        self.tick_statistics();
         self.tick_diagnostic(ctx);
         self.poll_background();
         self.updater.poll();
