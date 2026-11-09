@@ -90,6 +90,7 @@ See [plugins](plugins.md) for input and renderer limitations.
 On macOS, local event monitors installed while handling captured editor input leave the
 graph's original pointer events to the host while that editor has an interactive popup.
 The graph forwards selections and outside-click cancellation in native coordinates.
+Forwarded right and middle mouse events preserve their physical button number.
 Run the AppKit monitor regression on macOS, from the repository root:
 
 ```sh
