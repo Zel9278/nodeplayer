@@ -366,6 +366,12 @@ pub trait Editor {
     fn pointer(&mut self, _event: surface::EditorPointer) -> Result<()> {
         Ok(())
     }
+    fn accepts_keyboard(&self) -> bool {
+        false
+    }
+    fn keyboard(&mut self, _event: surface::EditorKeyboard) -> Result<()> {
+        anyhow::bail!("this editor does not accept captured keyboard input")
+    }
     fn capture_error(&self) -> Option<&str> {
         None
     }

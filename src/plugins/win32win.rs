@@ -89,6 +89,7 @@ pub(crate) struct CaptureInput {
     cursor: cursor::Cursor,
     capture: Cell<HWND>,
     focus: Cell<HWND>,
+    keyboard: Cell<Option<[u8; 256]>>,
     depth: Cell<u32>,
     suppress_capture: Cell<HWND>,
     suppress_focus: Cell<HWND>,
@@ -108,6 +109,7 @@ impl CaptureInput {
             cursor: cursor::Cursor::new(root),
             capture: Cell::new(HWND::default()),
             focus: Cell::new(HWND::default()),
+            keyboard: Cell::new(None),
             depth: Cell::new(0),
             suppress_capture: Cell::new(HWND::default()),
             suppress_focus: Cell::new(HWND::default()),
@@ -362,6 +364,49 @@ impl CaptureInput {
         self.cursor.set(position);
     }
 
+    pub(crate) fn focus_target(&self) -> Option<HWND> {
+        self.owns(self.focus.get()).then(|| self.focus.get())
+    }
+
+    pub(crate) fn set_keyboard_state(&self, keys: [u8; 256]) {
+        self.keyboard.set(Some(keys));
+    }
+
+    fn key_state(&self, code: usize) -> Option<i16> {
+        self.keyboard.get().map(|keys| if keys[code] & 0x80 != 0 { i16::MIN } else { 0 })
+    }
+
+    pub(crate) fn focus_editor(&self) {
+        if self.focus_target().is_none() {
+            let _scope = self.enter();
+            self.focus_window(self.root);
+        }
+    }
+
+    pub(crate) fn focus_window(&self, target: HWND) {
+        let _physical = cursor::coordinates(false);
+        if !self.owns(target) { return; }
+        let previous = self.focus.replace(target);
+        if previous == target { return; }
+        unsafe {
+            // SetFocus can activate the private top-level window and make winit
+            // report that the graph lost focus. Keep this transition logical.
+            if self.owns(previous) {
+                SendMessageW(previous, WM_KILLFOCUS, WPARAM(target.0 as usize), LPARAM(0));
+            }
+            SendMessageW(target, WM_SETFOCUS, WPARAM(previous.0 as usize), LPARAM(0));
+        }
+    }
+
+    pub(crate) fn blur_editor(&self) {
+        let focus = self.focus.replace(HWND::default());
+        if self.owns(focus) {
+            // Physical focus was restored after the callback. This is the actual
+            // logical loss, so it must reach the plugin instead of being suppressed.
+            unsafe { SendMessageW(focus, WM_KILLFOCUS, WPARAM(0), LPARAM(0)); }
+        }
+    }
+
     fn for_window(hwnd: HWND) -> Option<Rc<Self>> {
         CAPTURE_INPUTS.with(|inputs| {
             inputs
@@ -432,9 +477,6 @@ impl CaptureInput {
             if let Some(owner) = self.owner().filter(|owner| *owner != GetCapture()) {
                 SetCapture(owner);
             }
-            if self.owns(self.focus.get()) && self.focus.get() != GetFocus() {
-                let _ = SetFocus(self.focus.get());
-            }
         }
         scope
     }
@@ -471,7 +513,9 @@ impl Drop for CaptureInputScope<'_> {
                 }
                 let focused = GetFocus();
                 if input.owns(focused) {
-                    input.focus.set(focused);
+                    if focused != self.previous_focus || input.focus_target().is_none() {
+                        input.focus.set(focused);
+                    }
                     input.suppress_focus.set(focused);
                     let _ = SetFocus(self.previous_focus);
                     input.suppress_focus.set(HWND::default());
@@ -700,6 +744,11 @@ fn with_capture_input<T>(hwnd: HWND, operation: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 pub(crate) fn physical_coordinates() -> impl Drop {
     cursor::coordinates(false)
+}
+
+#[cfg(test)]
+pub(crate) fn logical_coordinates() -> impl Drop {
+    cursor::coordinates(true)
 }
 
 /// A worker hosts a single editor. JUCE dispatches timers and asynchronous menu

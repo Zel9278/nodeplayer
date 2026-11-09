@@ -16,12 +16,13 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT,
+    GetKeyboardState, SetKeyboardState, MapVirtualKeyW, VkKeyScanW, MAPVK_VK_TO_VSC_EX,
+    VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT,
     VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::{EditorFrame, EditorPointer, EditorPopup, PointerKind};
+use super::{EditorFrame, EditorKeyboard, EditorPointer, EditorPopup, PointerKind};
 use crate::plugins::window::CaptureInput;
 
 #[link(name = "user32")]
@@ -41,6 +42,9 @@ pub struct NativeCapture {
     input: Rc<CaptureInput>,
     popups: Vec<(HWND, Bitmap)>,
     modifiers: u8,
+    buttons: u8,
+    keys: [bool; 256],
+    keyboard_focused: bool,
     // Native handles, capture, and plugin window procedures stay on their owner thread.
     _main_thread: PhantomData<Rc<()>>,
 }
@@ -66,6 +70,9 @@ impl NativeCapture {
             input: CaptureInput::new(hwnd)?,
             popups: Vec::new(),
             modifiers: 0,
+            buttons: 0,
+            keys: [false; 256],
+            keyboard_focused: false,
             _main_thread: PhantomData,
         };
         capture.check_window()?;
@@ -93,7 +100,7 @@ impl NativeCapture {
     pub fn capture(&mut self, _native_size: (u32, u32)) -> Result<EditorFrame> {
         self.check_window()?;
         self.input.refresh()?;
-        let _keyboard = KeyboardModifiers::new(self.modifiers)?;
+        let _keyboard = self.keyboard_state(self.modifiers)?;
         let _input = self.input.enter();
         let mut client = RECT::default();
         // SAFETY: check_window verifies a live HWND owned by this thread.
@@ -324,7 +331,8 @@ impl NativeCapture {
         event.validate()?;
         self.input.refresh()?;
         self.modifiers = event.modifiers;
-        let _keyboard = KeyboardModifiers::new(event.modifiers)?;
+        self.buttons = if matches!(event.kind, PointerKind::Cancel) { 0 } else { event.buttons };
+        let _keyboard = self.keyboard_state(event.modifiers)?;
         if matches!(event.kind, PointerKind::Cancel) {
             self.drag_target = None;
             self.input.cancel();
@@ -452,6 +460,9 @@ impl NativeCapture {
                         _ => bail!("unsupported editor pointer button"),
                     };
                     self.drag_target = Some(target);
+                    if self.keyboard_focused {
+                        self.input.focus_window(target);
+                    }
                     (message, WPARAM(flags as usize), coordinates(point))
                 }
                 PointerKind::Up(button) => {
@@ -494,14 +505,179 @@ impl NativeCapture {
         }
         Ok(())
     }
+
+    pub fn keyboard(&mut self, event: EditorKeyboard) -> Result<()> {
+        self.check_window()?;
+        event.validate()?;
+        self.input.refresh()?;
+        match event {
+            EditorKeyboard::Focus(true) => {
+                self.keyboard_focused = true;
+                self.input.focus_editor();
+            }
+            EditorKeyboard::Focus(false) => {
+                // A missing OS key-up must not leave a plugin's held key active.
+                for code in 0..256 {
+                    if self.keys[code] {
+                        self.send_key(code as u16, false, false, 0, None)?;
+                    }
+                }
+                self.modifiers = 0;
+                self.keyboard_focused = false;
+                let _keyboard = self.keyboard_state(0)?;
+                self.input.blur_editor();
+            }
+            _ if !self.keyboard_focused => {}
+            EditorKeyboard::Key { key, pressed, repeat, modifiers, text } => {
+                if let Some(code) = key_code(key) {
+                    self.send_key(code, pressed, repeat, modifiers, text.as_deref())?;
+                } else if let Some(text) = text {
+                    self.keyboard(EditorKeyboard::Text(text))?;
+                }
+            }
+            EditorKeyboard::Text(text) => {
+                // The host already translated layout/dead keys/IME. Do not run
+                // TranslateMessage again or ordinary characters would be doubled.
+                let _keyboard = self.keyboard_state(0)?;
+                let _input = self.input.enter();
+                for unit in text.encode_utf16() {
+                    let target = self.input.focus_target().unwrap_or(self.hwnd);
+                    unsafe { SendMessageW(target, WM_CHAR, WPARAM(usize::from(unit)), LPARAM(1)); }
+                }
+            }
+            EditorKeyboard::Copy | EditorKeyboard::Cut | EditorKeyboard::Paste => {
+                let saved_modifiers = self.modifiers;
+                let code = match event {
+                    EditorKeyboard::Copy => b'C',
+                    EditorKeyboard::Cut => b'X',
+                    _ => b'V',
+                };
+                self.send_key(u16::from(code), true, false, super::MOD_CONTROL, None)?;
+                self.send_key(u16::from(code), false, false, super::MOD_CONTROL, None)?;
+                self.modifiers = saved_modifiers;
+            }
+        }
+        Ok(())
+    }
+
+    fn keyboard_state(&self, modifiers: u8) -> Result<KeyboardModifiers> {
+        let guard = KeyboardModifiers::with_keys(modifiers, &self.keys, self.buttons)?;
+        self.input.set_keyboard_state(guard.state);
+        Ok(guard)
+    }
+
+    fn send_key(&mut self, code: u16, pressed: bool, repeat: bool, modifiers: u8, text: Option<&str>) -> Result<()> {
+        self.keys[usize::from(code)] = pressed;
+        self.modifiers = modifiers;
+        let _keyboard = self.keyboard_state(modifiers)?;
+        let _input = self.input.enter();
+        let target = self.input.focus_target().unwrap_or(self.hwnd);
+        let scan = unsafe { MapVirtualKeyW(u32::from(code), MAPVK_VK_TO_VSC_EX) };
+        let extended = scan & 0xff00 != 0;
+        let flags = 1u32 | ((scan & 0xff) << 16) | (u32::from(extended) << 24)
+            | (u32::from(repeat || !pressed) << 30) | (u32::from(!pressed) << 31);
+        let characters = if !pressed {
+            Vec::new()
+        } else if let Some(text) = text {
+            text.encode_utf16().collect()
+        } else if matches!(code, 8 | 9 | 13 | 27) {
+            vec![code]
+        } else if modifiers & super::MOD_CONTROL != 0 && (65..=90).contains(&code) {
+            vec![code - 64]
+        } else {
+            Vec::new()
+        };
+        unsafe {
+            // JUCE checks for pending WM_CHAR during WM_KEYDOWN and synthesizes
+            // a character if none is queued. Queue translated text first, as a
+            // normal TranslateMessage/DispatchMessage cycle does, then deliver it
+            // in this same input scope so it cannot arrive twice or lose modifiers.
+            // A committed string can exceed the OS posted-message quota. Only a
+            // short prefix needs to be pending for the key handler's look-ahead.
+            for unit in characters.iter().take(32) {
+                PostMessageW(target, WM_CHAR, WPARAM(usize::from(*unit)), LPARAM(flags as isize))?;
+            }
+            SendMessageW(target, if pressed { WM_KEYDOWN } else { WM_KEYUP },
+                WPARAM(usize::from(code)), LPARAM(flags as isize));
+            for _ in characters.iter().take(32) {
+                let mut message = MSG::default();
+                if !PeekMessageW(&mut message, target, WM_CHAR, WM_CHAR, PM_REMOVE).as_bool() { break; }
+                DispatchMessageW(&message);
+            }
+            for unit in characters.iter().skip(32) {
+                SendMessageW(target, WM_CHAR, WPARAM(usize::from(*unit)), LPARAM(flags as isize));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn key_code(key: egui::Key) -> Option<u16> {
+    use egui::Key;
+    let code = match key {
+        Key::Backspace => 8, Key::Tab => 9, Key::Enter => 13, Key::Escape => 27,
+        Key::Space => 32, Key::PageUp => 33, Key::PageDown => 34,
+        Key::End => 35, Key::Home => 36,
+        Key::ArrowLeft => 37, Key::ArrowUp => 38, Key::ArrowRight => 39, Key::ArrowDown => 40,
+        Key::Insert => 45, Key::Delete => 46,
+        Key::ShiftLeft => 0xa0, Key::ShiftRight => 0xa1,
+        Key::ControlLeft => 0xa2, Key::ControlRight => 0xa3,
+        Key::AltLeft => 0xa4, Key::AltRight => 0xa5,
+        Key::SuperLeft => 0x5b, Key::SuperRight => 0x5c,
+        Key::IntlBackslash => 0xe2,
+        Key::BrowserBack => 0xa6,
+        Key::Copy | Key::Cut | Key::Paste => return None,
+        _ => {
+            let name = key.name();
+            if name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric() {
+                return Some(u16::from(name.as_bytes()[0].to_ascii_uppercase()));
+            }
+            if let Some(number) = name.strip_prefix('F').and_then(|n| n.parse::<u16>().ok()) {
+                return (1..=24).contains(&number).then_some(0x70 + number - 1);
+            }
+            let character = match key {
+                Key::Colon => ':', Key::Comma => ',', Key::Backslash => '\\',
+                Key::Slash => '/', Key::Pipe => '|', Key::Questionmark => '?',
+                Key::Exclamationmark => '!', Key::OpenBracket => '[', Key::CloseBracket => ']',
+                Key::OpenCurlyBracket => '{', Key::CloseCurlyBracket => '}',
+                Key::Backtick => '`', Key::Minus => '-', Key::Period => '.',
+                Key::Plus => '+', Key::Equals => '=', Key::Semicolon => ';', Key::Quote => '\'',
+                _ => return None,
+            };
+            let scan = unsafe { VkKeyScanW(character as u16) };
+            return (scan != -1).then_some(scan as u16 & 0xff);
+        }
+    };
+    Some(code)
 }
 
 /// Win32 plugins often use GetKeyState rather than mouse-message modifier bits.
 /// This changes only the source UI thread's keyboard table while forwarding input;
 /// it neither injects physical keys nor changes another window's keyboard state.
-struct KeyboardModifiers([u8; 256]);
+struct KeyboardModifiers {
+    saved: [u8; 256],
+    state: [u8; 256],
+}
 
 impl KeyboardModifiers {
+    fn with_keys(modifiers: u8, held: &[bool; 256], buttons: u8) -> Result<Self> {
+        let mut guard = Self::new(modifiers)?;
+        let mut keys = guard.state;
+        for (code, pressed) in held.iter().copied().enumerate() {
+            if !matches!(code, 0x10..=0x12 | 0x5b..=0x5c | 0xa0..=0xa5) {
+                keys[code] = (keys[code] & 0x7f) | if pressed { 0x80 } else { 0 };
+            }
+        }
+        // Mouse buttons share Win32's keyboard table. JUCE polls them through
+        // GetAsyncKeyState even inside a forwarded mouse-down callback.
+        for (bit, code) in [(1, 1), (2, 2), (4, 4)] {
+            keys[code] = (keys[code] & 0x7f) | if buttons & bit != 0 { 0x80 } else { 0 };
+        }
+        unsafe { SetKeyboardState(&keys) }?;
+        guard.state = keys;
+        Ok(guard)
+    }
+
     fn new(modifiers: u8) -> Result<Self> {
         let mut saved = [0; 256];
         unsafe { GetKeyboardState(&mut saved) }.context("read editor keyboard state")?;
@@ -518,13 +694,13 @@ impl KeyboardModifiers {
             }
         }
         unsafe { SetKeyboardState(&keys) }.context("set forwarded editor modifiers")?;
-        Ok(Self(saved))
+        Ok(Self { saved, state: keys })
     }
 }
 
 impl Drop for KeyboardModifiers {
     fn drop(&mut self) {
-        let _ = unsafe { SetKeyboardState(&self.0) };
+        let _ = unsafe { SetKeyboardState(&self.saved) };
     }
 }
 
@@ -773,6 +949,7 @@ mod tests {
         physical_cursor: Cell<Option<(i32, i32)>>,
         message_cursor: Cell<Option<(i32, i32)>>,
         requested_cursor: Cell<Option<(i32, i32)>>,
+        queried_buttons: Cell<u8>,
     }
 
     struct TestWindow {
@@ -825,6 +1002,16 @@ mod tests {
     ) -> LRESULT {
         unsafe {
             if let Some(state) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const State).as_ref() {
+                if matches!(message, WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
+                    | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_PRINTCLIENT)
+                {
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                    let mut buttons = 0;
+                    for (bit, code) in [(1, 1), (2, 2), (4, 4)] {
+                        if GetAsyncKeyState(code) < 0 { buttons |= bit; }
+                    }
+                    state.queried_buttons.set(buttons);
+                }
                 let point = (position.0 as i16 as i32, (position.0 >> 16) as i16 as i32);
                 match message {
                     WM_APP => {
@@ -967,6 +1154,7 @@ mod tests {
             physical_cursor: Cell::new(None),
             message_cursor: Cell::new(None),
             requested_cursor: Cell::new(None),
+            queried_buttons: Cell::new(0),
         });
         unsafe {
             let style =
@@ -1019,6 +1207,118 @@ mod tests {
         let mut after = [0; 256];
         unsafe { GetKeyboardState(&mut after) }?;
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn plugin_button_queries_follow_forwarded_clicks() -> Result<()> {
+        let root = fixture(None, (-1400, -1000), (400, 300), [23, 28, 38])?;
+        let mut capture = NativeCapture::new(root.hwnd.0 as usize)?;
+        let mut before = [0; 256];
+        unsafe { GetKeyboardState(&mut before) }?;
+        for (button, mask) in [(1, 1), (2, 2), (3, 4)] {
+            for (kind, buttons) in [(PointerKind::Down(button), mask), (PointerKind::Up(button), 0)] {
+                capture.pointer(EditorPointer {
+                    timestamp_ms: None, modifiers: 0, click_count: 1,
+                    position: [50.0, 35.0], kind, buttons,
+                })?;
+                assert_eq!(root.state.queried_buttons.get(), buttons, "mouse callback must see the forwarded buttons");
+                let verify: &dyn Fn() = &|| unsafe {
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                    for (bit, code) in [(1, 1), (2, 2), (4, 4)] {
+                        assert_eq!(GetAsyncKeyState(code) < 0, buttons & bit != 0,
+                            "asynchronous callbacks must retain the editor's button state");
+                    }
+                };
+                crate::plugins::window::dispatch_worker_message(&MSG {
+                    hwnd: root.hwnd, message: WM_APP,
+                    lParam: LPARAM(&verify as *const &dyn Fn() as isize),
+                    ..Default::default()
+                });
+            }
+        }
+        let mut after = [0; 256];
+        unsafe { GetKeyboardState(&mut after) }?;
+        assert_eq!(before, after, "forwarded mouse buttons must leave the host keyboard table intact");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn keyboard_text_edits_focused_child_and_blur_stops_delivery() -> Result<()> {
+        use crate::plugins::{Placement, window::HostWindow};
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, GetFocus};
+        struct EditWindow(HWND);
+        impl Drop for EditWindow {
+            fn drop(&mut self) { let _ = unsafe { DestroyWindow(self.0) }; }
+        }
+        let host = HostWindow::create(Placement::CaptureSource, 640, 360, "keyboard regression", false)?;
+        let root = HWND(host.handle() as *mut c_void);
+        let child = EditWindow(unsafe { CreateWindowExW(
+            WINDOW_EX_STYLE::default(), w!("EDIT"), w!(""),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP,
+            20, 24, 300, 40, root, None, HINSTANCE(GetModuleHandleW(None)?.0), None,
+        ) }?);
+        let foreground = unsafe { GetForegroundWindow() };
+        let active = unsafe { GetActiveWindow() };
+        let physical_focus = unsafe { GetFocus() };
+        let mut before = [0; 256];
+        unsafe { GetKeyboardState(&mut before) }?;
+        let mut capture = NativeCapture::new(host.handle())?;
+        capture.keyboard(EditorKeyboard::Focus(true))?;
+        for (kind, buttons) in [(PointerKind::Down(1), 1), (PointerKind::Up(1), 0)] {
+            capture.pointer(EditorPointer {
+                position: [50.0, 35.0], kind, buttons, modifiers: 0, click_count: 1, timestamp_ms: None,
+            })?;
+        }
+        assert_eq!(capture.input.focus_target(), Some(child.0));
+        {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetFocus, SetFocus};
+            let physical_focus = unsafe { GetFocus() };
+            for modifiers in [super::super::MOD_CONTROL, 0] {
+                let _keyboard = KeyboardModifiers::new(modifiers)?;
+                capture.input.set_keyboard_state(_keyboard.state);
+                let _input = capture.input.enter();
+                let _logical = crate::plugins::window::logical_coordinates();
+                assert_eq!(unsafe { GetFocus() }, child.0, "plugin queries must see logical child focus");
+                assert_eq!(unsafe { GetAsyncKeyState(i32::from(VK_CONTROL.0)) } < 0, modifiers != 0);
+                assert_eq!(unsafe { SetFocus(root) }?, child.0);
+                assert_eq!(unsafe { GetFocus() }, root);
+                assert_eq!(unsafe { SetFocus(child.0) }?, root);
+            }
+            assert_eq!(unsafe { GetFocus() }, physical_focus, "logical focus must leave graph focus intact");
+        }
+        let press = |key, text| EditorKeyboard::Key {
+            key, pressed: true, repeat: false, modifiers: 0, text,
+        };
+        capture.keyboard(press(egui::Key::A, Some("a".into())))?;
+        capture.keyboard(EditorKeyboard::Text("bc".into()))?;
+        capture.keyboard(press(egui::Key::ArrowLeft, None))?;
+        capture.keyboard(press(egui::Key::Backspace, None))?;
+        let text = || {
+            let mut buffer = [0u16; 256];
+            let count = unsafe { GetWindowTextW(child.0, &mut buffer) };
+            String::from_utf16_lossy(&buffer[..count as usize])
+        };
+        assert_eq!(text(), "ac", "keys edit the actual Win32 text control once");
+        capture.keyboard(press(egui::Key::End, None))?;
+        capture.keyboard(EditorKeyboard::Text("日本語🎵".into()))?;
+        assert_eq!(text(), "ac日本語🎵");
+        assert!(capture.keys.iter().any(|key| *key));
+        capture.keyboard(EditorKeyboard::Focus(false))?;
+        assert!(!capture.keys.iter().any(|key| *key));
+        assert!(capture.input.focus_target().is_none());
+        capture.keyboard(EditorKeyboard::Text("ignored".into()))?;
+        assert_eq!(text(), "ac日本語🎵");
+        capture.capture((640, 360))?;
+        assert!(capture.input.focus_target().is_none(), "capture must not restore retired keyboard focus");
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+        assert_eq!(unsafe { GetActiveWindow() }, active);
+        assert_eq!(unsafe { GetFocus() }, physical_focus);
+        let mut after = [0; 256];
+        unsafe { GetKeyboardState(&mut after) }?;
+        assert_eq!(before, after, "forwarded keys must restore the host keyboard table");
         Ok(())
     }
 
@@ -1601,6 +1901,7 @@ mod tests {
             physical_cursor: Cell::new(None),
             message_cursor: Cell::new(None),
             requested_cursor: Cell::new(None),
+            queried_buttons: Cell::new(0),
         });
         let popup = unsafe {
             let hwnd = CreateWindowExW(

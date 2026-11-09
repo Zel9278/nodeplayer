@@ -29,6 +29,7 @@ pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CONTROL: u8 = 2;
 pub const MOD_ALT: u8 = 4;
 pub const MOD_SUPER: u8 = 8;
+pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 /// Capture service budget; presentation is paced independently by the viewport/display.
 pub const CAPTURE_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 240);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -142,6 +143,44 @@ pub struct EditorPointer {
     /// Linux maps it into X server time so delayed delivery preserves click intervals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_ms: Option<u64>,
+}
+
+/// Keyboard ownership and input, ordered with pointer events at the UI boundary.
+/// Text is already translated by the host's keyboard layout or IME.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum EditorKeyboard {
+    Focus(bool),
+    Key {
+        key: egui::Key,
+        pressed: bool,
+        repeat: bool,
+        modifiers: u8,
+        /// Characters translated from this press, when the host supplied them.
+        text: Option<String>,
+    },
+    Text(String),
+    Copy,
+    Cut,
+    Paste,
+}
+
+impl EditorKeyboard {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Key { modifiers, pressed, repeat, text, .. } => {
+                ensure!(modifiers & !15 == 0, "invalid editor keyboard modifiers");
+                ensure!(*pressed || !repeat, "repeat on an editor key release");
+                ensure!(*pressed || text.is_none(), "text on an editor key release");
+                if let Some(text) = text { Self::Text(text.clone()).validate()?; }
+            }
+            Self::Text(text) => {
+                ensure!(text.len() <= MAX_TEXT_BYTES, "editor text exceeds input limit");
+                ensure!(!text.contains('\0'), "editor text contains a null character");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn pointer_timestamp_ms() -> Option<u64> {
@@ -292,6 +331,16 @@ impl Editor for CapturedEditor {
         event.validate()?;
         self.native.pointer(event)
     }
+    fn accepts_keyboard(&self) -> bool {
+        cfg!(target_os = "windows")
+    }
+    fn keyboard(&mut self, event: EditorKeyboard) -> Result<()> {
+        event.validate()?;
+        #[cfg(target_os = "windows")]
+        return self.native.keyboard(event);
+        #[cfg(not(target_os = "windows"))]
+        anyhow::bail!("captured keyboard input is not supported on this platform")
+    }
     fn place(&mut self, _spot: Option<&Spot>) {
         // Canvas overlap is applied to the image, never cut out of its native source.
     }
@@ -367,6 +416,18 @@ pub fn pump_worker_app() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_messages_reject_invalid_text_and_release_flags() {
+        assert!(EditorKeyboard::Text("日本語🎵".into()).validate().is_ok());
+        assert!(EditorKeyboard::Text("\0".into()).validate().is_err());
+        assert!(EditorKeyboard::Text("a".repeat(MAX_TEXT_BYTES + 1)).validate().is_err());
+        for (repeat, modifiers, text) in [(true, 0, None), (false, 16, None), (false, 0, Some("a".into()))] {
+            assert!(EditorKeyboard::Key {
+                key: egui::Key::A, pressed: false, repeat, modifiers, text,
+            }.validate().is_err());
+        }
+    }
 
     #[test]
     fn pointer_timestamps_roundtrip_and_legacy_messages_remain_valid() {

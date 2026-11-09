@@ -120,6 +120,8 @@ mod hooks {
     type Write = unsafe extern "system" fn(i32, i32) -> BOOL;
     type Message = unsafe extern "system" fn() -> u32;
     type Foreground = unsafe extern "system" fn() -> HWND;
+    type Focus = unsafe extern "system" fn(HWND) -> HWND;
+    type AsyncKey = unsafe extern "system" fn(i32) -> i16;
     type Bounds = unsafe extern "system" fn(HWND, *mut RECT) -> BOOL;
     type Convert = unsafe extern "system" fn(HWND, *mut POINT) -> BOOL;
     type Map = unsafe extern "system" fn(HWND, HWND, *mut POINT, u32) -> i32;
@@ -129,6 +131,9 @@ mod hooks {
     static SET: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static MESSAGE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static FOREGROUND: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static GET_FOCUS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static SET_FOCUS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static ASYNC_KEY: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static BOUNDS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static TO_SCREEN: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static FROM_SCREEN: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -177,6 +182,9 @@ mod hooks {
                 foreground as *const () as *mut c_void,
                 &FOREGROUND,
             ),
+            (b"GetFocus\0".as_slice(), get_focus as *const () as *mut c_void, &GET_FOCUS),
+            (b"SetFocus\0".as_slice(), set_focus as *const () as *mut c_void, &SET_FOCUS),
+            (b"GetAsyncKeyState\0".as_slice(), async_key as *const () as *mut c_void, &ASYNC_KEY),
             (
                 b"GetWindowRect\0".as_slice(),
                 bounds as *const () as *mut c_void,
@@ -312,6 +320,45 @@ mod hooks {
         let original: Foreground =
             unsafe { std::mem::transmute(FOREGROUND.load(Ordering::Acquire)) };
         unsafe { original() }
+    }
+
+    unsafe extern "system" fn get_focus() -> HWND {
+        if COORDINATES.try_with(Cell::get).unwrap_or(false)
+            && let Some(focus) = super::super::CaptureInput::current().and_then(|input| input.focus_target())
+        {
+            return focus;
+        }
+        let original: Foreground = unsafe { std::mem::transmute(GET_FOCUS.load(Ordering::Acquire)) };
+        unsafe { original() }
+    }
+
+    unsafe extern "system" fn set_focus(target: HWND) -> HWND {
+        if COORDINATES.try_with(Cell::get).unwrap_or(false)
+            && let Some(input) = super::super::CaptureInput::current()
+            && (input.contains(target) || target.0.is_null() && input.focus_target().is_some())
+        {
+            let previous = unsafe { get_focus() };
+            if target.0.is_null() { input.blur_editor(); }
+            else { input.focus_window(target); }
+            return previous;
+        }
+        let original: Focus = unsafe { std::mem::transmute(SET_FOCUS.load(Ordering::Acquire)) };
+        unsafe { original(target) }
+    }
+
+    unsafe extern "system" fn async_key(code: i32) -> i16 {
+        if (0..256).contains(&code) && COORDINATES.try_with(Cell::get).unwrap_or(false)
+            && let Some(input) = super::super::CaptureInput::current()
+        {
+            // Timers and helper windows run between forwarded events, after the
+            // host's keyboard table has been restored. Retain the editor's state
+            // for those callbacks as well as synchronous key and mouse messages.
+            return input.key_state(code as usize).unwrap_or_else(|| {
+                (unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(code) }) & i16::MIN
+            });
+        }
+        let original: AsyncKey = unsafe { std::mem::transmute(ASYNC_KEY.load(Ordering::Acquire)) };
+        unsafe { original(code) }
     }
 
     unsafe extern "system" fn bounds(hwnd: HWND, rect: *mut RECT) -> BOOL {
