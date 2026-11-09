@@ -393,11 +393,10 @@ impl NativeCapture {
             PointerKind::Wheel { .. } => unreachable!(),
             PointerKind::Cancel => unreachable!(),
         };
-        let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-            event_type, location, native_modifiers(pointer.modifiers),
-            unsafe { CACurrentMediaTime() }, target_window.windowNumber(), None, 0, isize::from(pointer.click_count),
-            if matches!(pointer.kind, PointerKind::Up(_)) { 0.0 } else { 1.0 },
-        ).context("AppKit could not create forwarded pointer event")?;
+        let event = mouse_event(
+            event_type, location, pointer.modifiers, target_window.windowNumber(),
+            pointer.click_count,
+        )?;
         if matches!(pointer.kind, PointerKind::Down(_)) {
             self.drag_target = Some(target.clone());
             if target_window == window {
@@ -420,6 +419,48 @@ impl NativeCapture {
             self.drag_target = None;
         }
         Ok(())
+    }
+}
+
+fn mouse_event(
+    event_type: NSEventType,
+    location: NSPoint,
+    modifiers: u8,
+    window_number: isize,
+    click_count: u8,
+) -> Result<Retained<NSEvent>> {
+    let released = matches!(event_type, NSEventType::LeftMouseUp | NSEventType::RightMouseUp | NSEventType::OtherMouseUp);
+    let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+        event_type, location, native_modifiers(modifiers),
+        unsafe { CACurrentMediaTime() }, window_number, None, 0, isize::from(click_count),
+        if released { 0.0 } else { 1.0 },
+    ).context("AppKit could not create forwarded pointer event")?;
+    let button = match event_type {
+        NSEventType::RightMouseDown | NSEventType::RightMouseUp | NSEventType::RightMouseDragged => 1,
+        NSEventType::OtherMouseDown | NSEventType::OtherMouseUp | NSEventType::OtherMouseDragged => 2,
+        _ => return Ok(event),
+    };
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreateCopy(event: *const CGEvent) -> *mut CGEvent;
+        fn CGEventSetIntegerValueField(event: *mut CGEvent, field: u32, value: i64);
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(value: *const c_void);
+    }
+    // AppKit's mouse factory leaves buttonNumber at zero for Right/Other events.
+    // Preserve its window coordinates and timing, but set the physical button on
+    // a copy of its Quartz event before rebuilding the immutable NSEvent.
+    unsafe {
+        let original: *const CGEvent = msg_send![&*event, CGEvent];
+        ensure!(!original.is_null(), "forwarded pointer event has no Quartz event");
+        let copy = CGEventCreateCopy(original);
+        ensure!(!copy.is_null(), "cannot copy forwarded pointer event");
+        CGEventSetIntegerValueField(copy, 3, button); // kCGMouseEventButtonNumber
+        let event: Option<Retained<NSEvent>> = msg_send![NSEvent::class(), eventWithCGEvent: copy];
+        CFRelease(copy.cast());
+        event.context("AppKit could not wrap forwarded pointer event")
     }
 }
 
@@ -736,6 +777,25 @@ fn convert_rgba8(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarded_mouse_events_preserve_physical_button_and_click_metadata() -> Result<()> {
+        for (button, types) in [
+            (0, [NSEventType::LeftMouseDown, NSEventType::LeftMouseUp, NSEventType::LeftMouseDragged]),
+            (1, [NSEventType::RightMouseDown, NSEventType::RightMouseUp, NSEventType::RightMouseDragged]),
+            (2, [NSEventType::OtherMouseDown, NSEventType::OtherMouseUp, NSEventType::OtherMouseDragged]),
+        ] {
+            for event_type in types {
+                let event = mouse_event(event_type, NSPoint::new(23.0, 41.0), super::super::MOD_SHIFT, 0, 2)?;
+                assert_eq!(event.r#type(), event_type);
+                assert_eq!(event.buttonNumber(), button);
+                assert_eq!(event.locationInWindow(), NSPoint::new(23.0, 41.0));
+                assert_eq!(event.clickCount(), 2);
+                assert!(event.modifierFlags().contains(NSEventModifierFlags::Shift));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn vector_conversion_matches_scalar_rounding_and_layouts() -> Result<()> {
