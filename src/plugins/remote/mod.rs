@@ -405,6 +405,52 @@ impl RemoteEditor {
         Ok(())
     }
 
+    fn enqueue_input(&mut self, event: EditorPointer) -> Result<()> {
+        if !self.captured || self.input_failed {
+            bail!("isolated editor does not accept captured input");
+        }
+        self.flush_input()?;
+        let generation = match self.active_surface()? {
+            SurfaceAccess::Ready(surface) => surface.generation(),
+            SurfaceAccess::Busy => self
+                .generation
+                .context("isolated editor capture is not ready")?,
+            SurfaceAccess::Missing => bail!("isolated editor capture is not ready"),
+        };
+        if matches!(event.kind, PointerKind::Move)
+            && let Some((previous_generation, previous)) = self.pending_input.back_mut()
+            && *previous_generation == generation
+            && matches!(previous.kind, PointerKind::Move)
+        {
+            *previous = event;
+            return self.flush_input();
+        }
+        if self.pending_input.len() >= Self::MAX_PENDING_INPUT {
+            // Moves and wheel deltas are disposable under pressure; button ordering is not.
+            self.pending_input.retain(|(_, event)| {
+                matches!(
+                    event.kind,
+                    PointerKind::Down(_) | PointerKind::Up(_) | PointerKind::Cancel
+                )
+            });
+        }
+        if self.pending_input.len() >= Self::MAX_PENDING_INPUT {
+            if matches!(event.kind, PointerKind::Move | PointerKind::Wheel { .. }) {
+                return Ok(());
+            }
+            let message = "isolated editor input queue overflow; editor closed to release its drag"
+                .to_owned();
+            self.fail_input(message.clone());
+            bail!(message);
+        }
+        self.pending_input.push_back((generation, event));
+        if let Err(error) = self.flush_input() {
+            self.fail_input(format!("{error:#}"));
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn record_error(&mut self, message: String) {
         self.errors.record(message);
     }
@@ -485,49 +531,7 @@ impl Editor for RemoteEditor {
     }
     fn pointer(&mut self, event: EditorPointer) -> Result<()> {
         event.validate()?;
-        if !self.captured || self.input_failed {
-            bail!("isolated editor does not accept captured input");
-        }
-        self.flush_input()?;
-        let generation = match self.active_surface()? {
-            SurfaceAccess::Ready(surface) => surface.generation(),
-            SurfaceAccess::Busy => self
-                .generation
-                .context("isolated editor capture is not ready")?,
-            SurfaceAccess::Missing => bail!("isolated editor capture is not ready"),
-        };
-        if matches!(event.kind, PointerKind::Move)
-            && let Some((previous_generation, previous)) = self.pending_input.back_mut()
-            && *previous_generation == generation
-            && matches!(previous.kind, PointerKind::Move)
-        {
-            *previous = event;
-            return self.flush_input();
-        }
-        if self.pending_input.len() >= Self::MAX_PENDING_INPUT {
-            // Moves and wheel deltas are disposable under pressure; button ordering is not.
-            self.pending_input.retain(|(_, event)| {
-                matches!(
-                    event.kind,
-                    PointerKind::Down(_) | PointerKind::Up(_) | PointerKind::Cancel
-                )
-            });
-        }
-        if self.pending_input.len() >= Self::MAX_PENDING_INPUT {
-            if matches!(event.kind, PointerKind::Move | PointerKind::Wheel { .. }) {
-                return Ok(());
-            }
-            let message = "isolated editor input queue overflow; editor closed to release its drag"
-                .to_owned();
-            self.fail_input(message.clone());
-            bail!(message);
-        }
-        self.pending_input.push_back((generation, event));
-        if let Err(error) = self.flush_input() {
-            self.fail_input(format!("{error:#}"));
-            return Err(error);
-        }
-        Ok(())
+        self.enqueue_input(event)
     }
     fn ready(&self) -> bool {
         self.core
