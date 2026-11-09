@@ -7,7 +7,7 @@ mod surface;
 mod worker;
 use super::{Created, Editor, Format, Instance, ParamDesc, Placement, PluginInfo, Spot};
 use crate::engine::Processor;
-use crate::plugins::surface::{EditorFrame, EditorPointer, PointerKind};
+use crate::plugins::surface::{EditorFrame, EditorKeyboard, EditorPointer, PointerKind};
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Sender, TrySendError};
 use protocol::{Command, Metadata};
@@ -333,7 +333,7 @@ struct RemoteEditor {
     opened: Instant,
     seen_open: bool,
     captured: bool,
-    pending_input: VecDeque<(u64, EditorPointer)>,
+    pending_input: VecDeque<(u64, CapturedInput)>,
     input_failed: bool,
     errors: crate::plugins::surface::CaptureErrors,
     native_error: Option<String>,
@@ -343,6 +343,28 @@ enum SurfaceAccess {
     Busy,
     Missing,
     Ready(Arc<FrameMap>),
+}
+#[derive(Clone)]
+enum CapturedInput {
+    Pointer(EditorPointer),
+    Keyboard(EditorKeyboard),
+}
+
+impl CapturedInput {
+    fn motion(&self) -> bool {
+        matches!(self, Self::Pointer(event) if matches!(event.kind, PointerKind::Move))
+    }
+
+    fn disposable(&self) -> bool {
+        matches!(self, Self::Pointer(event) if matches!(event.kind, PointerKind::Move | PointerKind::Wheel { .. }))
+    }
+
+    fn command(self, generation: u64, token: u64) -> Command {
+        match self {
+            Self::Pointer(event) => Command::Pointer { generation, token, event },
+            Self::Keyboard(event) => Command::Keyboard { generation, token, event },
+        }
+    }
 }
 impl RemoteEditor {
     const MAX_PENDING_INPUT: usize = 256;
@@ -383,16 +405,12 @@ impl RemoteEditor {
             }
         };
         self.generation = Some(surface.generation());
-        while let Some(&(generation, event)) = self.pending_input.front() {
+        while let Some((generation, event)) = self.pending_input.front().cloned() {
             if generation != surface.generation() {
                 self.pending_input.pop_front();
                 continue;
             }
-            match self.core.tx.try_send(Command::Pointer {
-                generation,
-                token: self.token,
-                event,
-            }) {
+            match self.core.tx.try_send(event.command(generation, self.token)) {
                 Ok(()) => {
                     self.pending_input.pop_front();
                 }
@@ -405,41 +423,33 @@ impl RemoteEditor {
         Ok(())
     }
 
-    fn enqueue_input(&mut self, event: EditorPointer) -> Result<()> {
+    fn enqueue_input(&mut self, event: CapturedInput) -> Result<()> {
         if !self.captured || self.input_failed {
             bail!("isolated editor does not accept captured input");
         }
         self.flush_input()?;
         let generation = match self.active_surface()? {
             SurfaceAccess::Ready(surface) => surface.generation(),
-            SurfaceAccess::Busy => self
-                .generation
-                .context("isolated editor capture is not ready")?,
+            SurfaceAccess::Busy => self.generation.context("isolated editor capture is not ready")?,
             SurfaceAccess::Missing => bail!("isolated editor capture is not ready"),
         };
-        if matches!(event.kind, PointerKind::Move)
+        if event.motion()
             && let Some((previous_generation, previous)) = self.pending_input.back_mut()
             && *previous_generation == generation
-            && matches!(previous.kind, PointerKind::Move)
+            && previous.motion()
         {
             *previous = event;
             return self.flush_input();
         }
         if self.pending_input.len() >= Self::MAX_PENDING_INPUT {
-            // Moves and wheel deltas are disposable under pressure; button ordering is not.
-            self.pending_input.retain(|(_, event)| {
-                matches!(
-                    event.kind,
-                    PointerKind::Down(_) | PointerKind::Up(_) | PointerKind::Cancel
-                )
-            });
+            // Text, key and focus transitions are barriers, just like mouse buttons.
+            self.pending_input.retain(|(_, event)| !event.disposable());
         }
         if self.pending_input.len() >= Self::MAX_PENDING_INPUT {
-            if matches!(event.kind, PointerKind::Move | PointerKind::Wheel { .. }) {
+            if event.disposable() {
                 return Ok(());
             }
-            let message = "isolated editor input queue overflow; editor closed to release its drag"
-                .to_owned();
+            let message = "isolated editor input queue overflow; editor closed to release its input".to_owned();
             self.fail_input(message.clone());
             bail!(message);
         }
@@ -531,7 +541,14 @@ impl Editor for RemoteEditor {
     }
     fn pointer(&mut self, event: EditorPointer) -> Result<()> {
         event.validate()?;
-        self.enqueue_input(event)
+        self.enqueue_input(CapturedInput::Pointer(event))
+    }
+    fn accepts_keyboard(&self) -> bool {
+        self.captured && cfg!(target_os = "windows")
+    }
+    fn keyboard(&mut self, event: EditorKeyboard) -> Result<()> {
+        event.validate()?;
+        self.enqueue_input(CapturedInput::Keyboard(event))
     }
     fn ready(&self) -> bool {
         self.core
@@ -803,6 +820,42 @@ mod tests {
             matches!(rx.try_recv().unwrap(), Command::Pointer { event, .. } if matches!(event.kind, PointerKind::Up(1)) && event.position[0] == 40.0 && event.buttons == 0)
         );
         assert!(editor.pending_input.is_empty());
+    }
+
+    #[test]
+    fn keyboard_and_pointer_share_ordering_and_generation_checks() {
+        let (mut editor, rx) = captured_editor(1);
+        editor.core.tx.try_send(Command::Poll).unwrap();
+        editor.keyboard(EditorKeyboard::Focus(true)).unwrap();
+        editor.pointer(pointer(PointerKind::Down(1), 10.0, 1)).unwrap();
+        editor.keyboard(EditorKeyboard::Key {
+            key: egui::Key::A, pressed: true, repeat: false, modifiers: 0,
+            text: Some("a".into()),
+        }).unwrap();
+        editor.keyboard(EditorKeyboard::Text("日本語🎵".into())).unwrap();
+        editor.keyboard(EditorKeyboard::Focus(false)).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Command::Poll));
+        let mut commands = Vec::new();
+        while !editor.pending_input.is_empty() {
+            editor.flush_input().unwrap();
+            let encoded = serde_json::to_vec(&rx.try_recv().unwrap()).unwrap();
+            commands.push(serde_json::from_slice::<Command>(&encoded).unwrap());
+        }
+        assert!(matches!(&commands[0], Command::Keyboard { generation: 7, token: 2, event: EditorKeyboard::Focus(true) }));
+        assert!(matches!(&commands[1], Command::Pointer { event, .. } if matches!(event.kind, PointerKind::Down(1))));
+        assert!(matches!(&commands[2], Command::Keyboard { event: EditorKeyboard::Key { text: Some(text), .. }, .. } if text == "a"));
+        assert!(matches!(&commands[3], Command::Keyboard { event: EditorKeyboard::Text(text), .. } if text == "日本語🎵"));
+        assert!(matches!(&commands[4], Command::Keyboard { event: EditorKeyboard::Focus(false), .. }));
+
+        // Retire queued text instead of replaying it into a restarted worker.
+        editor.core.tx.try_send(Command::Poll).unwrap();
+        editor.keyboard(EditorKeyboard::Text("old editor".into())).unwrap();
+        *editor.core.surface.lock().unwrap() = Some(Arc::new(FrameMap::create(8, 2).unwrap()));
+        editor.flush_input().unwrap();
+        assert!(editor.pending_input.is_empty());
+        assert!(matches!(rx.try_recv().unwrap(), Command::Poll));
+        assert!(rx.try_recv().is_err());
+        assert!(editor.keyboard(EditorKeyboard::Text("replacement".into())).is_err());
     }
 
     #[test]

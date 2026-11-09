@@ -210,8 +210,13 @@ into single clicks or combine separate clicks. macOS and Windows use their syste
 double-click settings. Transitions retry through queue pressure without blocking
 the parent. If even the bounded transition queue
 fills, a reserved close slot closes the editor rather than leaving a stuck drag.
-Keyboard/IME, drag-and-drop, blocking native menus, and unattached popup windows are
-not bridged. Attached child popup capture is supported on macOS; Windows also captures
+Windows keyboard focus, keys, translated text, committed host IME text, and clipboard
+shortcuts share the pointer queue and its generation/token checks. Focus, key and text
+messages are ordering barriers and are never coalesced. Focus loss releases held keys
+and notifies the native focused child without activating the offscreen source.
+IME composition display, keyboard input on macOS and Linux, drag-and-drop, blocking
+native menus, and unattached popup windows are not bridged.
+Attached child popup capture is supported on macOS; Windows also captures
 owned native popup windows. The source
 stays alive until the graph editor closes. Windows and X11 capture hosts remain mapped
 outside the desktop; the AppKit host and its child popups are ordered transparently
