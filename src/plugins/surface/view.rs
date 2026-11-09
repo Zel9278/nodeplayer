@@ -4,7 +4,7 @@ use anyhow::Result;
 use egui::{Pos2, Rect};
 use std::time::{Duration, Instant};
 
-use super::{EditorFrame, EditorPointer, PointerKind};
+use super::{EditorFrame, EditorKeyboard, EditorPointer, PointerKind};
 use crate::plugins::{Editor, Spot};
 
 #[derive(Default)]
@@ -31,6 +31,8 @@ pub struct EditorView {
     cancel_popup: bool,
     drag_popup: Option<PopupMapping>,
     clicks: ClickTracker,
+    focus_id: Option<egui::Id>,
+    keyboard_focused: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -181,6 +183,11 @@ pub struct EditorFrameStats {
 }
 
 impl EditorView {
+    pub fn has_keyboard_focus(&self, context: &egui::Context) -> bool {
+        self.keyboard_focused
+            && self.focus_id.is_some_and(|id| context.memory(|memory| memory.has_focus(id)))
+    }
+
     /// Repeated captures keep delivery healthy without keeping the whole graph busy.
     pub fn animating(&self) -> bool {
         self.texture.is_none()
@@ -220,12 +227,21 @@ impl EditorView {
         let units = self.native_units_per_point.unwrap_or_else(|| editor.native_units_per_point());
         let desired = egui::vec2(size.0 as f32 / units, size.1 as f32 / units);
         let rect = if let Some(texture) = &self.texture {
-            ui.add(
+            let response = ui.add(
                 egui::Image::new((texture.id(), desired))
                     .fit_to_exact_size(desired)
                     .sense(egui::Sense::click_and_drag()),
-            )
-            .rect
+            );
+            self.focus_id = Some(response.id);
+            if editor.accepts_keyboard() {
+                ui.memory_mut(|memory| memory.set_focus_lock_filter(response.id, egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                }));
+            }
+            response.rect
         } else {
             let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
             ui.painter()
@@ -454,15 +470,24 @@ impl EditorView {
         spot: Option<&Spot>,
         native_units_per_point: f32,
     ) -> Result<()> {
+        let focused = context.input(|input| input.focused);
+        let top_modal = context.memory(|memory| memory.top_modal_layer());
+        let owns_popup = self.popup_layer.is_some() && self.popup_layer == top_modal;
+        let keyboard_available = editor.accepts_keyboard()
+            && focused
+            && spot.is_some_and(|spot| !spot.visible.is_empty())
+            && (top_modal.is_none() || owns_popup);
+        if self.keyboard_focused
+            && (!keyboard_available || (!owns_popup && !self.has_keyboard_focus(context)))
+        {
+            self.set_keyboard_focus(context, editor, false)?;
+        }
         let Some(screen) = self.screen.filter(|rect| rect.is_positive()) else {
             return Ok(());
         };
         let Some(size) = self.native_size.filter(|_| self.texture.is_some()) else {
             return Ok(());
         };
-        let focused = context.input(|input| input.focused);
-        let top_modal = context.memory(|memory| memory.top_modal_layer());
-        let owns_popup = self.popup_layer.is_some() && self.popup_layer == top_modal;
         if !self.popups.is_empty() && (self.cancel_popup || !focused || spot.is_none()) {
             self.dismiss_popups(editor, screen, size)?;
             return Ok(());
@@ -483,7 +508,24 @@ impl EditorView {
                     })
                 })
         };
-        for event in events {
+        let mut consumed = Vec::new();
+        let mut events = events.into_iter().enumerate().peekable();
+        while let Some((index, event)) = events.next() {
+            if keyboard_available && self.keyboard_focused
+                && let Some(mut keyboard) = keyboard_event(&event)
+            {
+                if let EditorKeyboard::Key { pressed: true, text, .. } = &mut keyboard
+                    && let Some((_, egui::Event::Text(_))) = events.peek()
+                    && let Some((text_index, egui::Event::Text(translated))) = events.next()
+                {
+                    *text = Some(translated);
+                    consumed.push(text_index);
+                }
+                self.last_activity = Some(Instant::now());
+                editor.keyboard(keyboard)?;
+                consumed.push(index);
+                continue;
+            }
             let (position, kind, modifiers) = match event {
                 egui::Event::ModifiersChanged(modifiers) => {
                     self.modifiers = modifiers;
@@ -556,6 +598,7 @@ impl EditorView {
                 })
                 .flatten();
             if owns_popup && matches!(kind, PointerKind::Down(_)) && popup.is_none() {
+                self.set_keyboard_focus(context, editor, false)?;
                 self.dismiss_popups(editor, screen, size)?;
                 break;
             }
@@ -563,6 +606,7 @@ impl EditorView {
                 focused && (popup.is_some() || (top_modal.is_none() && visible(position)));
             match kind {
                 PointerKind::Down(_) if !hovered => {
+                    self.set_keyboard_focus(context, editor, false)?;
                     self.clicks = ClickTracker::default();
                     continue;
                 }
@@ -570,6 +614,9 @@ impl EditorView {
                 PointerKind::Move if !hovered && self.buttons == 0 => continue,
                 PointerKind::Wheel { .. } if !hovered => continue,
                 _ => {}
+            }
+            if keyboard_available && matches!(kind, PointerKind::Down(_)) {
+                self.set_keyboard_focus(context, editor, true)?;
             }
             let next_buttons = match kind {
                 PointerKind::Down(b) => self.buttons | (1 << (b - 1)),
@@ -611,6 +658,26 @@ impl EditorView {
             }
             self.last_position = Some(position);
         }
+        if !consumed.is_empty() {
+            context.input_mut(|input| {
+                let mut index = 0;
+                input.events.retain(|_| {
+                    let keep = !consumed.contains(&index);
+                    index += 1;
+                    keep
+                });
+            });
+        }
+        if keyboard_available && self.keyboard_focused {
+            context.output_mut(|output| output.ime = Some(egui::output::IMEOutput {
+                purpose: egui::IMEPurpose::Normal,
+                rect: screen,
+                cursor_rect: Rect::from_min_size(
+                    self.last_position.unwrap_or(screen.min), egui::vec2(1.0, 20.0),
+                ),
+                should_interrupt_composition: false,
+            }));
+        }
         // Release ownership on focus loss, hidden graph tabs, or a lost OS pointer-up.
         let down = context.input(|input| input.pointer.any_down());
         if self.buttons != 0 && (!focused || spot.is_none() || !down) {
@@ -635,6 +702,28 @@ impl EditorView {
         if !focused || spot.is_none() {
             self.clicks = ClickTracker::default();
             self.modifiers = egui::Modifiers::default();
+        }
+        Ok(())
+    }
+
+    fn set_keyboard_focus(
+        &mut self,
+        context: &egui::Context,
+        editor: &mut dyn Editor,
+        focused: bool,
+    ) -> Result<()> {
+        let Some(id) = self.focus_id else { return Ok(()) };
+        if focused {
+            // Re-requesting focus interrupts an active host IME composition.
+            if !context.memory(|memory| memory.has_focus(id)) {
+                context.memory_mut(|memory| memory.request_focus(id));
+            }
+        } else {
+            context.memory_mut(|memory| memory.surrender_focus(id));
+        }
+        if self.keyboard_focused != focused {
+            editor.keyboard(EditorKeyboard::Focus(focused))?;
+            self.keyboard_focused = focused;
         }
         Ok(())
     }
@@ -711,6 +800,25 @@ impl EditorView {
     }
 }
 
+fn keyboard_event(event: &egui::Event) -> Option<EditorKeyboard> {
+    Some(match event {
+        egui::Event::Key { key, pressed, repeat, modifiers, .. } => EditorKeyboard::Key {
+            key: *key,
+            pressed: *pressed,
+            repeat: *repeat,
+            modifiers: modifier_mask(*modifiers),
+            text: None,
+        },
+        egui::Event::Text(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+            EditorKeyboard::Text(text.clone())
+        }
+        egui::Event::Copy => EditorKeyboard::Copy,
+        egui::Event::Cut => EditorKeyboard::Cut,
+        egui::Event::Paste(_) => EditorKeyboard::Paste,
+        _ => return None,
+    })
+}
+
 fn modifier_mask(modifiers: egui::Modifiers) -> u8 {
     (u8::from(modifiers.shift) * super::MOD_SHIFT)
         | (u8::from(modifiers.ctrl) * super::MOD_CONTROL)
@@ -730,6 +838,116 @@ fn native_from_screen(screen: Rect, native_size: (u32, u32), position: Pos2) -> 
 mod tests {
     use super::*;
     use egui::Vec2;
+
+    #[derive(Default)]
+    struct KeyboardEditor(Vec<EditorKeyboard>);
+
+    impl Editor for KeyboardEditor {
+        fn placement(&self) -> crate::plugins::Placement { crate::plugins::Placement::Embedded(1) }
+        fn size(&self) -> (u32, u32) { (200, 80) }
+        fn place(&mut self, _: Option<&Spot>) {}
+        fn idle(&mut self) -> bool { true }
+        fn accepts_keyboard(&self) -> bool { true }
+        fn keyboard(&mut self, event: EditorKeyboard) -> Result<()> {
+            self.0.push(event);
+            Ok(())
+        }
+    }
+
+    fn keyboard_frame(
+        context: &egui::Context,
+        views: &mut [EditorView; 2],
+        editors: &mut [KeyboardEditor; 2],
+        events: Vec<egui::Event>,
+        focused: bool,
+        visible: bool,
+    ) -> egui::FullOutput {
+        context.run_ui(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            focused, events, ..Default::default()
+        }, |ui| {
+            for (view, editor) in views.iter_mut().zip(editors.iter_mut()) {
+                if view.texture.is_none() {
+                    view.update_texture(context, EditorFrame {
+                        width: 1, height: 1, native_size: (200, 80), native_units_per_point: 1.0,
+                        rgba: vec![255; 4], popups: Vec::new(),
+                    });
+                }
+                view.paint(ui, editor, 1.0);
+            }
+            for (view, editor) in views.iter_mut().zip(editors.iter_mut()) {
+                let screen = view.screen.unwrap();
+                let clip = crate::plugins::PxRect {
+                    x: screen.min.x as i32, y: screen.min.y as i32,
+                    w: screen.width() as u32, h: screen.height() as u32,
+                };
+                let spot = Spot { clip, origin: (clip.x, clip.y), visible: vec![clip] };
+                view.dispatch(context, editor, visible.then_some(&spot), 1.0).unwrap();
+            }
+        })
+    }
+
+    fn click(position: Pos2) -> Vec<egui::Event> {
+        [true, false].into_iter().map(|pressed| egui::Event::PointerButton {
+            pos: position, button: egui::PointerButton::Primary, pressed,
+            modifiers: egui::Modifiers::NONE,
+        }).collect()
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false,
+            modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn only_clicked_editor_gets_keyboard_and_committed_text() {
+        let context = egui::Context::default();
+        let mut views = [EditorView::default(), EditorView::default()];
+        let mut editors = [KeyboardEditor::default(), KeyboardEditor::default()];
+        keyboard_frame(&context, &mut views, &mut editors, vec![], true, true);
+        let mut events = click(views[0].screen.unwrap().center());
+        events.extend([key(egui::Key::A), egui::Event::Text("a".into()),
+            egui::Event::Ime(egui::ImeEvent::Commit("日本語🎵".into()))]);
+        let output = keyboard_frame(&context, &mut views, &mut editors, events, true, true);
+        assert!(output.platform_output.ime.is_some());
+        assert_eq!(editors[0].0, [EditorKeyboard::Focus(true), EditorKeyboard::Key {
+            key: egui::Key::A, pressed: true, repeat: false, modifiers: 0, text: Some("a".into()),
+        }, EditorKeyboard::Text("日本語🎵".into())]);
+        assert!(editors[1].0.is_empty());
+        assert!(context.input(|input| !input.events.iter().any(|event| keyboard_event(event).is_some())));
+        assert!(views[0].has_keyboard_focus(&context));
+
+        let mut events = click(views[1].screen.unwrap().center());
+        events.extend([egui::Event::Text("other".into()), egui::Event::Paste("clipboard".into())]);
+        keyboard_frame(&context, &mut views, &mut editors, events, true, true);
+        assert_eq!(editors[0].0.last(), Some(&EditorKeyboard::Focus(false)));
+        assert_eq!(editors[1].0, [EditorKeyboard::Focus(true), EditorKeyboard::Text("other".into()), EditorKeyboard::Paste]);
+        assert!(!views[0].has_keyboard_focus(&context));
+        assert!(views[1].has_keyboard_focus(&context));
+    }
+
+    #[test]
+    fn keyboard_focus_survives_navigation_and_stops_on_hide_or_os_focus_loss() {
+        for (focused, visible) in [(false, true), (true, false)] {
+            let context = egui::Context::default();
+            let mut views = [EditorView::default(), EditorView::default()];
+            let mut editors = [KeyboardEditor::default(), KeyboardEditor::default()];
+            keyboard_frame(&context, &mut views, &mut editors, vec![], true, true);
+            let events = click(views[0].screen.unwrap().center());
+            keyboard_frame(&context, &mut views, &mut editors, events, true, true);
+            // Install the focus filter for the next frame before sending Tab.
+            keyboard_frame(&context, &mut views, &mut editors, vec![], true, true);
+            for navigation in [egui::Key::Tab, egui::Key::ArrowLeft, egui::Key::Escape, egui::Key::Space] {
+                keyboard_frame(&context, &mut views, &mut editors, vec![key(navigation)], true, true);
+                assert!(views[0].has_keyboard_focus(&context), "{navigation:?}");
+                assert!(matches!(editors[0].0.last(), Some(EditorKeyboard::Key { key, .. }) if *key == navigation));
+            }
+            keyboard_frame(&context, &mut views, &mut editors, vec![egui::Event::Text("ignored".into())], focused, visible);
+            assert_eq!(editors[0].0.last(), Some(&EditorKeyboard::Focus(false)));
+            assert!(!views[0].has_keyboard_focus(&context));
+            assert!(!editors[0].0.contains(&EditorKeyboard::Text("ignored".into())));
+        }
+    }
 
     #[test]
     fn identical_delivery_can_idle_but_pixel_and_popup_changes_wake_repainting() {

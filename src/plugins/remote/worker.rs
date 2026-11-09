@@ -332,6 +332,20 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                             refresh_frame = true;
                         }
                     }
+                    Command::Keyboard {
+                        generation: input_generation,
+                        token,
+                        event,
+                    } => {
+                        event.validate()?;
+                        if input_generation == generation
+                            && token == editor_id
+                            && let Some(editor) = editor.as_mut().filter(|editor| editor.accepts_keyboard())
+                        {
+                            editor.keyboard(event)?;
+                            refresh_frame = true;
+                        }
+                    }
                     Command::Place(token, spot) => {
                         if spot.as_ref().is_some_and(|s| s.visible.len() > 256) {
                             bail!("too many clipping rectangles")

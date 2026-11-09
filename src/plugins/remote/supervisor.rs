@@ -548,6 +548,7 @@ fn transact(
         Command::Open { .. } => "open-editor",
         Command::SetSurface(..) => "set-surface",
         Command::Pointer { .. } => "pointer",
+        Command::Keyboard { .. } => "keyboard",
         Command::Place(..) => "place",
         Command::DisplayScale(..) => "display-scale",
         Command::Close(..) => "close-editor",

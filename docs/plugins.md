@@ -66,8 +66,12 @@ On macOS and Windows, attached or owned popup windows appear over the graph and 
 including outside the editor image. Escape or a click outside closes the popup.
 On macOS, Metal popup windows also use drawable capture, including reused menus.
 Windows layered menus retain their uploaded pixels and transparency in the graph.
-Keyboard/IME, drag-and-drop, blocking native menus, and unrelated popup windows are
-not forwarded; use **Pop out** for those interactions. Capture can
+On Windows, click the editor to type into it. Text, editing keys, and clipboard
+shortcuts go to that editor until you click elsewhere or hide the graph. Space stays
+with the focused editor. Committed IME text is forwarded, but composition text is
+not drawn inside the editor image.
+Keyboard input on macOS and Linux, drag-and-drop, blocking native menus, and unrelated
+popup windows are not forwarded. Use **Pop out** for those interactions. Capture can
 fail for some GPU-rendered editors. Capture and native input stay in the worker under
 default hosting. With `--in-process-plugins`, they run on the app's UI thread.
 

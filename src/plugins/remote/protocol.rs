@@ -1,13 +1,13 @@
 //! Versioned, length-bounded control plane. Never carried on plugin stdout.
 use super::super::{ParamDesc, Placement, PluginInfo, Spot};
 use super::surface::SurfaceDescriptor;
-use crate::plugins::surface::EditorPointer;
+use crate::plugins::surface::{EditorKeyboard, EditorPointer};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_STATE: usize = 1024 * 1024;
 pub const MAX_PARAMS: usize = 8192;
@@ -58,6 +58,11 @@ pub enum Command {
         generation: u64,
         token: u64,
         event: EditorPointer,
+    },
+    Keyboard {
+        generation: u64,
+        token: u64,
+        event: EditorKeyboard,
     },
     Place(u64, Option<Spot>),
     DisplayScale(u64, f32),
