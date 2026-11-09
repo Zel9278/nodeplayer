@@ -131,6 +131,9 @@ struct BitmapCache {
 }
 
 struct PopupCapture {
+    // Popup windows can render through Metal independently of the editor surface.
+    // Detach their readback before releasing the popup's native window.
+    metal: Option<MetalCapture>,
     window: Retained<NSWindow>,
     bitmap: BitmapCache,
 }
@@ -249,10 +252,27 @@ impl NativeCapture {
                 .position(|p| p.window == child)
                 .map(|index| previous.swap_remove(index))
                 .unwrap_or_else(|| PopupCapture {
+                    metal: None,
                     window: child.clone(),
                     bitmap: BitmapCache::default(),
                 });
-            let image = capture_view(&view, &mut popup.bitmap, remaining_pixels)?;
+            if popup.metal.as_ref().is_some_and(|metal| !metal.is_current(&view)) {
+                popup.metal = None;
+            }
+            if popup.metal.is_none() {
+                popup.metal = MetalCapture::attach(&view);
+            }
+            let image = if let Some(metal) = &mut popup.metal {
+                let Some(image) = metal.frame()? else {
+                    // Bitmap snapshots cannot read a CAMetalLayer and may
+                    // re-enter plugin drawing while its first drawable is pending.
+                    self.popups.push(popup);
+                    continue;
+                };
+                image
+            } else {
+                capture_view(&view, &mut popup.bitmap, remaining_pixels)?
+            };
             remaining_pixels = remaining_pixels
                 .checked_sub(image.rgba.len() as u64 / 4)
                 .context("editor popups exceed capture pixel budget")?;
@@ -510,18 +530,17 @@ fn capture_view(view: &NSView, cache: &mut BitmapCache, pixel_budget: u64) -> Re
     rgba_frame(bitmap, native_size)
 }
 
-/// Only attached windows belong to this editor; never capture unrelated app windows.
+/// Include reused former children, but never claim unrelated application windows.
 fn popup_windows(root: &NSWindow) -> Result<Vec<Retained<NSWindow>>> {
     fn children(root: &NSWindow, result: &mut Vec<Retained<NSWindow>>) -> Result<()> {
-        if let Some(windows) = root.childWindows() {
-            for child in windows.iter().filter(|window| window.isVisible()) {
-                ensure!(result.len() < MAX_POPUPS, "too many native editor popups");
-                // The private host hides direct children before AppKit orders them.
-                // Keep any deeper attached windows private as well.
-                child.setAlphaValue(0.0);
-                result.push(child.clone());
-                children(&child, result)?;
-            }
+        for child in crate::plugins::window::captured_popup_windows(root).into_iter().filter(|window| window.isVisible()) {
+            if result.contains(&child) { continue; }
+            ensure!(result.len() < MAX_POPUPS, "too many native editor popups");
+            // The private host hides direct children before AppKit orders them.
+            // Keep any deeper attached windows private as well.
+            child.setAlphaValue(0.0);
+            result.push(child.clone());
+            children(&child, result)?;
         }
         Ok(())
     }
