@@ -235,19 +235,35 @@ mod hooks {
                         )
                     })?;
                 original.store(trampoline, Ordering::Release);
-                unsafe { MinHook::enable_hook(address) }
-                    .map_err(|error| anyhow!("enable editor cursor API hook: {error:?}"))?;
                 installed.push((address, trampoline));
                 Ok(())
             })();
             if let Err(error) = result {
                 for (address, _) in installed {
-                    let _ = unsafe { MinHook::disable_hook(address) };
+                    let _ = unsafe { MinHook::remove_hook(address) };
                 }
-                // Hooks and trampolines live until process exit. Another thread may
-                // already be returning through one even after it has been disabled.
                 bail!(error);
             }
+        }
+        // Enabling each hook separately repeats MinHook's process-wide thread scan
+        // and suspension. On busy machines that exceeds the worker's reply deadline.
+        // Publish every trampoline first, then activate only these hooks in one pass.
+        let enabled = (|| -> Result<()> {
+            for &(address, _) in &installed {
+                unsafe { MinHook::queue_enable_hook(address) }
+                    .map_err(|error| anyhow!("queue editor cursor API hook: {error:?}"))?;
+            }
+            unsafe { MinHook::apply_queued() }
+                .map_err(|error| anyhow!("enable editor cursor API hooks: {error:?}"))
+        })();
+        if let Err(error) = enabled {
+            for &(address, _) in &installed {
+                let _ = unsafe { MinHook::queue_disable_hook(address) };
+            }
+            let _ = unsafe { MinHook::apply_queued() };
+            // An activation can partially succeed. Retain its trampolines for any
+            // callbacks already in flight, even after disabling the hooks.
+            bail!(error);
         }
         Ok(())
     }

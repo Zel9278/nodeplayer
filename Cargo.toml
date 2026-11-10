@@ -114,3 +114,5 @@ strip = false
 # once a text field asked for it (see `ImeRequest::Allow` in its x11/event_processor.rs).
 [patch.crates-io]
 winit = { path = "third_party/winit" }
+# Enumerate only this process's threads when installing captured editor hooks.
+minhook = { path = "third_party/minhook" }

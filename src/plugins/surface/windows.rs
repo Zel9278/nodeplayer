@@ -2073,8 +2073,27 @@ mod tests {
         use crate::plugins::{Placement, window::HostWindow};
         use std::time::{Duration, Instant};
 
+        // Other tests initialize the process-lifetime API hooks. Run in a fresh
+        // process so this checks the first editor's setup, including hook
+        // installation. Keep it below a visible half-second pause, rather than
+        // merely below the worker's three-second reply deadline.
+        const COLD_CAPTURE: &str = "NODEPLAYER_TEST_COLD_CAPTURE";
+        if std::env::var_os(COLD_CAPTURE).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "plugins::surface::windows::tests::capture_host_stays_off_desktop_while_redrawing_resizing_and_reopening",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(COLD_CAPTURE, "1")
+                .status()?;
+            ensure!(status.success(), "cold editor capture regression failed: {status}");
+            return Ok(());
+        }
         let foreground = unsafe { GetForegroundWindow() };
         for _ in 0..2 {
+            let opening = Instant::now();
             let host = HostWindow::create(
                 Placement::CaptureSource,
                 640,
@@ -2120,6 +2139,11 @@ mod tests {
 
             let child = fixture(Some(hwnd), (20, 24), (240, 180), [38, 139, 188])?;
             let mut capture = NativeCapture::new(host.handle())?;
+            ensure!(
+                opening.elapsed() < Duration::from_millis(500),
+                "editor capture setup exceeded 500 ms: {:?}",
+                opening.elapsed()
+            );
             let first = capture.capture((1, 1))?;
             assert_eq!(first.native_size, (640, 360));
             assert_eq!(pixel(&first, 40, 40), [38, 139, 188, 255]);
