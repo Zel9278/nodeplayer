@@ -86,10 +86,6 @@ jobs:
         if: matrix.cross
         with:
           osx-version: '14.5'
-      - name: Configure native dependencies for osxcross
-        if: matrix.cross
-        shell: bash
-        run: bash packaging/macos/configure-osxcross.sh '${{ matrix.target }}'
       - name: Windows assembler
         if: runner.os == 'Windows'
         shell: pwsh
@@ -100,6 +96,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # Generate the toolchain after cache restore, which can clean target/.
+      - name: Configure native dependencies for osxcross
+        if: matrix.cross
+        shell: bash
+        run: bash packaging/macos/configure-osxcross.sh '${{ matrix.target }}'
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Test
