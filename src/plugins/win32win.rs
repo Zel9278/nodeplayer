@@ -102,6 +102,9 @@ pub(crate) struct CaptureInput {
 
 impl CaptureInput {
     pub(crate) fn new(root: HWND) -> Result<Rc<Self>> {
+        if let Some(input) = Self::for_window(root).filter(|input| input.root == root) {
+            return Ok(input);
+        }
         layered::initialize()?;
         cursor::initialize()?;
         let input = Rc::new(Self {
@@ -802,6 +805,8 @@ struct State {
 pub struct HostWindow {
     /// The window handed to the plugin.
     id: HWND,
+    // Attach before the plugin creates children, including their monitor/clock setup.
+    _capture_input: Option<Rc<CaptureInput>>,
     /// Clipping parent of `id` when embedded.
     container: Option<HWND>,
     pub placement: Placement,
@@ -982,13 +987,17 @@ impl HostWindow {
             // Messages before this (creation) go to DefWindowProc.
             SetWindowLongPtrW(id, GWLP_USERDATA, &*state as *const State as isize);
         }
-        let win = Self {
+        let mut win = Self {
             id,
+            _capture_input: None,
             container,
             placement,
             shown: RefCell::new(None),
             state,
         };
+        if placement == Placement::CaptureSource {
+            win._capture_input = Some(CaptureInput::new(id)?);
+        }
         if container.is_none() {
             // The window was created with the client size as its outer size.
             win.resize(w, h);

@@ -1001,6 +1001,12 @@ mod tests {
         position: LPARAM,
     ) -> LRESULT {
         unsafe {
+            if message == WM_CREATE
+                && let Some(create) = (position.0 as *const CREATESTRUCTW).as_ref()
+                && let Some(monitor) = (create.lpCreateParams as *const Cell<HMONITOR>).as_ref()
+            {
+                monitor.set(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL));
+            }
             if let Some(state) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const State).as_ref() {
                 if matches!(message, WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
                     | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_PRINTCLIENT)
@@ -1191,6 +1197,45 @@ mod tests {
     #[test]
     fn rejects_invalid_borrowed_handle() {
         assert!(NativeCapture::new(0).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn offscreen_capture_children_keep_a_monitor_from_creation() -> Result<()> {
+        use crate::plugins::{Placement, window::HostWindow};
+        struct Child(HWND);
+        impl Drop for Child {
+            fn drop(&mut self) { let _ = unsafe { DestroyWindow(self.0) }; }
+        }
+        let unrelated = fixture(None, (-20000, -20000), (100, 100), [1, 2, 3])?;
+        let host = HostWindow::create(Placement::CaptureSource, 400, 300, "monitor regression", false)?;
+        let root = HWND(host.handle() as *mut c_void);
+        let expected = unsafe { MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST) };
+        assert!(!expected.0.is_null());
+        let mut bounds = RECT::default();
+        unsafe { GetWindowRect(root, &mut bounds) }?;
+        assert!(unsafe { MonitorFromRect(&bounds, MONITOR_DEFAULTTONULL) }.0.is_null(),
+            "the rendering host must remain physically outside every display");
+        let created = Cell::new(HMONITOR::default());
+        let child = Child(unsafe { CreateWindowExW(
+            WINDOW_EX_STYLE::default(), CLASS, w!("monitor-dependent child"),
+            WS_CHILD | WS_VISIBLE, 0, 0, 200, 100, root, None,
+            HINSTANCE(GetModuleHandleW(None)?.0), Some((&created as *const Cell<HMONITOR>).cast()),
+        ) }?);
+        assert_eq!(created.get(), expected,
+            "renderers must register their display clock before NativeCapture attaches");
+        let capture = NativeCapture::new(host.handle())?;
+        let same_input = CaptureInput::new(root)?;
+        assert!(Rc::ptr_eq(&capture.input, &same_input), "the source and adapter share input ownership");
+        for logical in [false, true] {
+            let _scope = capture.input.enter();
+            let _coordinates = crate::plugins::window::logical_coordinates();
+            if !logical { drop(_coordinates); }
+            assert_eq!(unsafe { MonitorFromWindow(child.0, MONITOR_DEFAULTTONULL) }, expected);
+            assert!(unsafe { MonitorFromWindow(unrelated.hwnd, MONITOR_DEFAULTTONULL) }.0.is_null(),
+                "unrelated offscreen windows must retain the real monitor result");
+        }
+        Ok(())
     }
 
     #[test]

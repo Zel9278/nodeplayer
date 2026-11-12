@@ -75,9 +75,12 @@ layered popup uploads before their source bitmaps are reused. Captured native po
 stay off the desktop, including position changes made by layered uploads. X11 capture
 resolves the current named pixmap on every read so compositor backing-store replacement
 cannot leave it reading an abandoned image.
-On Windows, captured sources reserve a fixed offscreen origin across resizes. Cursor
-queries and warps inside captured editor callbacks use forwarded coordinates without
-moving the desktop cursor. The graph and other threads retain the normal cursor APIs.
+On Windows, captured sources reserve a fixed offscreen origin across resizes.
+The source registers capture input before the plugin creates its child windows.
+Captured windows retain the nearest display when a monitor query would otherwise
+return no display. This keeps JUCE's VBlank redraw listener active offscreen.
+Cursor queries and warps inside captured editor callbacks use forwarded coordinates
+without moving the desktop cursor. The graph and other threads retain the normal cursor APIs.
 Cancellation restores normal cursor and foreground queries until the next pointer event.
 Ownerless popup windows created during editor callbacks stay with that editor. Worker
 helper callbacks retain the same input context so asynchronous JUCE menus stay open.
