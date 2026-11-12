@@ -516,16 +516,7 @@ impl NativeCapture {
                 self.input.focus_editor();
             }
             EditorKeyboard::Focus(false) => {
-                // A missing OS key-up must not leave a plugin's held key active.
-                for code in 0..256 {
-                    if self.keys[code] {
-                        self.send_key(code as u16, false, false, 0, None)?;
-                    }
-                }
-                self.modifiers = 0;
-                self.keyboard_focused = false;
-                let _keyboard = self.keyboard_state(0)?;
-                self.input.blur_editor();
+                self.release_keyboard()?;
             }
             _ if !self.keyboard_focused => {}
             EditorKeyboard::Key { key, pressed, repeat, modifiers, text } => {
@@ -547,16 +538,38 @@ impl NativeCapture {
             }
             EditorKeyboard::Copy | EditorKeyboard::Cut | EditorKeyboard::Paste => {
                 let saved_modifiers = self.modifiers;
+                let saved_keys = self.keys;
                 let code = match event {
                     EditorKeyboard::Copy => b'C',
                     EditorKeyboard::Cut => b'X',
                     _ => b'V',
                 };
-                self.send_key(u16::from(code), true, false, super::MOD_CONTROL, None)?;
-                self.send_key(u16::from(code), false, false, super::MOD_CONTROL, None)?;
+                let delivered = (|| {
+                    self.send_key(u16::from(code), true, false, super::MOD_CONTROL, None)?;
+                    self.send_key(u16::from(code), false, false, super::MOD_CONTROL, None)
+                })();
+                self.keys = saved_keys;
                 self.modifiers = saved_modifiers;
+                // Helper windows can run before the next capture. Their logical
+                // table must stop reporting the shortcut's synthetic Control key.
+                let _keyboard = self.keyboard_state(saved_modifiers)?;
+                delivered?;
             }
         }
+        Ok(())
+    }
+
+    fn release_keyboard(&mut self) -> Result<()> {
+        // A missing OS key-up or closing the editor must not leave a held action active.
+        for code in 0..256 {
+            if self.keys[code] {
+                self.send_key(code as u16, false, false, 0, None)?;
+            }
+        }
+        self.modifiers = 0;
+        self.keyboard_focused = false;
+        let _keyboard = self.keyboard_state(0)?;
+        self.input.blur_editor();
         Ok(())
     }
 
@@ -609,6 +622,18 @@ impl NativeCapture {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for NativeCapture {
+    fn drop(&mut self) {
+        if self.check_window().is_ok() {
+            self.buttons = 0;
+            if self.release_keyboard().is_err() {
+                self.input.blur_editor();
+            }
+            self.input.cancel();
+        }
     }
 }
 
@@ -666,6 +691,21 @@ impl KeyboardModifiers {
         for (code, pressed) in held.iter().copied().enumerate() {
             if !matches!(code, 0x10..=0x12 | 0x5b..=0x5c | 0xa0..=0xa5) {
                 keys[code] = (keys[code] & 0x7f) | if pressed { 0x80 } else { 0 };
+            }
+        }
+        for (bit, left, right) in [
+            (super::MOD_SHIFT, VK_LSHIFT, VK_RSHIFT),
+            (super::MOD_CONTROL, VK_LCONTROL, VK_RCONTROL),
+            (super::MOD_ALT, VK_LMENU, VK_RMENU),
+            (super::MOD_SUPER, VK_LWIN, VK_RWIN),
+        ] {
+            let active = modifiers & bit != 0;
+            let right_pressed = active && held[right.0 as usize];
+            // A pointer event can supply a modifier without a preceding key event.
+            // Use the left side only when no known right-side press explains it.
+            let left_pressed = active && (held[left.0 as usize] || !right_pressed);
+            for (code, pressed) in [(left, left_pressed), (right, right_pressed)] {
+                keys[code.0 as usize] = (keys[code.0 as usize] & 0x7f) | if pressed { 0x80 } else { 0 };
             }
         }
         // Mouse buttons share Win32's keyboard table. JUCE polls them through
@@ -950,6 +990,9 @@ mod tests {
         message_cursor: Cell<Option<(i32, i32)>>,
         requested_cursor: Cell<Option<(i32, i32)>>,
         queried_buttons: Cell<u8>,
+        key_downs: Cell<u32>,
+        key_ups: Cell<u32>,
+        focus_losses: Cell<u32>,
     }
 
     struct TestWindow {
@@ -1020,6 +1063,14 @@ mod tests {
                 }
                 let point = (position.0 as i16 as i32, (position.0 >> 16) as i16 as i32);
                 match message {
+                    WM_KEYDOWN => {
+                        state.key_downs.set(state.key_downs.get() + 1);
+                        return LRESULT(0);
+                    }
+                    WM_KEYUP => {
+                        state.key_ups.set(state.key_ups.get() + 1);
+                        return LRESULT(0);
+                    }
                     WM_APP => {
                         let callback = &*(position.0 as *const &dyn Fn());
                         callback();
@@ -1092,6 +1143,9 @@ mod tests {
                         return LRESULT(0);
                     }
                     WM_CANCELMODE | WM_KILLFOCUS => {
+                        if message == WM_KILLFOCUS {
+                            state.focus_losses.set(state.focus_losses.get() + 1);
+                        }
                         state.cancels.set(state.cancels.get() + 1);
                         state.last_cancel.set(message);
                         state.down.set(false);
@@ -1161,6 +1215,9 @@ mod tests {
             message_cursor: Cell::new(None),
             requested_cursor: Cell::new(None),
             queried_buttons: Cell::new(0),
+            key_downs: Cell::new(0),
+            key_ups: Cell::new(0),
+            focus_losses: Cell::new(0),
         });
         unsafe {
             let style =
@@ -1192,6 +1249,15 @@ mod tests {
     fn pixel(frame: &EditorFrame, x: u32, y: u32) -> [u8; 4] {
         let offset = (y as usize * frame.width as usize + x as usize) * 4;
         frame.rgba[offset..offset + 4].try_into().unwrap()
+    }
+
+    fn worker_callback(hwnd: HWND, callback: &dyn Fn()) {
+        crate::plugins::window::dispatch_worker_message(&MSG {
+            hwnd,
+            message: WM_APP,
+            lParam: LPARAM(&callback as *const &dyn Fn() as isize),
+            ..Default::default()
+        });
     }
 
     #[test]
@@ -1248,6 +1314,34 @@ mod tests {
             assert!(unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0);
             assert!(unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0);
             assert!(unsafe { GetKeyState(i32::from(VK_MENU.0)) } >= 0);
+        }
+        let mut after = [0; 256];
+        unsafe { GetKeyboardState(&mut after) }?;
+        assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_modifier_table_preserves_known_sides() -> Result<()> {
+        let mut before = [0; 256];
+        unsafe { GetKeyboardState(&mut before) }?;
+        for (bit, left, right, generic) in [
+            (super::super::MOD_SHIFT, VK_LSHIFT, VK_RSHIFT, Some(VK_SHIFT)),
+            (super::super::MOD_CONTROL, VK_LCONTROL, VK_RCONTROL, Some(VK_CONTROL)),
+            (super::super::MOD_ALT, VK_LMENU, VK_RMENU, Some(VK_MENU)),
+            (super::super::MOD_SUPER, VK_LWIN, VK_RWIN, None),
+        ] {
+            for (left_pressed, right_pressed) in [(true, false), (false, true), (true, true)] {
+                let mut held = [false; 256];
+                held[left.0 as usize] = left_pressed;
+                held[right.0 as usize] = right_pressed;
+                let keyboard = KeyboardModifiers::with_keys(bit, &held, 0)?;
+                assert_eq!(keyboard.state[left.0 as usize] & 0x80 != 0, left_pressed);
+                assert_eq!(keyboard.state[right.0 as usize] & 0x80 != 0, right_pressed);
+                if let Some(generic) = generic {
+                    assert_ne!(keyboard.state[generic.0 as usize] & 0x80, 0);
+                }
+            }
         }
         let mut after = [0; 256];
         unsafe { GetKeyboardState(&mut after) }?;
@@ -1350,12 +1444,19 @@ mod tests {
         capture.keyboard(press(egui::Key::End, None))?;
         capture.keyboard(EditorKeyboard::Text("日本語🎵".into()))?;
         assert_eq!(text(), "ac日本語🎵");
+        capture.pointer(EditorPointer {
+            position: [50.0, 35.0], kind: PointerKind::Cancel, buttons: 0,
+            modifiers: 0, click_count: 0, timestamp_ms: None,
+        })?;
+        assert_eq!(capture.input.focus_target(), Some(child.0));
+        capture.keyboard(EditorKeyboard::Text("d".into()))?;
+        assert_eq!(text(), "ac日本語🎵d", "pointer cancellation must preserve keyboard focus");
         assert!(capture.keys.iter().any(|key| *key));
         capture.keyboard(EditorKeyboard::Focus(false))?;
         assert!(!capture.keys.iter().any(|key| *key));
         assert!(capture.input.focus_target().is_none());
         capture.keyboard(EditorKeyboard::Text("ignored".into()))?;
-        assert_eq!(text(), "ac日本語🎵");
+        assert_eq!(text(), "ac日本語🎵d");
         capture.capture((640, 360))?;
         assert!(capture.input.focus_target().is_none(), "capture must not restore retired keyboard focus");
         assert_eq!(unsafe { GetForegroundWindow() }, foreground);
@@ -1364,6 +1465,126 @@ mod tests {
         let mut after = [0; 256];
         unsafe { GetKeyboardState(&mut after) }?;
         assert_eq!(before, after, "forwarded keys must restore the host keyboard table");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn dismissing_popup_restores_the_focused_editor_child() -> Result<()> {
+        let root = fixture(None, (-2000, -2000), (400, 300), [23, 28, 38])?;
+        let child = fixture(Some(root.hwnd), (20, 20), (200, 100), [38, 139, 188])?;
+        let next = fixture(Some(root.hwnd), (20, 140), (200, 100), [139, 38, 188])?;
+        let mut capture = NativeCapture::new(root.hwnd.0 as usize)?;
+        capture.keyboard(EditorKeyboard::Focus(true))?;
+        {
+            let _scope = capture.input.enter();
+            capture.input.focus_window(child.hwnd);
+            // Tab navigation and plugin callbacks can change focus themselves.
+            unsafe { SetFocus(next.hwnd) }?;
+            assert_eq!(unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() }, next.hwnd,
+                "physical SetFocus must reach the next control");
+            assert_eq!(capture.input.focus_target(), Some(next.hwnd),
+                "focus messages must remember the next control (root {:?}, previous {:?})", root.hwnd, child.hwnd);
+        }
+        assert_eq!(capture.input.focus_target(), Some(next.hwnd),
+            "restoring physical focus must keep the next control (root {:?}, previous {:?})", root.hwnd, child.hwnd);
+        let popup = {
+            let _scope = capture.input.enter();
+            let popup = fixture(None, (100, 100), (100, 100), [90, 100, 110])?;
+            capture.input.focus_window(popup.hwnd);
+            popup
+        };
+        assert_eq!(capture.input.focus_target(), Some(popup.hwnd));
+        capture.pointer(EditorPointer {
+            position: [30.0, 30.0], kind: PointerKind::Cancel, buttons: 0,
+            modifiers: 0, click_count: 0, timestamp_ms: None,
+        })?;
+        assert_eq!(capture.input.focus_target(), Some(next.hwnd));
+        let key_downs = next.state.key_downs.get();
+        capture.keyboard(EditorKeyboard::Key {
+            key: egui::Key::A, pressed: true, repeat: false, modifiers: 0, text: None,
+        })?;
+        assert_eq!(next.state.key_downs.get(), key_downs + 1);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn closing_capture_releases_held_keys_and_keyboard_focus() -> Result<()> {
+        let root = fixture(None, (-2000, -2000), (400, 300), [23, 28, 38])?;
+        let child = fixture(Some(root.hwnd), (20, 20), (200, 100), [38, 139, 188])?;
+        let mut capture = NativeCapture::new(root.hwnd.0 as usize)?;
+        capture.keyboard(EditorKeyboard::Focus(true))?;
+        {
+            let _scope = capture.input.enter();
+            capture.input.focus_window(child.hwnd);
+        }
+        for (key, modifiers) in [(egui::Key::A, 0), (egui::Key::ShiftRight, super::super::MOD_SHIFT)] {
+            capture.keyboard(EditorKeyboard::Key {
+                key, pressed: true, repeat: false, modifiers, text: None,
+            })?;
+        }
+        let focus_losses = child.state.focus_losses.get();
+        drop(capture);
+        assert_eq!(child.state.key_downs.get(), 2);
+        assert_eq!(child.state.key_ups.get(), 2, "close must release every held key");
+        assert_eq!(child.state.focus_losses.get(), focus_losses + 1);
+        assert!(unsafe { IsWindow(child.hwnd) }.as_bool(), "the source still owns its HWND");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn deferred_keyboard_callbacks_use_and_restore_the_logical_table() -> Result<()> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetKeyState};
+        let root = fixture(None, (-2000, -2000), (400, 300), [23, 28, 38])?;
+        let helper = fixture(None, (-2000, -2000), (20, 20), [1, 2, 3])?;
+        let mut capture = NativeCapture::new(root.hwnd.0 as usize)?;
+        capture.keyboard(EditorKeyboard::Focus(true))?;
+        for key in [egui::Key::ControlRight, egui::Key::A] {
+            capture.keyboard(EditorKeyboard::Key {
+                key, pressed: true, repeat: false, modifiers: super::super::MOD_CONTROL, text: None,
+            })?;
+        }
+        let mut before = [0; 256];
+        unsafe { GetKeyboardState(&mut before) }?;
+        let observed = Cell::new(None);
+        worker_callback(helper.hwnd, &|| unsafe {
+            let mut keys = [0; 256];
+            if GetKeyboardState(&mut keys).is_ok() {
+                observed.set(Some((keys, GetKeyState(i32::from(VK_RCONTROL.0)), GetAsyncKeyState(i32::from(VK_RCONTROL.0)))));
+            }
+        });
+        let (keys, synchronous, asynchronous) = observed.get().expect("worker callback did not read keyboard state");
+        assert_ne!(keys[VK_CONTROL.0 as usize] & 0x80, 0);
+        assert_ne!(keys[VK_RCONTROL.0 as usize] & 0x80, 0);
+        assert_eq!(keys[VK_LCONTROL.0 as usize] & 0x80, 0);
+        assert_ne!(keys[b'A' as usize] & 0x80, 0);
+        assert!(synchronous < 0 && asynchronous < 0);
+        let mut after = [0; 256];
+        unsafe { GetKeyboardState(&mut after) }?;
+        assert_eq!(before, after, "deferred callbacks must restore the host table");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn clipboard_shortcuts_restore_deferred_modifier_state_without_a_capture() -> Result<()> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetKeyState};
+        let root = fixture(None, (-2000, -2000), (400, 300), [23, 28, 38])?;
+        let helper = fixture(None, (-2000, -2000), (20, 20), [1, 2, 3])?;
+        let mut capture = NativeCapture::new(root.hwnd.0 as usize)?;
+        capture.keyboard(EditorKeyboard::Focus(true))?;
+        for shortcut in [EditorKeyboard::Copy, EditorKeyboard::Cut, EditorKeyboard::Paste] {
+            capture.keyboard(shortcut)?;
+            let observed = Cell::new(None);
+            worker_callback(helper.hwnd, &|| unsafe {
+                observed.set(Some((GetKeyState(i32::from(VK_CONTROL.0)), GetAsyncKeyState(i32::from(VK_CONTROL.0)))));
+            });
+            let (synchronous, asynchronous) = observed.get().expect("worker callback did not run");
+            assert!(synchronous >= 0 && asynchronous >= 0, "the synthetic Control key must already be released");
+            assert!(!capture.keys.iter().any(|key| *key));
+        }
         Ok(())
     }
 
@@ -1929,6 +2150,9 @@ mod tests {
         let second = fixture(None, (-2400, -1800), (400, 300), [30, 40, 50])?;
         let _second_capture = NativeCapture::new(second.hwnd.0 as usize)?;
         let mut state = Box::new(State {
+            key_downs: Cell::new(0),
+            key_ups: Cell::new(0),
+            focus_losses: Cell::new(0),
             color: [180, 90, 30],
             mixed_alpha: Cell::new(false),
             timer_ticks: Cell::new(0),

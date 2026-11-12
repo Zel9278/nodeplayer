@@ -475,7 +475,9 @@ impl EditorView {
         let owns_popup = self.popup_layer.is_some() && self.popup_layer == top_modal;
         let keyboard_available = editor.accepts_keyboard()
             && focused
-            && spot.is_some_and(|spot| !spot.visible.is_empty())
+            // A popup's modal backdrop can cover the entire editor, including on
+            // its first frame before egui reports it as the previous top modal.
+            && spot.is_some_and(|spot| self.popup_layer.is_some() || !spot.visible.is_empty())
             && (top_modal.is_none() || owns_popup);
         if self.keyboard_focused
             && (!keyboard_available || (!owns_popup && !self.has_keyboard_focus(context)))
@@ -700,6 +702,17 @@ impl EditorView {
             self.drag_popup = None;
         }
         if !focused || spot.is_none() {
+            if let Some(position) = self.last_position.take() {
+                editor.pointer(EditorPointer {
+                    timestamp_ms: super::pointer_timestamp_ms(),
+                    modifiers: 0,
+                    click_count: 0,
+                    position: self.native_position(screen, size, position, None),
+                    kind: PointerKind::Cancel,
+                    buttons: 0,
+                })?;
+                self.last_activity = Some(Instant::now());
+            }
             self.clicks = ClickTracker::default();
             self.modifiers = egui::Modifiers::default();
         }
@@ -953,6 +966,54 @@ mod tests {
     }
 
     #[test]
+    fn an_owned_popup_keeps_keyboard_input_when_its_modal_covers_the_editor() {
+        let context = egui::Context::default();
+        let mut views = [EditorView::default(), EditorView::default()];
+        let mut editors = [KeyboardEditor::default(), KeyboardEditor::default()];
+        keyboard_frame(&context, &mut views, &mut editors, vec![], true, true);
+        let events = click(views[0].screen.unwrap().center());
+        keyboard_frame(&context, &mut views, &mut editors, events, true, true);
+        assert_eq!(editors[0].0, [EditorKeyboard::Focus(true)]);
+
+        views[0].update_texture(&context, EditorFrame {
+            width: 1, height: 1, native_size: (200, 80), native_units_per_point: 1.0,
+            rgba: vec![255; 4],
+            popups: vec![super::super::EditorPopup {
+                origin: [0.0, 0.0], width: 1, height: 1, native_size: (200, 80),
+                rgba: vec![255; 4], interactive: true,
+            }],
+        });
+        for events in [vec![], vec![], vec![key(egui::Key::ArrowDown), key(egui::Key::M), egui::Event::Text("m".into())]] {
+            let mut output = context.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                focused: true, events, ..Default::default()
+            }, |ui| {
+                views[0].paint(ui, &mut editors[0], 1.0);
+                let screen = views[0].screen.unwrap();
+                let clip = crate::plugins::PxRect {
+                    x: screen.min.x as i32, y: screen.min.y as i32,
+                    w: screen.width() as u32, h: screen.height() as u32,
+                };
+                // The popup's modal backdrop covers all of the root image.
+                let spot = Spot { clip, origin: (clip.x, clip.y), visible: Vec::new() };
+                views[0].dispatch(&context, &mut editors[0], Some(&spot), 1.0).unwrap();
+            });
+            let has_ime = output.platform_output.ime.is_some();
+            output.textures_delta.clear();
+            assert!(has_ime, "popup focus: {:?}, keyboard events: {:?}",
+                context.memory(|memory| memory.top_modal_layer()), editors[0].0);
+        }
+        assert_eq!(editors[0].0, [EditorKeyboard::Focus(true), EditorKeyboard::Key {
+            key: egui::Key::ArrowDown, pressed: true, repeat: false, modifiers: 0,
+            text: None,
+        }, EditorKeyboard::Key {
+            key: egui::Key::M, pressed: true, repeat: false, modifiers: 0,
+            text: Some("m".into()),
+        }]);
+        assert!(context.input(|input| !input.events.iter().any(|event| keyboard_event(event).is_some())));
+    }
+
+    #[test]
     fn identical_delivery_can_idle_but_pixel_and_popup_changes_wake_repainting() {
         let context = egui::Context::default();
         let mut view = EditorView::default();
@@ -1174,6 +1235,46 @@ mod tests {
     }
 
     #[test]
+    fn focus_loss_and_hidden_graph_cancel_pointer_state_after_releasing_a_drag() {
+        use crate::plugins::PxRect;
+        for hidden in [false, true] {
+            let context = egui::Context::default();
+            let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 100.0));
+            let mut view = EditorView { screen: Some(screen), ..Default::default() };
+            view.update_texture(&context, EditorFrame {
+                width: 2, height: 1, native_size: (400, 200),
+                native_units_per_point: 1.0, rgba: vec![255; 8], popups: Vec::new(),
+            });
+            let clip = PxRect { x: 0, y: 0, w: 200, h: 100 };
+            let spot = Spot { clip, origin: (0, 0), visible: vec![clip] };
+            let mut editor = RecordingEditor(Vec::new());
+            let mut output = context.run_ui(egui::RawInput {
+                focused: true,
+                events: vec![egui::Event::PointerButton {
+                    pos: egui::pos2(20.0, 30.0), button: egui::PointerButton::Primary,
+                    pressed: true, modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            }, |ui| view.dispatch(ui.ctx(), &mut editor, Some(&spot), 1.0).unwrap());
+            output.textures_delta.clear();
+            for _ in 0..2 {
+                let mut output = context.run_ui(egui::RawInput {
+                    focused: hidden, ..Default::default()
+                }, |ui| view.dispatch(ui.ctx(), &mut editor, (!hidden).then_some(&spot), 1.0).unwrap());
+                output.textures_delta.clear();
+            }
+            assert_eq!(editor.0.len(), 3, "cancellation is delivered once per interaction");
+            assert!(matches!(editor.0[0].kind, PointerKind::Down(1)));
+            assert!(matches!(editor.0[1].kind, PointerKind::Up(1)));
+            assert!(matches!(editor.0[2].kind, PointerKind::Cancel));
+            assert_eq!(editor.0[2].buttons, 0);
+            assert!(view.last_position.is_none());
+            drop(view);
+            context.tex_manager().write().take_delta().clear();
+        }
+    }
+
+    #[test]
     fn pointer_modifiers_are_recorded_before_native_or_worker_delivery() {
         use crate::plugins::PxRect;
         let context = egui::Context::default();
@@ -1295,6 +1396,7 @@ mod tests {
             editor
                 .0
                 .iter()
+                .filter(|event| !matches!(event.kind, PointerKind::Cancel))
                 .map(|event| event.click_count)
                 .collect::<Vec<_>>(),
             [1, 1, 2, 2, 1, 1, 1, 1]
