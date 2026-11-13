@@ -449,19 +449,24 @@ mod hooks {
             }
         };
         INDIRECT.store(original, Ordering::Release);
-        if let Err(error) = unsafe { MinHook::enable_hook(direct) } {
-            let _ = unsafe { MinHook::remove_hook(direct) };
-            let _ = unsafe { MinHook::remove_hook(indirect) };
-            bail!("enable layered upload hook: {error:?}")
-        }
-        if let Err(error) = unsafe { MinHook::enable_hook(indirect) } {
-            // Never free a trampoline if disabling its live hook failed. Hooks are
-            // process-lifetime resources; no plugin's hooks are disabled or removed.
-            if unsafe { MinHook::disable_hook(direct) }.is_ok() {
-                let _ = unsafe { MinHook::remove_hook(direct) };
+        // Queue only our upload hooks so activation scans and suspends the process
+        // threads once, with both trampolines available before any callback can run.
+        let enabled = (|| -> Result<()> {
+            for address in [direct, indirect] {
+                unsafe { MinHook::queue_enable_hook(address) }
+                    .map_err(|error| anyhow!("queue layered upload hook: {error:?}"))?;
             }
-            let _ = unsafe { MinHook::remove_hook(indirect) };
-            bail!("enable indirect layered upload hook: {error:?}")
+            unsafe { MinHook::apply_queued() }
+                .map_err(|error| anyhow!("enable layered upload hooks: {error:?}"))
+        })();
+        if let Err(error) = enabled {
+            for address in [direct, indirect] {
+                let _ = unsafe { MinHook::queue_disable_hook(address) };
+            }
+            let _ = unsafe { MinHook::apply_queued() };
+            // Activation may partially succeed. Keep trampolines alive for callbacks
+            // already in flight, including if rollback fails.
+            bail!(error);
         }
         Ok(())
     }

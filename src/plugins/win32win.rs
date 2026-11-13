@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, GetFocus, ReleaseCapture, SetCapture, SetFocus,
+    GetCapture, GetFocus, GetKeyboardState, ReleaseCapture, SetCapture, SetFocus, SetKeyboardState,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, w};
@@ -89,6 +89,7 @@ pub(crate) struct CaptureInput {
     cursor: cursor::Cursor,
     capture: Cell<HWND>,
     focus: Cell<HWND>,
+    editor_focus: Cell<HWND>,
     keyboard: Cell<Option<[u8; 256]>>,
     depth: Cell<u32>,
     suppress_capture: Cell<HWND>,
@@ -102,6 +103,9 @@ pub(crate) struct CaptureInput {
 
 impl CaptureInput {
     pub(crate) fn new(root: HWND) -> Result<Rc<Self>> {
+        if let Some(input) = Self::for_window(root).filter(|input| input.root == root) {
+            return Ok(input);
+        }
         layered::initialize()?;
         cursor::initialize()?;
         let input = Rc::new(Self {
@@ -109,6 +113,7 @@ impl CaptureInput {
             cursor: cursor::Cursor::new(root),
             capture: Cell::new(HWND::default()),
             focus: Cell::new(HWND::default()),
+            editor_focus: Cell::new(HWND::default()),
             keyboard: Cell::new(None),
             depth: Cell::new(0),
             suppress_capture: Cell::new(HWND::default()),
@@ -386,6 +391,9 @@ impl CaptureInput {
     pub(crate) fn focus_window(&self, target: HWND) {
         let _physical = cursor::coordinates(false);
         if !self.owns(target) { return; }
+        if target == self.root || unsafe { IsChild(self.root, target) }.as_bool() {
+            self.editor_focus.set(target);
+        }
         let previous = self.focus.replace(target);
         if previous == target { return; }
         unsafe {
@@ -399,6 +407,7 @@ impl CaptureInput {
     }
 
     pub(crate) fn blur_editor(&self) {
+        self.editor_focus.set(HWND::default());
         let focus = self.focus.replace(HWND::default());
         if self.owns(focus) {
             // Physical focus was restored after the callback. This is the actual
@@ -431,7 +440,7 @@ impl CaptureInput {
         self.cursor.cancel();
         let _cursor = self.cursor.enter();
         let capture = self.capture.replace(HWND::default());
-        let focus = self.focus.replace(HWND::default());
+        let focus = self.focus.get();
         unsafe {
             let target = if self.owns(capture) { capture } else { focus };
             if self.owns(target) {
@@ -444,6 +453,13 @@ impl CaptureInput {
                 let _ = ReleaseCapture();
             }
         }
+        // Escape dismisses pointer ownership, but the editor still owns keyboard
+        // input. Return from a menu to the child that had focus before it opened.
+        let editor_focus = self.editor_focus.get();
+        if self.owns(editor_focus) {
+            let _scope = self.enter();
+            self.focus_window(editor_focus);
+        }
     }
 
     pub(crate) fn enter(&self) -> CaptureInputScope<'_> {
@@ -455,6 +471,7 @@ impl CaptureInput {
             _cursor: self.cursor.enter(),
             previous_capture: HWND::default(),
             previous_focus: HWND::default(),
+            previous_keyboard: None,
             temporary: Vec::new(),
             outer: depth == 0,
         };
@@ -462,6 +479,15 @@ impl CaptureInput {
             return scope;
         }
         unsafe {
+            // Deferred timers and helper windows run after the forwarded event
+            // restored the host table. Give their synchronous key queries the
+            // same logical state as GetAsyncKeyState for this callback's scope.
+            if let Some(keys) = self.keyboard.get() {
+                let mut previous = [0; 256];
+                if GetKeyboardState(&mut previous).is_ok() && SetKeyboardState(&keys).is_ok() {
+                    scope.previous_keyboard = Some(previous);
+                }
+            }
             scope.previous_capture = GetCapture();
             scope.previous_focus = GetFocus();
             self.returning_capture.set(scope.previous_capture);
@@ -488,6 +514,7 @@ pub(crate) struct CaptureInputScope<'a> {
     _cursor: cursor::Scope<'a>,
     previous_capture: HWND,
     previous_focus: HWND,
+    previous_keyboard: Option<[u8; 256]>,
     temporary: Vec<HWND>,
     outer: bool,
 }
@@ -515,6 +542,9 @@ impl Drop for CaptureInputScope<'_> {
                 if input.owns(focused) {
                     if focused != self.previous_focus || input.focus_target().is_none() {
                         input.focus.set(focused);
+                        if focused == input.root || IsChild(input.root, focused).as_bool() {
+                            input.editor_focus.set(focused);
+                        }
                     }
                     input.suppress_focus.set(focused);
                     let _ = SetFocus(self.previous_focus);
@@ -523,6 +553,9 @@ impl Drop for CaptureInputScope<'_> {
                 let ptr = input as *const CaptureInput as usize;
                 for hwnd in &self.temporary {
                     let _ = RemoveWindowSubclass(*hwnd, Some(capture_input_proc), ptr);
+                }
+                if let Some(keys) = &self.previous_keyboard {
+                    let _ = SetKeyboardState(keys);
                 }
             }
             input.returning_capture.set(HWND::default());
@@ -614,6 +647,19 @@ unsafe extern "system" fn capture_input_proc(
             input.capture.set(HWND::default());
         }
     }
+    if message == WM_SETFOCUS && input.owns(hwnd) {
+        if input.depth.get() != 0 && !input.suppress_focus.get().0.is_null()
+            && hwnd == input.returning_focus.get()
+        {
+            // Restoring physical focus at callback exit is not a logical
+            // navigation back to the previous editor control.
+            return LRESULT(0);
+        }
+        input.focus.set(hwnd);
+        if hwnd == input.root || unsafe { IsChild(input.root, hwnd) }.as_bool() {
+            input.editor_focus.set(hwnd);
+        }
+    }
     if message == WM_CANCELMODE && input.owns(hwnd) {
         input.capture.set(HWND::default());
     }
@@ -624,6 +670,9 @@ unsafe extern "system" fn capture_input_proc(
         }
         if input.focus.get() == hwnd {
             input.focus.set(HWND::default());
+        }
+        if input.editor_focus.get() == hwnd {
+            input.editor_focus.set(HWND::default());
         }
         input
             .popup_origins
@@ -724,6 +773,7 @@ impl Drop for CaptureInput {
         unsafe {
             let _ = UnhookWindowsHookEx(self.creation_hook.get());
         }
+        self.blur_editor();
         self.cancel();
         let ptr = self as *const Self as usize;
         for hwnd in self.hooks.get_mut().drain(..) {
@@ -802,6 +852,8 @@ struct State {
 pub struct HostWindow {
     /// The window handed to the plugin.
     id: HWND,
+    // Attach before the plugin creates children, including their monitor/clock setup.
+    _capture_input: Option<Rc<CaptureInput>>,
     /// Clipping parent of `id` when embedded.
     container: Option<HWND>,
     pub placement: Placement,
@@ -982,13 +1034,17 @@ impl HostWindow {
             // Messages before this (creation) go to DefWindowProc.
             SetWindowLongPtrW(id, GWLP_USERDATA, &*state as *const State as isize);
         }
-        let win = Self {
+        let mut win = Self {
             id,
+            _capture_input: None,
             container,
             placement,
             shown: RefCell::new(None),
             state,
         };
+        if placement == Placement::CaptureSource {
+            win._capture_input = Some(CaptureInput::new(id)?);
+        }
         if container.is_none() {
             // The window was created with the client size as its outer size.
             win.resize(w, h);

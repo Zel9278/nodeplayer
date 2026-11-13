@@ -2263,7 +2263,13 @@ impl App {
         // Each level keeps its own pan, zoom and selection.
         let salt = egui::Id::new("graph").with(self.group_path());
         // The graph pans on the wheel before node bodies see it, so take it out first.
-        let scroll = if self.capture_scroll {
+        let capture_scroll = self.capture_scroll || self.snarl.nodes().any(|node| {
+            matches!(&node.kind, NodeKind::Plugin(plugin)
+                if plugin.is_embedded()
+                    && plugin.editor.as_ref().is_some_and(|editor| editor.is_captured())
+                    && plugin.editor_view.captures_scroll(ui.ctx()))
+        });
+        let scroll = if capture_scroll {
             ui.ctx().input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta))
         } else {
             egui::Vec2::ZERO
@@ -2300,6 +2306,12 @@ impl App {
         let mut style = self.style;
         if !std::mem::replace(&mut self.graph_shown, true) {
             style.max_scale = Some(1.0);
+        }
+        if capture_scroll {
+            // Ctrl+Alt wheel is still plugin input. egui keeps its zoom delta
+            // separately from the scroll delta removed above.
+            style.min_scale = Some(self.zoom);
+            style.max_scale = Some(self.zoom);
         }
         let response = SnarlWidget::new().id_salt(salt).style(style).show(&mut self.snarl, &mut viewer, ui);
         self.fit_zoom = response.double_clicked();
@@ -3547,9 +3559,6 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                     };
                     let xf = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or_default();
                     let rect = editor_view.paint(ui, ed.as_mut(), ppp);
-                    if ui.ctx().input(|input| input.modifiers.alt) && ui.ctx().pointer_latest_pos().is_some_and(|point| (xf * rect).contains(point)) {
-                        self.wants_scroll = true;
-                    }
                     let screen = xf * rect;
                     let clip = (xf * ui.clip_rect()).intersect(screen);
                     if clip.is_positive() {

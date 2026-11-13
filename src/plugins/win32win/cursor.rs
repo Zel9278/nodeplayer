@@ -126,6 +126,7 @@ mod hooks {
     type Convert = unsafe extern "system" fn(HWND, *mut POINT) -> BOOL;
     type Map = unsafe extern "system" fn(HWND, HWND, *mut POINT, u32) -> i32;
     type WindowAt = unsafe extern "system" fn(POINT) -> HWND;
+    type Monitor = unsafe extern "system" fn(HWND, u32) -> windows::Win32::Graphics::Gdi::HMONITOR;
     static GET: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static PHYSICAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static SET: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -139,6 +140,7 @@ mod hooks {
     static FROM_SCREEN: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static MAP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static AT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static MONITOR: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static INSTALLED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
     pub(super) fn initialize() -> Result<()> {
@@ -210,6 +212,7 @@ mod hooks {
                 window_at as *const () as *mut c_void,
                 &AT,
             ),
+            (b"MonitorFromWindow\0".as_slice(), monitor as *const () as *mut c_void, &MONITOR),
         ] {
             let result = (|| -> Result<()> {
                 let address = unsafe { GetProcAddress(module, PCSTR(name.as_ptr())) }
@@ -235,19 +238,35 @@ mod hooks {
                         )
                     })?;
                 original.store(trampoline, Ordering::Release);
-                unsafe { MinHook::enable_hook(address) }
-                    .map_err(|error| anyhow!("enable editor cursor API hook: {error:?}"))?;
                 installed.push((address, trampoline));
                 Ok(())
             })();
             if let Err(error) = result {
                 for (address, _) in installed {
-                    let _ = unsafe { MinHook::disable_hook(address) };
+                    let _ = unsafe { MinHook::remove_hook(address) };
                 }
-                // Hooks and trampolines live until process exit. Another thread may
-                // already be returning through one even after it has been disabled.
                 bail!(error);
             }
+        }
+        // Enabling each hook separately repeats MinHook's process-wide thread scan
+        // and suspension. On busy machines that exceeds the worker's reply deadline.
+        // Publish every trampoline first, then activate only these hooks in one pass.
+        let enabled = (|| -> Result<()> {
+            for &(address, _) in &installed {
+                unsafe { MinHook::queue_enable_hook(address) }
+                    .map_err(|error| anyhow!("queue editor cursor API hook: {error:?}"))?;
+            }
+            unsafe { MinHook::apply_queued() }
+                .map_err(|error| anyhow!("enable editor cursor API hooks: {error:?}"))
+        })();
+        if let Err(error) = enabled {
+            for &(address, _) in &installed {
+                let _ = unsafe { MinHook::queue_disable_hook(address) };
+            }
+            let _ = unsafe { MinHook::apply_queued() };
+            // An activation can partially succeed. Retain its trampolines for any
+            // callbacks already in flight, even after disabling the hooks.
+            bail!(error);
         }
         Ok(())
     }
@@ -429,5 +448,20 @@ mod hooks {
         }
         let original: WindowAt = unsafe { std::mem::transmute(AT.load(Ordering::Acquire)) };
         unsafe { original(point) }
+    }
+
+    unsafe extern "system" fn monitor(hwnd: HWND, flags: u32) -> windows::Win32::Graphics::Gdi::HMONITOR {
+        use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTONEAREST};
+        let original: Monitor = unsafe { std::mem::transmute(MONITOR.load(Ordering::Acquire)) };
+        let actual = unsafe { original(hwnd, flags) };
+        if actual.0.is_null() && flags == MONITOR_DEFAULTTONULL.0
+            && super::super::CaptureInput::for_window(hwnd).is_some()
+        {
+            // JUCE unregisters its VBlank redraw listener when its HWND has no
+            // monitor. The private source is mapped offscreen, but still needs
+            // the nearest display's clock, including during child construction.
+            return unsafe { original(hwnd, MONITOR_DEFAULTTONEAREST.0) };
+        }
+        actual
     }
 }
