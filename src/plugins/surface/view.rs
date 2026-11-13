@@ -14,6 +14,8 @@ pub struct EditorView {
     native_size: Option<(u32, u32)>,
     native_units_per_point: Option<f32>,
     screen: Option<Rect>,
+    wheel_visible: Vec<Rect>,
+    wheel_owned: bool,
     buttons: u8,
     modifiers: egui::Modifiers,
     last_position: Option<Pos2>,
@@ -183,6 +185,32 @@ pub struct EditorFrameStats {
 }
 
 impl EditorView {
+    /// Decide before the graph handles this frame's pan/zoom input.
+    pub fn captures_scroll(&self, context: &egui::Context) -> bool {
+        let (focused, scrolling, wheel, alt) = context.input(|input| (
+            input.focused,
+            input.is_scrolling(),
+            input.events.iter().any(|event| matches!(event, egui::Event::MouseWheel { .. })),
+            input.events.iter().any(|event| {
+                matches!(event, egui::Event::MouseWheel { modifiers, .. } if modifiers.alt)
+            }),
+        ));
+        if !focused { return false; }
+        // egui smooths a wheel notch over later frames. Keep its remainder with
+        // the editor even after Alt is released or the pointer moves away.
+        if !wheel { return self.wheel_owned && scrolling; }
+        let Some(position) = context.pointer_latest_pos() else { return false };
+        let top_modal = context.memory(|memory| memory.top_modal_layer());
+        if self.popup_layer.is_some() && self.popup_layer == top_modal {
+            return self.popup_rects.iter().enumerate().any(|(index, rect)| {
+                self.popups[index].interactive && rect.contains(position)
+            });
+        }
+        alt && top_modal.is_none()
+            && self.screen.is_some_and(|screen| screen.contains(position))
+            && self.wheel_visible.iter().any(|rect| rect.contains(position))
+    }
+
     pub fn has_keyboard_focus(&self, context: &egui::Context) -> bool {
         self.keyboard_focused
             && self.focus_id.is_some_and(|id| context.memory(|memory| memory.has_focus(id)))
@@ -470,12 +498,23 @@ impl EditorView {
         spot: Option<&Spot>,
         native_units_per_point: f32,
     ) -> Result<()> {
+        self.wheel_owned &= context.input(|input| input.is_scrolling()
+            && !input.events.iter().any(|event| matches!(event, egui::Event::MouseWheel { .. })));
+        self.wheel_visible.clear();
+        if let Some(spot) = spot {
+            self.wheel_visible.extend(spot.visible.iter().map(|rect| Rect::from_min_size(
+                egui::pos2(rect.x as f32, rect.y as f32) / native_units_per_point,
+                egui::vec2(rect.w as f32, rect.h as f32) / native_units_per_point,
+            )));
+        }
         let focused = context.input(|input| input.focused);
         let top_modal = context.memory(|memory| memory.top_modal_layer());
         let owns_popup = self.popup_layer.is_some() && self.popup_layer == top_modal;
         let keyboard_available = editor.accepts_keyboard()
             && focused
-            && spot.is_some_and(|spot| !spot.visible.is_empty())
+            // A popup's modal backdrop can cover the entire editor, including on
+            // its first frame before egui reports it as the previous top modal.
+            && spot.is_some_and(|spot| self.popup_layer.is_some() || !spot.visible.is_empty())
             && (top_modal.is_none() || owns_popup);
         if self.keyboard_focused
             && (!keyboard_available || (!owns_popup && !self.has_keyboard_focus(context)))
@@ -652,6 +691,7 @@ impl EditorView {
                 kind,
                 buttons: next_buttons,
             })?;
+            self.wheel_owned |= matches!(kind, PointerKind::Wheel { .. });
             self.buttons = next_buttons;
             if self.buttons == 0 {
                 self.drag_popup = None;
@@ -700,6 +740,17 @@ impl EditorView {
             self.drag_popup = None;
         }
         if !focused || spot.is_none() {
+            if let Some(position) = self.last_position.take() {
+                editor.pointer(EditorPointer {
+                    timestamp_ms: super::pointer_timestamp_ms(),
+                    modifiers: 0,
+                    click_count: 0,
+                    position: self.native_position(screen, size, position, None),
+                    kind: PointerKind::Cancel,
+                    buttons: 0,
+                })?;
+                self.last_activity = Some(Instant::now());
+            }
             self.clicks = ClickTracker::default();
             self.modifiers = egui::Modifiers::default();
         }
@@ -953,6 +1004,54 @@ mod tests {
     }
 
     #[test]
+    fn an_owned_popup_keeps_keyboard_input_when_its_modal_covers_the_editor() {
+        let context = egui::Context::default();
+        let mut views = [EditorView::default(), EditorView::default()];
+        let mut editors = [KeyboardEditor::default(), KeyboardEditor::default()];
+        keyboard_frame(&context, &mut views, &mut editors, vec![], true, true);
+        let events = click(views[0].screen.unwrap().center());
+        keyboard_frame(&context, &mut views, &mut editors, events, true, true);
+        assert_eq!(editors[0].0, [EditorKeyboard::Focus(true)]);
+
+        views[0].update_texture(&context, EditorFrame {
+            width: 1, height: 1, native_size: (200, 80), native_units_per_point: 1.0,
+            rgba: vec![255; 4],
+            popups: vec![super::super::EditorPopup {
+                origin: [0.0, 0.0], width: 1, height: 1, native_size: (200, 80),
+                rgba: vec![255; 4], interactive: true,
+            }],
+        });
+        for events in [vec![], vec![], vec![key(egui::Key::ArrowDown), key(egui::Key::M), egui::Event::Text("m".into())]] {
+            let mut output = context.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                focused: true, events, ..Default::default()
+            }, |ui| {
+                views[0].paint(ui, &mut editors[0], 1.0);
+                let screen = views[0].screen.unwrap();
+                let clip = crate::plugins::PxRect {
+                    x: screen.min.x as i32, y: screen.min.y as i32,
+                    w: screen.width() as u32, h: screen.height() as u32,
+                };
+                // The popup's modal backdrop covers all of the root image.
+                let spot = Spot { clip, origin: (clip.x, clip.y), visible: Vec::new() };
+                views[0].dispatch(&context, &mut editors[0], Some(&spot), 1.0).unwrap();
+            });
+            let has_ime = output.platform_output.ime.is_some();
+            output.textures_delta.clear();
+            assert!(has_ime, "popup focus: {:?}, keyboard events: {:?}",
+                context.memory(|memory| memory.top_modal_layer()), editors[0].0);
+        }
+        assert_eq!(editors[0].0, [EditorKeyboard::Focus(true), EditorKeyboard::Key {
+            key: egui::Key::ArrowDown, pressed: true, repeat: false, modifiers: 0,
+            text: None,
+        }, EditorKeyboard::Key {
+            key: egui::Key::M, pressed: true, repeat: false, modifiers: 0,
+            text: Some("m".into()),
+        }]);
+        assert!(context.input(|input| !input.events.iter().any(|event| keyboard_event(event).is_some())));
+    }
+
+    #[test]
     fn identical_delivery_can_idle_but_pixel_and_popup_changes_wake_repainting() {
         let context = egui::Context::default();
         let mut view = EditorView::default();
@@ -1174,6 +1273,112 @@ mod tests {
     }
 
     #[test]
+    fn first_alt_wheel_reaches_the_editor_without_also_panning_the_scene() {
+        use crate::plugins::PxRect;
+        let run = |claim_scroll, later_graph_wheel, control| {
+            let context = egui::Context::default();
+            let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 100.0));
+            let mut view = EditorView { screen: Some(screen), ..Default::default() };
+            view.update_texture(&context, EditorFrame {
+                width: 2, height: 1, native_size: (400, 200),
+                native_units_per_point: 1.0, rgba: vec![255; 8], popups: Vec::new(),
+            });
+            let clip = PxRect { x: 0, y: 0, w: 200, h: 100 };
+            let spot = Spot { clip, origin: (0, 0), visible: vec![clip] };
+            let mut editor = RecordingEditor(Vec::new());
+            let mut transform = egui::emath::TSTransform::IDENTITY;
+            for frame in 0..12 {
+                let wheel = frame == 1;
+                let graph_wheel = later_graph_wheel && frame == 4;
+                let modifiers = egui::Modifiers { alt: wheel, ctrl: control && wheel, ..Default::default() };
+                let mut events = vec![egui::Event::ModifiersChanged(modifiers),
+                    egui::Event::PointerMoved(if frame < 2 {
+                        egui::pos2(20.0, 30.0)
+                    } else {
+                        // The plugin's wheel must not pan the graph after the
+                        // user releases Alt and moves off the editor image.
+                        egui::pos2(400.0, 300.0)
+                    })];
+                if wheel || graph_wheel {
+                    events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -32.0),
+                        phase: egui::TouchPhase::Move, modifiers,
+                    });
+                }
+                let mut output = context.run_ui(egui::RawInput {
+                    focused: true, events,
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                    ..Default::default()
+                }, |ui| {
+                    let claimed = claim_scroll && view.captures_scroll(ui.ctx());
+                    if claimed {
+                        ui.ctx().input_mut(|input| input.smooth_scroll_delta = egui::Vec2::ZERO);
+                    }
+                    let graph = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+                    let mut response = ui.interact(graph, egui::Id::new("graph scene"), egui::Sense::click_and_drag());
+                    let scene = if claimed {
+                        egui::Scene::new().zoom_range(transform.scaling..=transform.scaling)
+                    } else {
+                        egui::Scene::new()
+                    };
+                    scene.register_pan_and_zoom(ui, &mut response, &mut transform);
+                    view.dispatch(ui.ctx(), &mut editor, Some(&spot), 1.0).unwrap();
+                });
+                output.textures_delta.clear();
+            }
+            assert_eq!(editor.0.iter().filter(|event| matches!(event.kind, PointerKind::Wheel { .. })).count(), 1);
+            drop(view);
+            context.tex_manager().write().take_delta().clear();
+            transform
+        };
+        for control in [false, true] {
+            assert_ne!(run(false, false, control), egui::emath::TSTransform::IDENTITY, "the unchecked first wheel pans or zooms the graph");
+            assert_eq!(run(true, false, control), egui::emath::TSTransform::IDENTITY);
+            assert_ne!(run(true, true, control), egui::emath::TSTransform::IDENTITY, "a fresh graph wheel must still pan normally");
+        }
+    }
+
+    #[test]
+    fn focus_loss_and_hidden_graph_cancel_pointer_state_after_releasing_a_drag() {
+        use crate::plugins::PxRect;
+        for hidden in [false, true] {
+            let context = egui::Context::default();
+            let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 100.0));
+            let mut view = EditorView { screen: Some(screen), ..Default::default() };
+            view.update_texture(&context, EditorFrame {
+                width: 2, height: 1, native_size: (400, 200),
+                native_units_per_point: 1.0, rgba: vec![255; 8], popups: Vec::new(),
+            });
+            let clip = PxRect { x: 0, y: 0, w: 200, h: 100 };
+            let spot = Spot { clip, origin: (0, 0), visible: vec![clip] };
+            let mut editor = RecordingEditor(Vec::new());
+            let mut output = context.run_ui(egui::RawInput {
+                focused: true,
+                events: vec![egui::Event::PointerButton {
+                    pos: egui::pos2(20.0, 30.0), button: egui::PointerButton::Primary,
+                    pressed: true, modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            }, |ui| view.dispatch(ui.ctx(), &mut editor, Some(&spot), 1.0).unwrap());
+            output.textures_delta.clear();
+            for _ in 0..2 {
+                let mut output = context.run_ui(egui::RawInput {
+                    focused: hidden, ..Default::default()
+                }, |ui| view.dispatch(ui.ctx(), &mut editor, (!hidden).then_some(&spot), 1.0).unwrap());
+                output.textures_delta.clear();
+            }
+            assert_eq!(editor.0.len(), 3, "cancellation is delivered once per interaction");
+            assert!(matches!(editor.0[0].kind, PointerKind::Down(1)));
+            assert!(matches!(editor.0[1].kind, PointerKind::Up(1)));
+            assert!(matches!(editor.0[2].kind, PointerKind::Cancel));
+            assert_eq!(editor.0[2].buttons, 0);
+            assert!(view.last_position.is_none());
+            drop(view);
+            context.tex_manager().write().take_delta().clear();
+        }
+    }
+
+    #[test]
     fn pointer_modifiers_are_recorded_before_native_or_worker_delivery() {
         use crate::plugins::PxRect;
         let context = egui::Context::default();
@@ -1295,6 +1500,7 @@ mod tests {
             editor
                 .0
                 .iter()
+                .filter(|event| !matches!(event.kind, PointerKind::Cancel))
                 .map(|event| event.click_count)
                 .collect::<Vec<_>>(),
             [1, 1, 2, 2, 1, 1, 1, 1]

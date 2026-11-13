@@ -126,6 +126,7 @@ mod hooks {
     type Convert = unsafe extern "system" fn(HWND, *mut POINT) -> BOOL;
     type Map = unsafe extern "system" fn(HWND, HWND, *mut POINT, u32) -> i32;
     type WindowAt = unsafe extern "system" fn(POINT) -> HWND;
+    type Monitor = unsafe extern "system" fn(HWND, u32) -> windows::Win32::Graphics::Gdi::HMONITOR;
     static GET: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static PHYSICAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static SET: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -139,6 +140,7 @@ mod hooks {
     static FROM_SCREEN: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static MAP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static AT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static MONITOR: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static INSTALLED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
     pub(super) fn initialize() -> Result<()> {
@@ -210,6 +212,7 @@ mod hooks {
                 window_at as *const () as *mut c_void,
                 &AT,
             ),
+            (b"MonitorFromWindow\0".as_slice(), monitor as *const () as *mut c_void, &MONITOR),
         ] {
             let result = (|| -> Result<()> {
                 let address = unsafe { GetProcAddress(module, PCSTR(name.as_ptr())) }
@@ -445,5 +448,20 @@ mod hooks {
         }
         let original: WindowAt = unsafe { std::mem::transmute(AT.load(Ordering::Acquire)) };
         unsafe { original(point) }
+    }
+
+    unsafe extern "system" fn monitor(hwnd: HWND, flags: u32) -> windows::Win32::Graphics::Gdi::HMONITOR {
+        use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTONEAREST};
+        let original: Monitor = unsafe { std::mem::transmute(MONITOR.load(Ordering::Acquire)) };
+        let actual = unsafe { original(hwnd, flags) };
+        if actual.0.is_null() && flags == MONITOR_DEFAULTTONULL.0
+            && super::super::CaptureInput::for_window(hwnd).is_some()
+        {
+            // JUCE unregisters its VBlank redraw listener when its HWND has no
+            // monitor. The private source is mapped offscreen, but still needs
+            // the nearest display's clock, including during child construction.
+            return unsafe { original(hwnd, MONITOR_DEFAULTTONEAREST.0) };
+        }
+        actual
     }
 }
