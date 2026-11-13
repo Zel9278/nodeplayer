@@ -59,7 +59,8 @@ Scaling uses the latest image immediately, independently of the plugin's drawing
 Menus, windows, tooltips and nodes in front of an editor show over it, and clicks there
 go to them. A private native host keeps the editor rendering without opening
 a second desktop window. Closing the graph editor also destroys its native host.
-Clicks and drags are forwarded to the source, and Alt+wheel forwards wheel input.
+Clicks and drags are forwarded to the source, and Alt+wheel forwards wheel input
+without panning or zooming the graph.
 Pointer events retain Shift, Control and Alt/Option state for modified and fine drags.
 On macOS and Windows, double-clicks follow the system's timing settings.
 On macOS and Windows, attached or owned popup windows appear over the graph and accept pointer input,
