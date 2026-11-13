@@ -59,7 +59,8 @@ Scaling uses the latest image immediately, independently of the plugin's drawing
 Menus, windows, tooltips and nodes in front of an editor show over it, and clicks there
 go to them. A private native host keeps the editor rendering without opening
 a second desktop window. Closing the graph editor also destroys its native host.
-Clicks and drags are forwarded to the source, and Alt+wheel forwards wheel input.
+Clicks and drags are forwarded to the source, and Alt+wheel forwards wheel input
+without panning or zooming the graph.
 Pointer events retain Shift, Control and Alt/Option state for modified and fine drags.
 On macOS and Windows, double-clicks follow the system's timing settings.
 On macOS and Windows, attached or owned popup windows appear over the graph and accept pointer input,
@@ -68,8 +69,9 @@ On macOS, Metal popup windows also use drawable capture, including reused menus.
 Windows layered menus retain their uploaded pixels and transparency in the graph.
 On Windows, click the editor to type into it. Text, editing keys, and clipboard
 shortcuts go to that editor until you click elsewhere or hide the graph. Space stays
-with the focused editor. Committed IME text is forwarded, but composition text is
-not drawn inside the editor image.
+with the focused editor. Popup menus retain keyboard input, and dismissing a popup
+returns focus to the editor's previous control. Committed IME text is forwarded,
+but composition text is not drawn inside the editor image.
 Keyboard input on macOS and Linux, drag-and-drop, blocking native menus, and unrelated
 popup windows are not forwarded. Use **Pop out** for those interactions. Capture can
 fail for some GPU-rendered editors. Capture and native input stay in the worker under
