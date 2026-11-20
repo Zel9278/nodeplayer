@@ -30,9 +30,44 @@ struct AudioControl {
     gate: AtomicU32,
 }
 enum AudioMessage {
-    Replace(Box<dyn Processor>),
+    Replace(PreparedAudio),
     Stop,
 }
+/// Constructed on the plugin control thread, including all bus buffers.
+struct PreparedAudio {
+    proc: Box<dyn Processor>,
+    inputs: Vec<StereoBuf>,
+    outputs: Vec<StereoBuf>,
+    input_layout: shared::WireAudioLayout,
+    output_layout: shared::WireAudioLayout,
+    input_midi: Vec<MidiEvent>,
+    output_midi: MidiBuf,
+}
+
+impl PreparedAudio {
+    fn new(proc: Box<dyn Processor>) -> Result<Self> {
+        let ports = proc.audio_ports().unwrap_or_default();
+        ports.validate()?;
+        Ok(Self {
+            proc,
+            inputs: ports
+                .inputs
+                .iter()
+                .map(|port| StereoBuf::with_channels(port.channels))
+                .collect(),
+            outputs: ports
+                .outputs
+                .iter()
+                .map(|port| StereoBuf::with_channels(port.channels))
+                .collect(),
+            input_layout: shared::WireAudioLayout::new(&ports.inputs),
+            output_layout: shared::WireAudioLayout::new(&ports.outputs),
+            input_midi: Vec::with_capacity(shared::MIDI),
+            output_midi: MidiBuf::new(),
+        })
+    }
+}
+
 struct AudioOwner {
     handle: Option<std::thread::JoinHandle<()>>,
     ctl: Arc<AudioControl>,
@@ -156,9 +191,10 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
     let (audio_tx, audio_rx) = crossbeam_channel::bounded(2);
     let audio_ctl = ctl.clone();
     let audio_map = map.clone();
+    let prepared_audio = PreparedAudio::new(created.processor)?;
     let audio = std::thread::Builder::new()
         .name("isolated-audio".into())
-        .spawn(move || audio_loop(created.processor, audio_map, audio_ctl, audio_rx))?;
+        .spawn(move || audio_loop(prepared_audio, audio_map, audio_ctl, audio_rx))?;
     // Declared after instance: audio joins/deactivates before Instance unloads plugin code.
     let _audio_owner = AudioOwner {
         handle: Some(audio),
@@ -258,7 +294,10 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                         let loaded = instance.load_state(&data);
                         let proc = instance.restart(init.sr as f64, crate::engine::MAX_BLOCK)?;
                         audio_tx
-                            .send_timeout(AudioMessage::Replace(proc), Duration::from_secs(1))
+                            .send_timeout(
+                                AudioMessage::Replace(PreparedAudio::new(proc)?),
+                                Duration::from_secs(1),
+                            )
                             .map_err(|_| {
                                 anyhow::anyhow!("child audio replacement queue timeout")
                             })?;
@@ -380,11 +419,20 @@ fn worker_main_inner(args: &[OsString]) -> Result<()> {
                 let restart = instance.wants_restart();
                 if restart {
                     park(&ctl, true)?;
-                    // A warm activation retains the plugin state and its sample timeline.
-                    // Keep queued bridge audio; only destructive Load invalidates an epoch.
+                    // Latency-only reactivation retains queued audio. A changed bus shape
+                    // is an epoch boundary, so old channels cannot become another bus.
                     let proc = instance.restart(init.sr as f64, crate::engine::MAX_BLOCK)?;
+                    if !super::same_audio_topology(
+                        &metadata_cache.audio_ports,
+                        &instance.audio_ports(),
+                    ) {
+                        map.invalidate();
+                    }
                     audio_tx
-                        .send_timeout(AudioMessage::Replace(proc), Duration::from_secs(1))
+                        .send_timeout(
+                            AudioMessage::Replace(PreparedAudio::new(proc)?),
+                            Duration::from_secs(1),
+                        )
                         .map_err(|_| anyhow::anyhow!("child audio replacement queue timeout"))?;
                     resume(&ctl)?;
                 }
@@ -511,6 +559,7 @@ fn metadata_changed(
     if i.params().len() != cached.values.len()
         || i.latency() != cached.latency
         || i.midi_ports() != cached.midi
+        || i.audio_ports() != cached.audio_ports
         || i.has_editor() != cached.editor
         || e.as_ref().is_some_and(|editor| editor.ready()) != cached.editor_open
         || e.as_ref().map(|e| e.size()).unwrap_or((640, 480)) != cached.editor_size
@@ -531,6 +580,23 @@ fn metadata(i: &dyn Instance, e: &Option<Box<dyn Editor>>, editor_id: u64) -> Re
     }
     if i.latency() as usize > MAX_LATENCY {
         bail!("plugin latency exceeds remote fallback budget")
+    }
+    let mut audio_ports = i.audio_ports();
+    audio_ports.validate()?;
+    for port in audio_ports
+        .inputs
+        .iter_mut()
+        .chain(&mut audio_ports.outputs)
+    {
+        truncate(&mut port.name, 4096);
+        if port.id.len() > 4096
+            || port
+                .layout
+                .as_ref()
+                .is_some_and(|layout| layout.len() > 4096)
+        {
+            bail!("audio bus descriptor exceeds remote limit");
+        }
     }
     let mut params = i.params().to_vec();
     for p in &mut params {
@@ -558,6 +624,7 @@ fn metadata(i: &dyn Instance, e: &Option<Box<dyn Editor>>, editor_id: u64) -> Re
         .and_then(|e| e.first_capture_error())
         .map(|error| error.chars().take(1024).collect());
     Ok(Metadata {
+        audio_ports,
         params,
         values,
         latency: i.latency(),
@@ -603,20 +670,16 @@ fn park(c: &AudioControl, flush_pending: bool) -> Result<()> {
     Ok(())
 }
 fn audio_loop(
-    mut proc: Box<dyn Processor>,
+    mut audio: PreparedAudio,
     map: Arc<Shared>,
     ctl: Arc<AudioControl>,
     rx: crossbeam_channel::Receiver<AudioMessage>,
 ) {
-    let mut inputs = vec![StereoBuf::new()];
-    let mut outputs = vec![StereoBuf::new()];
-    let mut input_midi = Vec::with_capacity(shared::MIDI);
-    let mut output_midi = MidiBuf::new();
     let mut stopped = false;
     loop {
         if ctl.stop.load(Ordering::Acquire) {
             if !stopped {
-                proc.deactivate();
+                audio.proc.deactivate();
             }
             return;
         }
@@ -625,15 +688,15 @@ fn audio_loop(
                 if ctl.gate.swap(0, Ordering::AcqRel) != 0 {
                     // Consume active parameter changes on their legal thread without
                     // inventing input samples or advancing/overlapping process clocks.
-                    proc.flush_params();
+                    audio.proc.flush_params();
                 }
-                proc.deactivate();
+                audio.proc.deactivate();
                 stopped = true;
             }
             ctl.parked.store(true, Ordering::Release);
             match rx.recv_timeout(Duration::from_millis(2)) {
                 Ok(AudioMessage::Replace(next)) => {
-                    proc = next;
+                    audio = next;
                     stopped = false;
                     while ctl.park.load(Ordering::Acquire) && !ctl.stop.load(Ordering::Acquire) {
                         std::thread::sleep(Duration::from_micros(250));
@@ -681,32 +744,55 @@ fn audio_loop(
                     ctl.failed.store(true, Ordering::Release);
                     return;
                 };
-                inputs[0].l[..Q].copy_from_slice(&p.left);
-                inputs[0].r[..Q].copy_from_slice(&p.right);
-                outputs[0].clear(Q);
-                input_midi.clear();
-                output_midi.clear();
+                if !p.input_layout.valid() || !p.output_layout.valid() {
+                    ctl.failed.store(true, Ordering::Release);
+                    return;
+                }
+                if p.input_layout != audio.input_layout || p.output_layout != audio.output_layout {
+                    // Parent has not yet adopted a newly reported plugin topology.
+                    slot.state.store(shared::FREE, Ordering::Release);
+                    continue;
+                }
+                let mut channel = 0;
+                for bus in &mut audio.inputs {
+                    for index in 0..bus.channels() {
+                        bus.channel_mut(index)[..Q].copy_from_slice(p.channel(channel));
+                        channel += 1;
+                    }
+                }
+                for bus in &mut audio.outputs {
+                    bus.clear(Q);
+                }
+                audio.input_midi.clear();
+                audio.output_midi.clear();
                 for e in &p.midi[..p.midi_count as usize] {
                     if (e.offset as usize) < Q {
-                        input_midi.push(MidiEvent {
+                        audio.input_midi.push(MidiEvent {
                             time: e.offset,
                             data: e.data,
                         });
                     }
                 }
-                proc.set_transport(transport);
-                proc.process_timed(
+                audio.proc.set_transport(transport);
+                audio.proc.process_timed(
                     p.first_sample,
                     Q,
-                    &mut inputs,
-                    &mut outputs,
-                    &input_midi,
-                    &mut output_midi,
+                    &mut audio.inputs,
+                    &mut audio.outputs,
+                    &audio.input_midi,
+                    &mut audio.output_midi,
                 );
-                p.left.copy_from_slice(&outputs[0].l[..Q]);
-                p.right.copy_from_slice(&outputs[0].r[..Q]);
+                let mut channel = 0;
+                for bus in &audio.outputs {
+                    for index in 0..bus.channels() {
+                        p.channel_mut(channel)
+                            .copy_from_slice(&bus.channel(index)[..Q]);
+                        channel += 1;
+                    }
+                }
                 let mut count = 0;
-                for e in output_midi
+                for e in audio
+                    .output_midi
                     .events()
                     .iter()
                     .filter(|e| (e.time as usize) < Q)
@@ -901,11 +987,28 @@ mod tests {
                 ..Default::default()
             };
             anyhow::ensure!(RegisterClassW(&class) != 0, "register pump test window");
-            let window = Window(CreateWindowExW(
-                WINDOW_EX_STYLE::default(), w!("NodePlayerWorkerPumpTest"), w!(""),
-                WINDOW_STYLE::default(), 0, 0, 1, 1, HWND_MESSAGE, None, instance, None,
-            )?, instance);
-            SetWindowLongPtrW(window.0, GWLP_USERDATA, (&*count as *const AtomicU32) as isize);
+            let window = Window(
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("NodePlayerWorkerPumpTest"),
+                    w!(""),
+                    WINDOW_STYLE::default(),
+                    0,
+                    0,
+                    1,
+                    1,
+                    HWND_MESSAGE,
+                    None,
+                    instance,
+                    None,
+                )?,
+                instance,
+            );
+            SetWindowLongPtrW(
+                window.0,
+                GWLP_USERDATA,
+                (&*count as *const AtomicU32) as isize,
+            );
             PostMessageW(window.0, WM_PAINT, WPARAM(0), LPARAM(0))?;
             pump_native()?;
             assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -1115,6 +1218,10 @@ mod tests {
             p.frames = Q as u32;
             p.midi_count = 0;
             p.transport = states[i].into();
+            p.input_layout =
+                shared::WireAudioLayout::new(&crate::plugins::AudioPorts::default().inputs);
+            p.output_layout =
+                shared::WireAudioLayout::new(&crate::plugins::AudioPorts::default().outputs);
             slot.state.store(INPUT, Ordering::Release);
         }
         let ctl = Arc::new(AudioControl {
@@ -1130,7 +1237,7 @@ mod tests {
         let child_ctl = ctl.clone();
         let handle = std::thread::spawn(move || {
             audio_loop(
-                Box::new(Capture(tx, Transport::default())),
+                PreparedAudio::new(Box::new(Capture(tx, Transport::default()))).unwrap(),
                 child_map,
                 child_ctl,
                 control_rx,
@@ -1145,6 +1252,91 @@ mod tests {
         for (i, received) in received.into_iter().enumerate() {
             assert_eq!(received.unwrap(), (1000 + i as u64 * Q as u64, states[i]));
         }
+    }
+
+    #[test]
+    fn audio_worker_scatters_and_gathers_every_bus_channel() {
+        use crate::plugins::{AudioPort, AudioPorts};
+        let port = |id: &str, channels, main| AudioPort {
+            id: id.into(),
+            name: id.into(),
+            channels,
+            main,
+            layout: None,
+        };
+        let ports = AudioPorts {
+            inputs: vec![port("program", 4, true), port("detector", 1, false)],
+            outputs: vec![port("processed", 4, true), port("monitor", 1, false)],
+        };
+        struct Probe(AudioPorts, crossbeam_channel::Sender<()>);
+        impl Processor for Probe {
+            fn audio_ports(&self) -> Option<AudioPorts> {
+                Some(self.0.clone())
+            }
+            fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
+                assert_eq!(inputs.len(), 2);
+                assert_eq!(outputs.len(), 2);
+                assert_eq!(inputs[0].channels(), 4);
+                assert_eq!(inputs[1].channels(), 1);
+                for channel in 0..4 {
+                    assert!(
+                        inputs[0].channel(channel)[..n]
+                            .iter()
+                            .all(|&sample| sample == channel as f32 + 1.0)
+                    );
+                    for frame in 0..n {
+                        outputs[0].channel_mut(channel)[frame] =
+                            inputs[0].channel(channel)[frame] + inputs[1].channel(0)[frame];
+                    }
+                }
+                outputs[1].channel_mut(0)[..n].copy_from_slice(&inputs[1].channel(0)[..n]);
+                self.1.send(()).unwrap();
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("nodeplayer-worker-buses-{}", std::process::id()));
+        let map = Arc::new(Shared::create(path, 1).unwrap());
+        let slot = map.slot(0);
+        let payload = unsafe { slot.payload() };
+        payload.generation = map.epoch();
+        payload.frames = Q as u32;
+        payload.input_layout = shared::WireAudioLayout::new(&ports.inputs);
+        payload.output_layout = shared::WireAudioLayout::new(&ports.outputs);
+        for channel in 0..4 {
+            payload.channel_mut(channel).fill(channel as f32 + 1.0);
+        }
+        payload.channel_mut(4).fill(0.5);
+        slot.state.store(INPUT, Ordering::Release);
+        let ctl = Arc::new(AudioControl {
+            park: AtomicBool::new(false),
+            parked: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            gate: AtomicU32::new(0),
+        });
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (_control_tx, control_rx) = crossbeam_channel::bounded(1);
+        let prepared = PreparedAudio::new(Box::new(Probe(ports, tx))).unwrap();
+        let child_map = map.clone();
+        let child_ctl = ctl.clone();
+        let handle =
+            std::thread::spawn(move || audio_loop(prepared, child_map, child_ctl, control_rx));
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        ctl.stop.store(true, Ordering::Release);
+        handle.join().unwrap();
+        result.unwrap();
+        assert!(!ctl.failed.load(Ordering::Acquire));
+        assert_eq!(slot.state.load(Ordering::Acquire), OUTPUT);
+        let payload = unsafe { slot.payload() };
+        for channel in 0..4 {
+            assert!(
+                payload
+                    .channel(channel)
+                    .iter()
+                    .all(|&sample| sample == channel as f32 + 1.5)
+            );
+        }
+        assert!(payload.channel(4).iter().all(|&sample| sample == 0.5));
     }
 
     #[test]
@@ -1201,6 +1393,10 @@ mod tests {
             payload.first_sample = sample;
             payload.frames = Q as u32;
             payload.midi_count = 0;
+            payload.input_layout =
+                shared::WireAudioLayout::new(&crate::plugins::AudioPorts::default().inputs);
+            payload.output_layout =
+                shared::WireAudioLayout::new(&crate::plugins::AudioPorts::default().outputs);
             payload.left.fill(value);
             payload.right.fill(-value);
             slot.state.store(INPUT, Ordering::Release);
@@ -1219,7 +1415,12 @@ mod tests {
         let child_ctl = ctl.clone();
         let probe = Probe(0, tx.clone());
         let handle = std::thread::spawn(move || {
-            audio_loop(Box::new(probe), child_map, child_ctl, control_rx);
+            audio_loop(
+                PreparedAudio::new(Box::new(probe)).unwrap(),
+                child_map,
+                child_ctl,
+                control_rx,
+            );
         });
         let result = (|| -> Result<Vec<Observation>> {
             let mut seen = vec![rx.recv_timeout(Duration::from_secs(2))?];
@@ -1227,7 +1428,9 @@ mod tests {
             // Actual queued audio survives parking and resumes at the next sample.
             publish(1, 1024 + Q as u64, 0.75);
             control_tx
-                .send(AudioMessage::Replace(Box::new(Probe(1, tx))))
+                .send(AudioMessage::Replace(
+                    PreparedAudio::new(Box::new(Probe(1, tx))).unwrap(),
+                ))
                 .map_err(|_| anyhow::anyhow!("worker replacement channel closed"))?;
             resume(&ctl)?;
             for _ in 0..3 {

@@ -47,6 +47,20 @@ use separate X11 editor windows when XWayland is available.
 
 ## On the node
 
+VST3 and CLAP nodes expose all reported audio input and output buses as named graph pins,
+with their channel counts. Connect a detector/sidechain input independently of the main
+input, or route an instrument's separate outputs to different processing chains. The host
+keeps the plugin's current channel arrangements and activates all VST3 audio buses. Audio
+processing and worker transport support up to 32 buses and 64 channels per direction.
+
+Bypass sends the main input to the main output. Auxiliary outputs and bypassed instruments
+are silent. Delay compensation and restart fallback preserve every channel of the main bus.
+Sessions and presets save bus identities so connections can follow reordered ports. CLAP
+uses its port IDs. VST3 uses the bus's role, name and occurrence because its bus interface
+does not provide persistent IDs. A removed or renamed VST3 bus loses its old connection.
+MIDI connections remain MIDI when the number of audio buses changes. Older stereo sessions
+continue to load.
+
 - **Editor** opens the plugin's own window (VST3 and CLAP), drawn inside the node. **Pop out**
   moves it into a window of its own.
 - **Params** opens a list of all parameters with sliders.

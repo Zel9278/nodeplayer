@@ -79,6 +79,11 @@ pub enum SavedKind {
         editor: bool,
         /// Base64 of the plugin's state.
         state: Option<String>,
+        /// Port identities allow wires to survive reordered buses and deferred worker loading.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio_ports: Option<crate::plugins::AudioPorts>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        midi_ports: Option<(bool, bool)>,
     },
     /// A graph inside a node, with its own input and output nodes.
     Group { name: String, graph: SavedGraph },
@@ -121,6 +126,8 @@ impl SavedKind {
             bypass: *bypass,
             editor: *editor,
             state,
+            audio_ports: None,
+            midi_ports: None,
         })
     }
 }

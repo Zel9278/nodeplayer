@@ -256,9 +256,68 @@ pub struct ParamDesc {
     pub read_only: bool,
 }
 
+/// One independently routable, planar audio stream. IDs are scoped to a direction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioPort {
+    pub id: String,
+    pub name: String,
+    pub channels: usize,
+    pub main: bool,
+    /// Format-specific channel arrangement, retained for inspection and restoration.
+    pub layout: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioPorts {
+    pub inputs: Vec<AudioPort>,
+    pub outputs: Vec<AudioPort>,
+}
+
+impl Default for AudioPorts {
+    fn default() -> Self {
+        let port = |name: &str| AudioPort {
+            id: "0".into(), name: name.into(), channels: 2, main: true,
+            layout: Some("stereo".into()),
+        };
+        Self { inputs: vec![port("Audio in")], outputs: vec![port("Audio out")] }
+    }
+}
+
+impl AudioPorts {
+    pub const MAX_PORTS: usize = 32;
+    pub const MAX_CHANNELS: usize = 64;
+
+    /// Display-name edits do not change sample interpretation or prepared buffer ownership.
+    pub fn same_topology(&self, other: &Self) -> bool {
+        [&self.inputs, &self.outputs].into_iter().zip([&other.inputs, &other.outputs]).all(|(a, b)| {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| {
+                a.id == b.id && a.channels == b.channels && a.main == b.main && a.layout == b.layout
+            })
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for ports in [&self.inputs, &self.outputs] {
+            anyhow::ensure!(ports.len() <= Self::MAX_PORTS, "too many plugin audio buses");
+            let mut ids = std::collections::HashSet::new();
+            let mut channels = 0usize;
+            for port in ports {
+                anyhow::ensure!(port.channels > 0 && port.channels <= Self::MAX_CHANNELS,
+                    "invalid audio bus channel count: {}", port.channels);
+                anyhow::ensure!(ids.insert(&port.id), "duplicate audio bus ID: {}", port.id);
+                channels += port.channels;
+            }
+            anyhow::ensure!(channels <= Self::MAX_CHANNELS, "too many plugin audio channels");
+        }
+        Ok(())
+    }
+}
+
 /// The UI-thread side of a plugin instance. Parameter values are normalized to 0..1.
 pub trait Instance {
     fn info(&self) -> &PluginInfo;
+    /// Current audio buses, queried only on the control/UI thread.
+    fn audio_ports(&self) -> AudioPorts { AudioPorts::default() }
     fn params(&self) -> &[ParamDesc];
     fn param_value(&self, id: u32) -> f64;
     fn param_display(&self, id: u32, value: f64) -> String;

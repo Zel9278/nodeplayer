@@ -39,7 +39,7 @@ use clap_sys::version::CLAP_VERSION;
 
 use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf, Transport};
 use crate::plugins::dylib::{self, Library};
-use crate::plugins::{self, Format, ParamDesc, Placement, PluginInfo};
+use crate::plugins::{self, AudioPort, AudioPorts, Format, ParamDesc, Placement, PluginInfo};
 
 const QUEUE_LEN: usize = 1024;
 const RESTART_QUIET_PERIOD: Duration = Duration::from_millis(200);
@@ -257,6 +257,7 @@ struct HostShared {
     callback_requested: AtomicBool,
     restart_requested: AtomicBool,
     rescan_params: AtomicBool,
+    rescan_audio_ports: AtomicU32,
     latency_changed: AtomicBool,
     /// Size the GUI asked for, as `w << 32 | h`; 0 when none is pending.
     resize_request: AtomicU64,
@@ -455,17 +456,23 @@ unsafe extern "C" fn state_dirty(_host: *const clap_host) {}
 static HOST_AUDIO_PORTS: clap_host_audio_ports =
     clap_host_audio_ports { is_rescan_flag_supported: Some(ports_flag_supported), rescan: Some(ports_rescan) };
 
-unsafe extern "C" fn ports_flag_supported(_host: *const clap_host, _flag: u32) -> bool {
-    false
+unsafe extern "C" fn ports_flag_supported(_host: *const clap_host, flag: u32) -> bool {
+    const SUPPORTED: u32 = CLAP_AUDIO_PORTS_RESCAN_NAMES | CLAP_AUDIO_PORTS_RESCAN_FLAGS
+        | CLAP_AUDIO_PORTS_RESCAN_CHANNEL_COUNT | CLAP_AUDIO_PORTS_RESCAN_PORT_TYPE
+        | CLAP_AUDIO_PORTS_RESCAN_IN_PLACE_PAIR | CLAP_AUDIO_PORTS_RESCAN_LIST;
+    flag != 0 && flag & !SUPPORTED == 0
 }
 
-unsafe extern "C" fn ports_rescan(_host: *const clap_host, _flags: u32) {
-    // Only allowed while the plugin is deactivated, i.e. during a restart, which reads the
-    // ports again anyway.
+unsafe extern "C" fn ports_rescan(host: *const clap_host, flags: u32) {
+    unsafe { shared(host) }.rescan_audio_ports.fetch_or(flags, Ordering::AcqRel);
 }
 
 static HOST_NOTE_PORTS: clap_host_note_ports =
-    clap_host_note_ports { supported_dialects: Some(note_dialects), rescan: Some(ports_rescan) };
+    clap_host_note_ports { supported_dialects: Some(note_dialects), rescan: Some(note_ports_rescan) };
+
+unsafe extern "C" fn note_ports_rescan(host: *const clap_host, _flags: u32) {
+    unsafe { shared(host) }.restart_requested.store(true, Ordering::Release);
+}
 
 unsafe extern "C" fn note_dialects(_host: *const clap_host) -> clap_note_dialect {
     CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI
@@ -619,8 +626,60 @@ unsafe fn ext<T>(plugin: *const clap_plugin, id: &CStr) -> *const T {
     unsafe { (*plugin).get_extension.map_or(std::ptr::null(), |g| g(plugin, id.as_ptr())) as *const T }
 }
 
+/// Read the current configuration while deactivated, before allocating DSP buffers.
+fn scan_audio_ports(plugin: *const clap_plugin, extension: *const clap_plugin_audio_ports) -> Result<AudioPorts> {
+    let scan = |input| -> Result<Vec<AudioPort>> {
+        let Some(extension) = (unsafe { extension.as_ref() }) else { return Ok(Vec::new()); };
+        let count = extension.count.map_or(0, |count| unsafe { count(plugin, input) });
+        anyhow::ensure!(count as usize <= AudioPorts::MAX_PORTS, "too many CLAP audio ports: {count}");
+        let mut ports = Vec::with_capacity(count as usize);
+        let mut total_channels = 0usize;
+        for index in 0..count {
+            let mut info: clap_audio_port_info = unsafe { std::mem::zeroed() };
+            anyhow::ensure!(extension.get.is_some_and(|get| unsafe { get(plugin, index, input, &mut info) }),
+                "could not read CLAP audio port {index}");
+            anyhow::ensure!(info.id != clap_sys::id::CLAP_INVALID_ID, "invalid CLAP audio port ID");
+            anyhow::ensure!(info.channel_count > 0 && info.channel_count as usize <= AudioPorts::MAX_CHANNELS,
+                "invalid CLAP audio port channel count: {}", info.channel_count);
+            total_channels += info.channel_count as usize;
+            anyhow::ensure!(total_channels <= AudioPorts::MAX_CHANNELS, "too many CLAP audio channels");
+            let main = info.flags & CLAP_AUDIO_PORT_IS_MAIN != 0;
+            anyhow::ensure!(!main || index == 0, "CLAP main audio port must be first");
+            let name = carray(&info.name);
+            let layout = (!info.port_type.is_null()).then(|| cstr(info.port_type)).filter(|name| !name.is_empty());
+            ports.push(AudioPort {
+                id: info.id.to_string(),
+                name: if name.is_empty() { format!("Audio {}", index + 1) } else { name },
+                channels: info.channel_count as usize,
+                main,
+                layout,
+            });
+        }
+        Ok(ports)
+    };
+    let ports = AudioPorts { inputs: scan(true)?, outputs: scan(false)? };
+    ports.validate()?;
+    Ok(ports)
+}
+
+fn describe_audio_channels(channels: &[usize]) -> Vec<AudioPort> {
+    channels.iter().enumerate().map(|(index, &channels)| AudioPort {
+        id: index.to_string(), name: format!("Audio {}", index + 1), channels,
+        main: index == 0, layout: None,
+    }).collect()
+}
+
+fn same_audio_configuration(previous: &AudioPorts, next: &AudioPorts) -> bool {
+    [&previous.inputs, &previous.outputs].into_iter().zip([&next.inputs, &next.outputs]).all(|(a, b)| {
+        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| {
+            a.id == b.id && a.channels == b.channels && a.main == b.main && a.layout == b.layout
+        })
+    })
+}
+
 pub struct ClapPlugin {
     info: PluginInfo,
+    audio_ports: AudioPorts,
     params: Vec<ParamDesc>,
     /// Plain-value range of each parameter.
     ranges: HashMap<clap_id, (f64, f64)>,
@@ -660,6 +719,7 @@ impl ClapPlugin {
                 callback_requested: AtomicBool::new(false),
                 restart_requested: AtomicBool::new(false),
                 rescan_params: AtomicBool::new(false),
+                rescan_audio_ports: AtomicU32::new(0),
                 latency_changed: AtomicBool::new(false),
                 resize_request: AtomicU64::new(0),
                 gui_closed: AtomicBool::new(false),
@@ -697,6 +757,7 @@ impl ClapPlugin {
             let (_, from_audio) = rtrb::RingBuffer::new(1);
             let mut me = Self {
                 info: info.clone(),
+                audio_ports: AudioPorts { inputs: Vec::new(), outputs: Vec::new() },
                 params: Vec::new(),
                 ranges: HashMap::new(),
                 plugin,
@@ -722,17 +783,12 @@ impl ClapPlugin {
     fn activate(&mut self, sample_rate: f64, max_block: usize) -> Result<ClapProcessor> {
         let plugin = self.plugin;
         unsafe {
-            let channels = |input: bool| -> Vec<usize> {
-                let Some(p) = self.ext.ports.as_ref() else { return Vec::new() };
-                let n = p.count.map_or(0, |c| c(plugin, input));
-                (0..n)
-                    .map(|i| {
-                        let mut info: clap_audio_port_info = std::mem::zeroed();
-                        if p.get.is_some_and(|g| g(plugin, i, input, &mut info)) { info.channel_count as usize } else { 0 }
-                    })
-                    .collect()
-            };
-            let (in_ch, out_ch) = (channels(true), channels(false));
+            // Deactivation/state restoration may have notified us already. This scan
+            // admits that configuration and must not queue another identical restart.
+            self.shared.rescan_audio_ports.store(0, Ordering::Release);
+            let ports = scan_audio_ports(plugin, self.ext.ports)?;
+            let in_ch: Vec<_> = ports.inputs.iter().map(|port| port.channels).collect();
+            let out_ch: Vec<_> = ports.outputs.iter().map(|port| port.channels).collect();
             let dialect = |input: bool| -> Option<Dialect> {
                 let p = self.ext.notes.as_ref()?;
                 if p.count.map_or(0, |c| c(plugin, input)) == 0 {
@@ -757,12 +813,13 @@ impl ClapPlugin {
                 bail!("activate failed");
             }
             self.active = true;
+            self.audio_ports = ports.clone();
             self.latency = self.ext.latency.as_ref().and_then(|l| l.get).map_or(0, |g| g(plugin));
             let (to_audio, from_ui) = rtrb::RingBuffer::new(QUEUE_LEN);
             let (to_ui, from_audio) = rtrb::RingBuffer::new(QUEUE_LEN);
             self.to_audio = to_audio;
             self.from_audio = from_audio;
-            Ok(ClapProcessor::new(plugin, from_ui, to_ui, &in_ch, &out_ch, self.notes.0, max_block))
+            Ok(ClapProcessor::new(plugin, from_ui, to_ui, &in_ch, &out_ch, self.notes.0, max_block).with_audio_ports(ports))
         }
     }
 
@@ -893,6 +950,8 @@ impl plugins::Instance for ClapPlugin {
         &self.info
     }
 
+    fn audio_ports(&self) -> AudioPorts { self.audio_ports.clone() }
+
     fn params(&self) -> &[ParamDesc] {
         &self.params
     }
@@ -942,6 +1001,18 @@ impl plugins::Instance for ClapPlugin {
         }
         self.recent.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(1));
         self.pump();
+        let rescans = self.shared.rescan_audio_ports.swap(0, Ordering::AcqRel);
+        if rescans == CLAP_AUDIO_PORTS_RESCAN_NAMES {
+            // CLAP explicitly allows name-only rescans while active. DSP buffer shapes
+            // and port identities must stay unchanged until reactivation.
+            match scan_audio_ports(self.plugin, self.ext.ports) {
+                Ok(ports) if same_audio_configuration(&self.audio_ports, &ports) => self.audio_ports = ports,
+                Ok(_) => self.shared.restart_requested.store(true, Ordering::Release),
+                Err(error) => log::error!("{} audio port rescan rejected: {error:#}", self.info.name),
+            }
+        } else if rescans != 0 {
+            self.shared.restart_requested.store(true, Ordering::Release);
+        }
         if self.shared.rescan_params.swap(false, Ordering::AcqRel) {
             self.restart_requests.parameter_changed(Instant::now());
             self.reload_params();
@@ -1069,6 +1140,7 @@ pub struct ClapProcessor {
     transport: clap_event_transport,
     max_block: usize,
     note_in: Option<Dialect>,
+    audio_ports: AudioPorts,
 }
 
 // Moved to the audio thread once and used only there.
@@ -1101,7 +1173,16 @@ impl ClapProcessor {
             transport: transport_event(Transport::default()),
             max_block,
             note_in,
+            audio_ports: AudioPorts {
+                inputs: describe_audio_channels(in_ch),
+                outputs: describe_audio_channels(out_ch),
+            },
         }
+    }
+
+    fn with_audio_ports(mut self, audio_ports: AudioPorts) -> Self {
+        self.audio_ports = audio_ports;
+        self
     }
 
     fn queue_midi(&mut self, midi: &[MidiEvent]) {
@@ -1147,31 +1228,24 @@ impl ClapProcessor {
     fn run(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf], midi_in: &[MidiEvent], midi_out: *mut MidiBuf) {
         AUDIO_THREAD.with(|a| a.set(true));
         let n = n.min(self.max_block);
-        let (i, o) = (&inputs[0], &mut outputs[0]);
+        for output in outputs.iter_mut() { output.clear(n); }
         if !self.started {
-            self.started = unsafe { (*self.plugin).start_processing.is_none_or(|s| s(self.plugin)) };
-            if !self.started {
-                o.clear(n);
-                return;
+            self.started = unsafe { (*self.plugin).start_processing.is_none_or(|start| start(self.plugin)) };
+            if !self.started { return; }
+        }
+        for (index, bus) in self.ins.data.iter_mut().enumerate() {
+            self.ins.bufs[index].constant_mask = 0;
+            for (channel, samples) in bus.iter_mut().enumerate() {
+                if let Some(input) = inputs.get(index).filter(|input| channel < input.channels()) {
+                    samples[..n].copy_from_slice(&input.channel(channel)[..n]);
+                } else {
+                    samples[..n].fill(0.0);
+                }
             }
         }
-
-        if let Some(bus) = self.ins.data.first_mut() {
-            match bus.len() {
-                0 => {}
-                1 => {
-                    for (k, s) in bus[0][..n].iter_mut().enumerate() {
-                        *s = 0.5 * (i.l[k] + i.r[k]);
-                    }
-                }
-                _ => {
-                    bus[0][..n].copy_from_slice(&i.l[..n]);
-                    bus[1][..n].copy_from_slice(&i.r[..n]);
-                    for ch in &mut bus[2..] {
-                        ch[..n].fill(0.0);
-                    }
-                }
-            }
+        for (index, bus) in self.outs.data.iter_mut().enumerate() {
+            self.outs.bufs[index].constant_mask = 0;
+            for samples in bus { samples[..n].fill(0.0); }
         }
 
         self.in_events.events.clear();
@@ -1188,8 +1262,8 @@ impl ClapProcessor {
             steady_time: self.steady_time,
             frames_count: n as u32,
             transport: &self.transport,
-            audio_inputs: self.ins.bufs.as_ptr(),
-            audio_outputs: self.outs.bufs.as_mut_ptr(),
+            audio_inputs: if self.ins.bufs.is_empty() { std::ptr::null() } else { self.ins.bufs.as_ptr() },
+            audio_outputs: if self.outs.bufs.is_empty() { std::ptr::null_mut() } else { self.outs.bufs.as_mut_ptr() },
             audio_inputs_count: self.ins.bufs.len() as u32,
             audio_outputs_count: self.outs.bufs.len() as u32,
             in_events: &self.in_events.list,
@@ -1199,18 +1273,21 @@ impl ClapProcessor {
         self.out_events.midi = std::ptr::null_mut();
         self.steady_time = self.steady_time.saturating_add(n as i64);
 
-        match (status != CLAP_PROCESS_ERROR, self.outs.data.first()) {
-            (true, Some(bus)) if !bus.is_empty() => {
-                let r = if bus.len() > 1 { &bus[1] } else { &bus[0] };
-                o.l[..n].copy_from_slice(&bus[0][..n]);
-                o.r[..n].copy_from_slice(&r[..n]);
+        if status != CLAP_PROCESS_ERROR {
+            for (index, output) in outputs.iter_mut().enumerate() {
+                if let Some(bus) = self.outs.data.get(index) {
+                    for (channel, samples) in bus.iter().enumerate().take(output.channels()) {
+                        output.channel_mut(channel)[..n].copy_from_slice(&samples[..n]);
+                    }
+                }
             }
-            _ => o.clear(n),
         }
     }
 }
 
 impl Processor for ClapProcessor {
+    fn audio_ports(&self) -> Option<AudioPorts> { Some(self.audio_ports.clone()) }
+
     fn set_transport(&mut self, transport: Transport) {
         self.transport = transport_event(transport);
     }
@@ -1314,6 +1391,140 @@ impl Drop for ClapProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiple_audio_buses_keep_channels_separate_and_missing_inputs_are_silent() {
+        unsafe extern "C" fn process(plugin: *const clap_plugin, process: *const clap_process) -> clap_process_status {
+            unsafe {
+                *(*plugin).plugin_data.cast::<usize>() += 1;
+                let process = &*process;
+                assert_eq!((process.audio_inputs_count, process.audio_outputs_count), (3, 3));
+                for index in 0..3 {
+                    let input = &*process.audio_inputs.add(index);
+                    let output = &*process.audio_outputs.add(index);
+                    assert_eq!(input.channel_count, [2, 1, 6][index]);
+                    assert_eq!(output.channel_count, input.channel_count);
+                    for channel in 0..input.channel_count as usize {
+                        let source = std::slice::from_raw_parts(*input.data32.add(channel), process.frames_count as usize);
+                        let target = std::slice::from_raw_parts_mut(*output.data32.add(channel), process.frames_count as usize);
+                        target.copy_from_slice(source);
+                    }
+                }
+            }
+            CLAP_PROCESS_CONTINUE
+        }
+        let mut calls = 0usize;
+        let mut plugin: clap_plugin = unsafe { std::mem::zeroed() };
+        plugin.plugin_data = (&mut calls as *mut usize).cast();
+        plugin.process = Some(process);
+        let (_tx, from_ui) = rtrb::RingBuffer::new(1);
+        let (to_ui, _rx) = rtrb::RingBuffer::new(1);
+        let widths = [2, 1, 6];
+        let mut processor = ClapProcessor::new(&plugin, from_ui, to_ui, &widths, &widths, None, 64);
+        let mut inputs: Vec<_> = widths.iter().map(|&channels| StereoBuf::with_channels(channels)).collect();
+        let mut outputs: Vec<_> = widths.iter().map(|&channels| StereoBuf::with_channels(channels)).collect();
+        for (bus, input) in inputs.iter_mut().enumerate() {
+            for channel in 0..input.channels() {
+                input.channel_mut(channel)[..64].fill((bus * 10 + channel + 1) as f32);
+            }
+        }
+        processor.process(64, &mut inputs, &mut outputs);
+        assert_eq!(calls, 1, "all buses share one process call");
+        for (bus, output) in outputs.iter().enumerate() {
+            for channel in 0..output.channels() {
+                assert_eq!(&output.channel(channel)[..64], vec![(bus * 10 + channel + 1) as f32; 64]);
+            }
+        }
+        processor.process(64, &mut inputs[..1], &mut outputs);
+        assert_eq!(calls, 2);
+        for output in &outputs[1..] {
+            for channel in 0..output.channels() {
+                assert!(output.channel(channel)[..64].iter().all(|&sample| sample == 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn zero_audio_bus_plugins_process_with_null_buffer_arrays() {
+        unsafe extern "C" fn process(_: *const clap_plugin, process: *const clap_process) -> clap_process_status {
+            let process = unsafe { &*process };
+            assert_eq!(process.audio_inputs.is_null(), process.audio_inputs_count == 0);
+            assert_eq!(process.audio_outputs.is_null(), process.audio_outputs_count == 0);
+            for index in 0..process.audio_outputs_count as usize {
+                let output = unsafe { &*process.audio_outputs.add(index) };
+                for channel in 0..output.channel_count as usize {
+                    unsafe { std::slice::from_raw_parts_mut(*output.data32.add(channel), process.frames_count as usize) }
+                        .fill((channel + 1) as f32);
+                }
+            }
+            CLAP_PROCESS_CONTINUE
+        }
+        let mut plugin: clap_plugin = unsafe { std::mem::zeroed() };
+        plugin.process = Some(process);
+        let configurations: [(&[usize], &[usize]); 3] = [(&[], &[]), (&[], &[6]), (&[1], &[])];
+        for (in_widths, out_widths) in configurations {
+            let (_tx, from_ui) = rtrb::RingBuffer::new(1);
+            let (to_ui, _rx) = rtrb::RingBuffer::new(1);
+            let mut processor = ClapProcessor::new(&plugin, from_ui, to_ui, in_widths, out_widths, None, 64);
+            let mut inputs: Vec<_> = in_widths.iter().map(|&channels| StereoBuf::with_channels(channels)).collect();
+            let mut outputs: Vec<_> = out_widths.iter().map(|&channels| StereoBuf::with_channels(channels)).collect();
+            processor.process(64, &mut inputs, &mut outputs);
+            let ports = processor.audio_ports().unwrap();
+            assert_eq!((ports.inputs.len(), ports.outputs.len()), (in_widths.len(), out_widths.len()));
+            for output in outputs {
+                for channel in 0..output.channels() {
+                    assert_eq!(&output.channel(channel)[..64], vec![(channel + 1) as f32; 64]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scans_stable_audio_port_ids_names_and_native_channel_counts() {
+        unsafe extern "C" fn count(_: *const clap_plugin, _: bool) -> u32 { 3 }
+        unsafe extern "C" fn get(_: *const clap_plugin, index: u32, input: bool, info: *mut clap_audio_port_info) -> bool {
+            unsafe {
+                let info = &mut *info;
+                info.id = 10 + index;
+                info.channel_count = [2, 1, 6][index as usize];
+                info.flags = if index == 0 { CLAP_AUDIO_PORT_IS_MAIN } else { 0 };
+                let name = if input { b"Input" } else { b"Other" };
+                for (target, &source) in info.name.iter_mut().zip(name) { *target = source as c_char; }
+                info.port_type = if index == 0 { c"stereo".as_ptr() } else { std::ptr::null() };
+            }
+            true
+        }
+        let extension = clap_plugin_audio_ports { count: Some(count), get: Some(get) };
+        let ports = scan_audio_ports(std::ptr::null(), &extension).unwrap();
+        assert_eq!(ports.inputs.iter().map(|port| port.channels).collect::<Vec<_>>(), [2, 1, 6]);
+        assert_eq!(ports.inputs[1].id, "11");
+        assert_eq!(ports.inputs[1].name, "Input");
+        assert_eq!(ports.outputs[1].name, "Other");
+        assert!(ports.inputs[0].main && !ports.inputs[1].main);
+        assert_eq!(ports.inputs[0].layout.as_deref(), Some("stereo"));
+        assert_eq!(ports.inputs[2].layout, None);
+        let empty = scan_audio_ports(std::ptr::null(), std::ptr::null()).unwrap();
+        assert!(empty.inputs.is_empty() && empty.outputs.is_empty());
+    }
+
+    #[test]
+    fn rejects_oversized_audio_port_lists_before_reading_descriptors() {
+        unsafe extern "C" fn count(_: *const clap_plugin, _: bool) -> u32 { u32::MAX }
+        let extension = clap_plugin_audio_ports { count: Some(count), get: None };
+        assert!(scan_audio_ports(std::ptr::null(), &extension).is_err());
+    }
+
+    #[test]
+    fn port_name_rescans_preserve_configuration_but_shape_changes_require_restart() {
+        let ports = AudioPorts::default();
+        let mut changed = ports.clone();
+        changed.inputs[0].name = "New program name".into();
+        assert!(same_audio_configuration(&ports, &changed));
+        changed.inputs[0].channels = 1;
+        assert!(!same_audio_configuration(&ports, &changed));
+        assert!(unsafe { ports_flag_supported(std::ptr::null(), CLAP_AUDIO_PORTS_RESCAN_LIST) });
+        assert!(!unsafe { ports_flag_supported(std::ptr::null(), 1 << 31) });
+    }
 
     #[test]
     fn repeated_restart_requests_wait_for_quiet_and_are_consumed_once() {

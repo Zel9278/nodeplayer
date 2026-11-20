@@ -19,7 +19,7 @@ use vst3::Steinberg::*;
 use vst3::{ComPtr, ComWrapper, Interface};
 
 use crate::plugins::dylib::{self, Library};
-use crate::plugins::{self, Format, ParamDesc, Placement, PluginInfo};
+use crate::plugins::{self, AudioPort, AudioPorts, Format, ParamDesc, Placement, PluginInfo};
 use host::{
     ComponentHandler, HostApp, MemoryStream, ParamChange, ParamSender, cchar_to_string,
     tchar_to_string,
@@ -226,11 +226,56 @@ pub fn find_bundles(root: &Path, out: &mut Vec<PathBuf>) {
 // ---------------------------------------------------------------------------
 // Instances
 
+/// VST3 supplies bus indices rather than persistent IDs. Retain names and roles for
+/// connection restoration, and bound all descriptor counts before allocating audio.
+fn read_audio_ports(
+    component: &ComPtr<IComponent>,
+    audio: &ComPtr<IAudioProcessor>,
+    direction: i32,
+) -> Result<Vec<AudioPort>> {
+    unsafe {
+        let count = component.getBusCount(MediaTypes_::kAudio as i32, direction);
+        anyhow::ensure!(count >= 0 && count as usize <= AudioPorts::MAX_PORTS,
+            "invalid VST3 audio bus count: {count}");
+        let mut ports = Vec::with_capacity(count as usize);
+        let mut total_channels = 0usize;
+        let mut occurrences = HashMap::new();
+        for index in 0..count {
+            let mut info: BusInfo = std::mem::zeroed();
+            anyhow::ensure!(component.getBusInfo(MediaTypes_::kAudio as i32, direction, index, &mut info) == kResultOk,
+                "could not read VST3 audio bus {index}");
+            anyhow::ensure!(info.channelCount > 0 && info.channelCount as usize <= AudioPorts::MAX_CHANNELS,
+                "invalid VST3 audio bus channel count: {}", info.channelCount);
+            total_channels += info.channelCount as usize;
+            anyhow::ensure!(total_channels <= AudioPorts::MAX_CHANNELS, "too many VST3 audio channels");
+            let name = tchar_to_string(&info.name);
+            // VST3 has no persistent bus IDs. Matching by role/name/occurrence avoids
+            // reconnecting an auxiliary wire merely because a different bus took its index.
+            let key = format!("{}:{name}", info.busType);
+            let occurrence = occurrences.entry(key.clone()).or_insert(0usize);
+            let id = format!("{key}:{}", *occurrence);
+            *occurrence += 1;
+            let mut arrangement = 0;
+            let layout = (audio.getBusArrangement(direction, index, &mut arrangement) == kResultOk)
+                .then(|| format!("0x{arrangement:x}"));
+            ports.push(AudioPort {
+                id,
+                name: if name.is_empty() { format!("Audio {}", index + 1) } else { name },
+                channels: info.channelCount as usize,
+                main: info.busType == BusTypes_::kMain as i32,
+                layout,
+            });
+        }
+        Ok(ports)
+    }
+}
+
 /// The UI-thread half of a plugin instance. The audio half is [`Vst3Processor`].
 pub struct Vst3Plugin {
     pub info: PluginInfo,
     pub params: Vec<ParamDesc>,
     pub latency: u32,
+    audio_ports: AudioPorts,
     component: ComPtr<IComponent>,
     controller: Option<ComPtr<IEditController>>,
     separate_controller: bool,
@@ -335,6 +380,7 @@ impl Vst3Plugin {
                 info: info.clone(),
                 params: Vec::new(),
                 latency: 0,
+                audio_ports: AudioPorts { inputs: Vec::new(), outputs: Vec::new() },
                 component,
                 controller,
                 separate_controller,
@@ -360,45 +406,35 @@ impl Vst3Plugin {
         let component = &self.component;
         let audio = component.cast::<IAudioProcessor>().ok_or_else(|| anyhow!("component has no IAudioProcessor"))?;
         unsafe {
-            // Buses: ask for stereo on the main buses, keep whatever the rest use.
+            // Keep the plugin's channel arrangements, including mono and surround main
+            // buses. Every advertised audio bus is independently routable in the graph.
             use BusDirections_::*;
             use MediaTypes_::*;
-            let n_in = component.getBusCount(kAudio as i32, kInput as i32).max(0) as usize;
-            let n_out = component.getBusCount(kAudio as i32, kOutput as i32).max(0) as usize;
-            let mut in_arr = vec![SpeakerArr::kStereo; n_in];
-            let mut out_arr = vec![SpeakerArr::kStereo; n_out];
-            for (i, a) in in_arr.iter_mut().enumerate().skip(1) {
-                audio.getBusArrangement(kInput as i32, i as i32, a);
-            }
-            for (i, a) in out_arr.iter_mut().enumerate().skip(1) {
-                audio.getBusArrangement(kOutput as i32, i as i32, a);
-            }
-            if audio.setBusArrangements(
-                in_arr.as_mut_ptr(),
-                n_in as i32,
-                out_arr.as_mut_ptr(),
-                n_out as i32,
-            ) != kResultOk
-            {
-                log::info!("{}: plugin rejected stereo bus arrangement", self.info.name);
-            }
-            let bus_channels = |dir: i32, n: usize| -> Vec<usize> {
-                (0..n)
-                    .map(|i| {
-                        let mut bi: BusInfo = std::mem::zeroed();
-                        component.getBusInfo(kAudio as i32, dir, i as i32, &mut bi);
-                        bi.channelCount.max(0) as usize
-                    })
-                    .collect()
+            let mut ports = AudioPorts {
+                inputs: read_audio_ports(component, &audio, kInput as i32)?,
+                outputs: read_audio_ports(component, &audio, kOutput as i32)?,
             };
-            let in_ch = bus_channels(kInput as i32, n_in);
-            let out_ch = bus_channels(kOutput as i32, n_out);
-            if n_in > 0 {
-                component.activateBus(kAudio as i32, kInput as i32, 0, 1);
+            ports.validate()?;
+            // Preserve API indices: an unavailable advertised bus is an activation error,
+            // rather than shifting every later graph port to a different plugin bus.
+            for (direction, buses) in [(kInput as i32, &ports.inputs), (kOutput as i32, &ports.outputs)] {
+                for index in 0..buses.len() {
+                    if component.activateBus(kAudio as i32, direction, index as i32, 1) != kResultOk {
+                        bail!("could not activate audio bus {}", buses[index].name);
+                    }
+                }
             }
-            if n_out > 0 {
-                component.activateBus(kAudio as i32, kOutput as i32, 0, 1);
-            }
+            // Some plugins update bus descriptors on activation.
+            let activated = AudioPorts {
+                inputs: read_audio_ports(component, &audio, kInput as i32)?,
+                outputs: read_audio_ports(component, &audio, kOutput as i32)?,
+            };
+            anyhow::ensure!(activated.inputs.len() == ports.inputs.len() && activated.outputs.len() == ports.outputs.len(),
+                "plugin changed its audio bus count during activation");
+            ports = activated;
+            ports.validate()?;
+            let in_ch: Vec<_> = ports.inputs.iter().map(|port| port.channels).collect();
+            let out_ch: Vec<_> = ports.outputs.iter().map(|port| port.channels).collect();
             // The first event bus of each direction carries the node's MIDI.
             let ev_in = component.getBusCount(kEvent as i32, kInput as i32) > 0;
             let ev_out = component.getBusCount(kEvent as i32, kOutput as i32) > 0;
@@ -426,6 +462,7 @@ impl Vst3Plugin {
                 bail!("setActive failed");
             }
             self.latency = audio.getLatencySamples();
+            self.audio_ports = ports.clone();
 
             let (to_audio_tx, to_audio_rx) = rtrb::RingBuffer::new(PARAM_QUEUE_LEN);
             let (from_audio_tx, from_audio_rx) = rtrb::RingBuffer::new(PARAM_QUEUE_LEN);
@@ -443,7 +480,7 @@ impl Vst3Plugin {
                 cc_map,
                 sample_rate,
                 max_block,
-            ))
+            ).with_audio_ports(ports))
         }
     }
 
@@ -600,6 +637,10 @@ fn unpack_states(data: &[u8]) -> Result<States> {
 impl plugins::Instance for Vst3Plugin {
     fn info(&self) -> &PluginInfo {
         &self.info
+    }
+
+    fn audio_ports(&self) -> AudioPorts {
+        self.audio_ports.clone()
     }
 
     fn params(&self) -> &[ParamDesc] {

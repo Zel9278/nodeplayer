@@ -6,6 +6,7 @@ use vst3::{ComPtr, ComWrapper};
 
 use super::host::{EventList, ParamChange, ParamChanges};
 use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf, Transport};
+use crate::plugins::{AudioPort, AudioPorts};
 
 const MAX_CHANGED_PARAMS: usize = 256;
 
@@ -79,6 +80,7 @@ pub struct Vst3Processor {
     out_events: Option<ComWrapper<EventList>>,
     cc_map: CcMap,
     started: bool,
+    audio_ports: AudioPorts,
 }
 
 // The processor is only ever used from one thread at a time (moved to the audio thread once).
@@ -114,6 +116,10 @@ impl Vst3Processor {
             out_events: midi.1.then(|| ComWrapper::new(EventList::new())),
             cc_map,
             started: false,
+            audio_ports: AudioPorts {
+                inputs: describe_channels(in_channels),
+                outputs: describe_channels(out_channels),
+            },
         }
     }
 
@@ -218,7 +224,13 @@ impl Vst3Processor {
         list.clear();
     }
 
-    /// Processes one stereo block. `input`/`output` are `[left, right]` slices of equal length.
+    pub(super) fn with_audio_ports(mut self, audio_ports: AudioPorts) -> Self {
+        self.audio_ports = audio_ports;
+        self
+    }
+
+    /// Compatibility helper for the command-line plugin checks. Only the main buses are
+    /// connected; all auxiliary inputs are explicitly silent for every block.
     pub fn process_stereo(
         &mut self,
         input: [&[f32]; 2],
@@ -227,55 +239,111 @@ impl Vst3Processor {
         midi_out: Option<&mut MidiBuf>,
     ) {
         let [out_l, out_r] = output;
-        let n = out_l.len().min(self.max_block);
-        if !self.started {
-            unsafe { self.audio.setProcessing(1) };
-            self.started = true;
+        let n = out_l.len().min(out_r.len()).min(input[0].len()).min(input[1].len()).min(self.max_block);
+        for bus in &mut self.ins.data {
+            for channel in bus {
+                channel[..n].fill(0.0);
+            }
         }
-
-        // Main input bus: stereo -> whatever the bus has.
-        if let Some(bus) = self.ins.data.first_mut() {
+        let main_input = self.audio_ports.inputs.iter().position(|port| port.main).unwrap_or(0);
+        if let Some(bus) = self.ins.data.get_mut(main_input) {
             match bus.len() {
                 0 => {}
                 1 => {
-                    for (i, s) in bus[0][..n].iter_mut().enumerate() {
-                        *s = 0.5 * (input[0][i] + input[1][i]);
+                    for (index, sample) in bus[0][..n].iter_mut().enumerate() {
+                        *sample = 0.5 * (input[0][index] + input[1][index]);
                     }
                 }
                 _ => {
                     bus[0][..n].copy_from_slice(&input[0][..n]);
                     bus[1][..n].copy_from_slice(&input[1][..n]);
-                    for ch in &mut bus[2..] {
-                        ch[..n].fill(0.0);
+                }
+            }
+        }
+        let success = self.process_block(n, midi_in, midi_out);
+        out_l.fill(0.0);
+        out_r.fill(0.0);
+        let main_output = self.audio_ports.outputs.iter().position(|port| port.main).unwrap_or(0);
+        if success && let Some(bus) = self.outs.data.get(main_output) && !bus.is_empty() {
+            let flags = self.outs.abb[main_output].silenceFlags;
+            if flags & 1 == 0 {
+                out_l[..n].copy_from_slice(&bus[0][..n]);
+            }
+            let channel = usize::from(bus.len() > 1);
+            if flags & (1u64 << channel) == 0 {
+                out_r[..n].copy_from_slice(&bus[channel][..n]);
+            }
+        }
+    }
+
+    fn run(
+        &mut self,
+        n: usize,
+        inputs: &[StereoBuf],
+        outputs: &mut [StereoBuf],
+        midi_in: &[MidiEvent],
+        midi_out: Option<&mut MidiBuf>,
+    ) {
+        let n = n.min(self.max_block);
+        for (index, bus) in self.ins.data.iter_mut().enumerate() {
+            for (channel, samples) in bus.iter_mut().enumerate() {
+                if let Some(input) = inputs.get(index).filter(|input| channel < input.channels()) {
+                    samples[..n].copy_from_slice(&input.channel(channel)[..n]);
+                } else {
+                    samples[..n].fill(0.0);
+                }
+            }
+        }
+        let success = self.process_block(n, midi_in, midi_out);
+        for (index, output) in outputs.iter_mut().enumerate() {
+            output.clear(n);
+            if success && let Some(bus) = self.outs.data.get(index) {
+                let flags = self.outs.abb[index].silenceFlags;
+                for (channel, samples) in bus.iter().enumerate().take(output.channels()) {
+                    if flags & (1u64 << channel) == 0 {
+                        output.channel_mut(channel)[..n].copy_from_slice(&samples[..n]);
                     }
                 }
             }
         }
+    }
 
+    /// Processes every bus together once. Buffers are allocated only during activation.
+    fn process_block(&mut self, n: usize, midi_in: &[MidiEvent], midi_out: Option<&mut MidiBuf>) -> bool {
+        if !self.started {
+            self.started = unsafe { self.audio.setProcessing(1) } == kResultOk;
+            if !self.started {
+                return false;
+            }
+        }
+        for buffer in &mut self.ins.abb {
+            buffer.silenceFlags = 0;
+        }
+        for (bus, buffer) in self.outs.data.iter_mut().zip(&mut self.outs.abb) {
+            buffer.silenceFlags = 0;
+            for channel in bus {
+                channel[..n].fill(0.0);
+            }
+        }
         self.in_changes.clear();
         self.out_changes.clear();
         while let Ok(ch) = self.from_ui.pop() {
             self.in_changes.push(ch);
         }
-        if let Some(l) = &self.in_events {
-            l.clear();
-        }
-        if let Some(l) = &self.out_events {
-            l.clear();
-        }
+        if let Some(list) = &self.in_events { list.clear(); }
+        if let Some(list) = &self.out_events { list.clear(); }
         self.queue_midi(midi_in);
-        let events = |l: &Option<ComWrapper<EventList>>| {
-            l.as_ref().map_or(std::ptr::null_mut(), |l| l.as_com_ref::<IEventList>().unwrap().as_ptr())
+        let events = |list: &Option<ComWrapper<EventList>>| {
+            list.as_ref().map_or(std::ptr::null_mut(), |list| list.as_com_ref::<IEventList>().unwrap().as_ptr())
         };
-
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime as i32,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
             numSamples: n as i32,
             numInputs: self.ins.abb.len() as i32,
             numOutputs: self.outs.abb.len() as i32,
-            inputs: self.ins.abb.as_mut_ptr(),
-            outputs: self.outs.abb.as_mut_ptr(),
+            inputs: if self.ins.abb.is_empty() { std::ptr::null_mut() } else { self.ins.abb.as_mut_ptr() },
+            outputs: if self.outs.abb.is_empty() { std::ptr::null_mut() } else { self.outs.abb.as_mut_ptr() },
             inputParameterChanges: self.in_changes.as_com_ref::<IParameterChanges>().unwrap().as_ptr(),
             outputParameterChanges: self
                 .out_changes
@@ -286,31 +354,27 @@ impl Vst3Processor {
             outputEvents: events(&self.out_events),
             processContext: &mut *self.ctx,
         };
-        let res = unsafe { self.audio.process(&mut data) };
+        let result = unsafe { self.audio.process(&mut data) };
         self.ctx.continousTimeSamples = self.ctx.continousTimeSamples.saturating_add(n as i64);
-
-        for ch in self.out_changes.iter() {
-            let _ = self.to_ui.push(ch);
+        for change in self.out_changes.iter() {
+            let _ = self.to_ui.push(change);
         }
-        if let Some(out) = midi_out {
-            self.take_midi(n, out);
-        }
-
-        match (res == kResultOk, self.outs.data.first()) {
-            (true, Some(bus)) if !bus.is_empty() => {
-                let r = if bus.len() > 1 { &bus[1] } else { &bus[0] };
-                out_l[..n].copy_from_slice(&bus[0][..n]);
-                out_r[..n].copy_from_slice(&r[..n]);
-            }
-            _ => {
-                out_l[..n].fill(0.0);
-                out_r[..n].fill(0.0);
-            }
-        }
+        if let Some(out) = midi_out { self.take_midi(n, out); }
+        result == kResultOk
     }
+
+}
+
+fn describe_channels(channels: &[usize]) -> Vec<AudioPort> {
+    channels.iter().enumerate().map(|(index, &channels)| AudioPort {
+        id: index.to_string(), name: format!("Audio {}", index + 1), channels,
+        main: index == 0, layout: None,
+    }).collect()
 }
 
 impl Processor for Vst3Processor {
+    fn audio_ports(&self) -> Option<AudioPorts> { Some(self.audio_ports.clone()) }
+
     fn set_transport(&mut self, transport: Transport) {
         update_transport(&mut self.ctx, transport);
     }
@@ -372,9 +436,7 @@ impl Processor for Vst3Processor {
         }
     }
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
-        let (i, o) = (&inputs[0], &mut outputs[0]);
-        let StereoBuf { l, r } = o;
-        self.process_stereo([&i.l[..n], &i.r[..n]], [&mut l[..n], &mut r[..n]], &[], None);
+        self.run(n, inputs, outputs, &[], None);
     }
 
     fn process_midi(
@@ -385,9 +447,7 @@ impl Processor for Vst3Processor {
         midi_in: &[MidiEvent],
         midi_out: &mut MidiBuf,
     ) {
-        let (i, o) = (&inputs[0], &mut outputs[0]);
-        let StereoBuf { l, r } = o;
-        self.process_stereo([&i.l[..n], &i.r[..n]], [&mut l[..n], &mut r[..n]], midi_in, Some(midi_out));
+        self.run(n, inputs, outputs, midi_in, Some(midi_out));
     }
 
     fn deactivate(&mut self) {
@@ -421,12 +481,41 @@ mod tests {
     #[derive(Default)]
     struct Capture {
         blocks: Mutex<Vec<(u32, i64, i64)>>,
+        audio_blocks: Mutex<Vec<Vec<Vec<Vec<f32>>>>>,
         processing: Mutex<Vec<bool>>,
         flushes: Mutex<Vec<Vec<(u32, f64)>>>,
+        bus_descriptions: Mutex<Vec<(String, usize)>>,
     }
     struct Plugin(Arc<Capture>);
     impl vst3::Class for Plugin {
-        type Interfaces = (IAudioProcessor,);
+        type Interfaces = (IAudioProcessor, IComponent);
+    }
+    impl IPluginBaseTrait for Plugin {
+        unsafe fn initialize(&self, _: *mut FUnknown) -> tresult { kResultOk }
+        unsafe fn terminate(&self) -> tresult { kResultOk }
+    }
+    impl IComponentTrait for Plugin {
+        unsafe fn getControllerClassId(&self, _: *mut TUID) -> tresult { kNotImplemented }
+        unsafe fn setIoMode(&self, _: IoMode) -> tresult { kResultOk }
+        unsafe fn getBusCount(&self, _: MediaType, _: BusDirection) -> i32 {
+            self.0.bus_descriptions.lock().unwrap().len() as i32
+        }
+        unsafe fn getBusInfo(&self, _: MediaType, _: BusDirection, index: i32, bus: *mut BusInfo) -> tresult {
+            let descriptions = self.0.bus_descriptions.lock().unwrap();
+            let Some((name, channels)) = descriptions.get(index as usize) else { return kInvalidArgument; };
+            unsafe {
+                let bus = &mut *bus;
+                bus.channelCount = *channels as i32;
+                bus.busType = if index == 0 { BusTypes_::kMain as i32 } else { BusTypes_::kAux as i32 };
+                for (target, source) in bus.name.iter_mut().zip(name.encode_utf16()) { *target = source; }
+            }
+            kResultOk
+        }
+        unsafe fn getRoutingInfo(&self, _: *mut RoutingInfo, _: *mut RoutingInfo) -> tresult { kNotImplemented }
+        unsafe fn activateBus(&self, _: MediaType, _: BusDirection, _: i32, _: TBool) -> tresult { kResultOk }
+        unsafe fn setActive(&self, _: TBool) -> tresult { kResultOk }
+        unsafe fn setState(&self, _: *mut IBStream) -> tresult { kResultOk }
+        unsafe fn getState(&self, _: *mut IBStream) -> tresult { kResultOk }
     }
     impl IAudioProcessorTrait for Plugin {
         unsafe fn setBusArrangements(
@@ -441,9 +530,12 @@ mod tests {
         unsafe fn getBusArrangement(
             &self,
             _: BusDirection,
-            _: i32,
-            _: *mut SpeakerArrangement,
+            index: i32,
+            arrangement: *mut SpeakerArrangement,
         ) -> tresult {
+            if let Some((_, channels)) = self.0.bus_descriptions.lock().unwrap().get(index as usize) {
+                unsafe { *arrangement = (1u64 << (*channels).min(63)) - 1; }
+            }
             kResultOk
         }
         unsafe fn canProcessSampleSize(&self, _: i32) -> tresult {
@@ -497,12 +589,116 @@ mod tests {
                     );
                 }
                 self.0.flushes.lock().unwrap().push(changes);
+            } else {
+                let n = data.numSamples as usize;
+                let mut captured = Vec::new();
+                for index in 0..data.numInputs as usize {
+                    let bus = unsafe { &*data.inputs.add(index) };
+                    let mut channels = Vec::new();
+                    for channel in 0..bus.numChannels as usize {
+                        let samples = unsafe { *bus.__field0.channelBuffers32.add(channel) };
+                        channels.push(unsafe { std::slice::from_raw_parts(samples, n) }.to_vec());
+                    }
+                    captured.push(channels);
+                }
+                for index in 0..data.numOutputs as usize {
+                    let bus = unsafe { &mut *data.outputs.add(index) };
+                    for channel in 0..bus.numChannels as usize {
+                        let target = unsafe { std::slice::from_raw_parts_mut(*bus.__field0.channelBuffers32.add(channel), n) };
+                        if let Some(source) = captured.get(index).and_then(|bus| bus.get(channel)) {
+                            target.copy_from_slice(source);
+                        } else {
+                            target.fill(0.0);
+                        }
+                    }
+                }
+                self.0.audio_blocks.lock().unwrap().push(captured);
             }
             kResultOk
         }
         unsafe fn getTailSamples(&self) -> u32 {
             0
         }
+    }
+
+    #[test]
+    fn native_bus_descriptors_keep_layouts_and_named_ids_across_reordering() {
+        let capture = Arc::new(Capture::default());
+        *capture.bus_descriptions.lock().unwrap() = vec![
+            ("Program".into(), 6), ("Detector".into(), 1), ("Monitor".into(), 2),
+        ];
+        let plugin = ComWrapper::new(Plugin(capture.clone()));
+        let component = plugin.to_com_ptr::<IComponent>().unwrap();
+        let audio = plugin.to_com_ptr::<IAudioProcessor>().unwrap();
+        let ports = super::super::read_audio_ports(&component, &audio, BusDirections_::kInput as i32).unwrap();
+        assert_eq!(ports.iter().map(|port| port.channels).collect::<Vec<_>>(), [6, 1, 2]);
+        assert!(ports[0].main && !ports[1].main);
+        assert_eq!(ports[0].layout.as_deref(), Some("0x3f"));
+        capture.bus_descriptions.lock().unwrap().swap(1, 2);
+        let reordered = super::super::read_audio_ports(&component, &audio, BusDirections_::kInput as i32).unwrap();
+        assert_eq!(ports[1].id, reordered[2].id);
+        assert_eq!(ports[2].id, reordered[1].id);
+        *capture.bus_descriptions.lock().unwrap() = vec![("Too wide".into(), 65)];
+        assert!(super::super::read_audio_ports(&component, &audio, BusDirections_::kInput as i32).is_err());
+        *capture.bus_descriptions.lock().unwrap() = vec![("Too many".into(), 1); 33];
+        assert!(super::super::read_audio_ports(&component, &audio, BusDirections_::kInput as i32).is_err());
+        capture.bus_descriptions.lock().unwrap().clear();
+        assert!(super::super::read_audio_ports(&component, &audio, BusDirections_::kInput as i32).unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_bus_preserves_mono_and_surround_channels_and_missing_inputs_are_silent() {
+        let capture = Arc::new(Capture::default());
+        let audio = ComWrapper::new(Plugin(capture.clone())).to_com_ptr::<IAudioProcessor>().unwrap();
+        let (_tx, from_ui) = rtrb::RingBuffer::new(1);
+        let (to_ui, _rx) = rtrb::RingBuffer::new(1);
+        let widths = [2, 1, 6];
+        let mut processor = Vst3Processor::new(audio, from_ui, to_ui, &widths, &widths,
+            (false, false), CcMap::new(None), 48_000.0, 64);
+        let mut inputs: Vec<_> = widths.iter().map(|&channels| StereoBuf::with_channels(channels)).collect();
+        let mut outputs: Vec<_> = widths.iter().map(|&channels| StereoBuf::with_channels(channels)).collect();
+        for (bus, input) in inputs.iter_mut().enumerate() {
+            for channel in 0..input.channels() {
+                input.channel_mut(channel)[..64].fill((bus * 10 + channel + 1) as f32);
+            }
+        }
+        processor.process(64, &mut inputs, &mut outputs);
+        assert_eq!(capture.audio_blocks.lock().unwrap().len(), 1, "all buses share one process call");
+        for (bus, output) in outputs.iter().enumerate() {
+            for channel in 0..output.channels() {
+                assert_eq!(&output.channel(channel)[..64], vec![(bus * 10 + channel + 1) as f32; 64]);
+            }
+        }
+        processor.process(64, &mut inputs[..1], &mut outputs);
+        for output in &outputs[1..] {
+            for channel in 0..output.channels() {
+                assert!(output.channel(channel)[..64].iter().all(|&sample| sample == 0.0));
+            }
+        }
+        processor.process_stereo([&[3.0; 64], &[5.0; 64]], [&mut [0.0; 64], &mut [0.0; 64]], &[], None);
+        let captured = capture.audio_blocks.lock().unwrap();
+        for bus in &captured.last().unwrap()[1..] {
+            assert!(bus.iter().flatten().all(|&sample| sample == 0.0), "legacy helper silences auxiliary buses");
+        }
+    }
+
+    #[test]
+    fn zero_bus_plugins_still_process_without_graph_audio_ports() {
+        let capture = Arc::new(Capture::default());
+        let audio = ComWrapper::new(Plugin(capture.clone())).to_com_ptr::<IAudioProcessor>().unwrap();
+        let configurations: [(&[usize], &[usize]); 3] = [(&[], &[]), (&[], &[6]), (&[1], &[])];
+        for (in_widths, out_widths) in configurations {
+            let (_tx, from_ui) = rtrb::RingBuffer::new(1);
+            let (to_ui, _rx) = rtrb::RingBuffer::new(1);
+            let mut processor = Vst3Processor::new(audio.clone(), from_ui, to_ui, in_widths, out_widths,
+                (false, false), CcMap::new(None), 48_000.0, 64);
+            let mut inputs: Vec<_> = in_widths.iter().map(|&channels| StereoBuf::with_channels(channels)).collect();
+            let mut outputs: Vec<_> = out_widths.iter().map(|&channels| StereoBuf::with_channels(channels)).collect();
+            processor.process(64, &mut inputs, &mut outputs);
+            let ports = processor.audio_ports().unwrap();
+            assert_eq!((ports.inputs.len(), ports.outputs.len()), (in_widths.len(), out_widths.len()));
+        }
+        assert_eq!(capture.audio_blocks.lock().unwrap().len(), 3);
     }
 
     #[test]

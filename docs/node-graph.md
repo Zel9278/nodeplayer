@@ -20,8 +20,9 @@ and a message is logged; no incompatible wire is created.
   the 🔌 Plugins tab with "+".
 - **Connect**: drag from an output pin (right side) to an input pin (left side). Several wires
   into one input are summed. A wire that would make a loop is refused.
-- **Pins**: round blue pins carry stereo audio, square orange pins carry MIDI. MIDI only
-  connects to MIDI.
+- **Pins**: round blue pins carry audio buses, square orange pins carry MIDI. A VST3 or CLAP
+  node shows each bus's name and channel count, including sidechains and additional outputs.
+  Built-in audio nodes use stereo. MIDI only connects to MIDI.
 - **Disconnect**: right-click a wire to cut it, or right-click a pin to drop all its wires.
 - **Remove**: right-click a node and pick "Remove".
 - **Fold**: ▼ at the left of a node's title hides its body.
@@ -33,6 +34,12 @@ and a message is logged; no incompatible wire is created.
 
 Nodes that aren't connected to anything still run, so a visualizer can hang off any output
 as a dead end.
+
+VST3 and CLAP buses retain their reported channel counts. Matching channels pass through
+independently, mono duplicates into stereo, and stereo averages into mono. Other channel-count
+differences connect channels by position: extra source channels are omitted and missing source
+channels are silent. This does not perform a surround downmix. A full multichannel path needs
+nodes with compatible channel counts.
 
 ## Built-in nodes
 

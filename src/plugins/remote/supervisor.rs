@@ -617,6 +617,28 @@ fn validate(r: &Reply, generation: u64, id: u64) -> Result<()> {
     {
         bail!("oversized worker state")
     }
+    if let Some(metadata) = &r.metadata {
+        metadata
+            .audio_ports
+            .validate()
+            .context("invalid worker audio buses")?;
+        for port in metadata
+            .audio_ports
+            .inputs
+            .iter()
+            .chain(&metadata.audio_ports.outputs)
+        {
+            if port.id.len() > 4096
+                || port.name.len() > 4096
+                || port
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.len() > 4096)
+            {
+                bail!("oversized worker audio bus metadata");
+            }
+        }
+    }
     if r.metadata.as_ref().is_some_and(|m| {
         m.params.len() > protocol::MAX_PARAMS
             || m.values.len() > protocol::MAX_PARAMS
@@ -1104,10 +1126,7 @@ mod tests {
             Command::Place(2, None),
             Command::Place(1, None),
         ];
-        let expected = vec![
-            Command::Place(1, None),
-            Command::Place(2, None),
-        ];
+        let expected = vec![Command::Place(1, None), Command::Place(2, None)];
         assert_eq!(encoded(coalesce(commands)), encoded(expected));
     }
 

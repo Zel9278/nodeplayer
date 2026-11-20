@@ -42,6 +42,105 @@ enum ScanMsg {
     Done,
 }
 
+/// Audio follows stable bus identity, while MIDI follows its own pin past the audio buses.
+fn remap_pin(
+    old: &plugins::AudioPorts,
+    old_midi: (bool, bool),
+    new: &plugins::AudioPorts,
+    new_midi: (bool, bool),
+    pin: usize,
+    input: bool,
+) -> Option<usize> {
+    let (before, after, had_midi, has_midi) = if input {
+        (&old.inputs, &new.inputs, old_midi.0, new_midi.0)
+    } else {
+        (&old.outputs, &new.outputs, old_midi.1, new_midi.1)
+    };
+    if let Some(port) = before.get(pin) {
+        after.iter().position(|candidate| candidate.id == port.id)
+    } else {
+        (had_midi && has_midi && pin == before.len()).then_some(after.len())
+    }
+}
+
+fn restore_pin(saved: &SavedKind, current: &NodeKind, pin: usize, input: bool) -> Option<usize> {
+    let NodeKind::Plugin(plugin) = current else { return Some(pin) };
+    match saved {
+        SavedKind::Plugin { audio_ports: Some(old), midi_ports, .. } => remap_pin(
+            old, midi_ports.unwrap_or((true, true)), &plugin.audio_ports, plugin.midi_ports, pin, input,
+        ),
+        // Older sessions always had one audio pin followed by an optional MIDI pin.
+        SavedKind::Plugin { .. } | SavedKind::Vst3 { .. } => {
+            let ports = if input { &plugin.audio_ports.inputs } else { &plugin.audio_ports.outputs };
+            match pin {
+                0 => ports.iter().position(|port| port.main).or_else(|| (!ports.is_empty()).then_some(0)),
+                1 if if input { plugin.midi_ports.0 } else { plugin.midi_ports.1 } => Some(ports.len()),
+                _ => None,
+            }
+        }
+        _ => Some(pin),
+    }
+}
+
+fn update_plugin_ports(
+    snarl: &mut Snarl<GraphNode>,
+    id: NodeId,
+    ports: plugins::AudioPorts,
+    midi: (bool, bool),
+) {
+    let NodeKind::Plugin(plugin) = &snarl[id].kind else { return };
+    let mut old = plugin.audio_ports.clone();
+    if !plugin.ports_known {
+        // Pending workers use a temporary stereo main pin. Its numeric placeholder is
+        // not a plugin-supplied identity, so adopt the first discovered main bus once.
+        for (before, after) in [(&mut old.inputs, &ports.inputs), (&mut old.outputs, &ports.outputs)] {
+            if let Some(before) = before.first_mut()
+                && let Some(after) = after.iter().find(|port| port.main).or_else(|| after.first())
+            {
+                before.id = after.id.clone();
+            }
+        }
+    }
+    let old_midi = plugin.midi_ports;
+    let wires: Vec<_> = snarl.wires().filter(|(from, to)| from.node == id || to.node == id).collect();
+    for &(from, to) in &wires { snarl.disconnect(from, to); }
+    if let NodeKind::Plugin(plugin) = &mut snarl[id].kind {
+        plugin.audio_ports = ports.clone();
+        plugin.midi_ports = midi;
+        plugin.ports_known = true;
+    }
+    for (mut from, mut to) in wires {
+        if from.node == id {
+            let Some(pin) = remap_pin(&old, old_midi, &ports, midi, from.output, false) else { continue };
+            from.output = pin;
+        }
+        if to.node == id {
+            let Some(pin) = remap_pin(&old, old_midi, &ports, midi, to.input, true) else { continue };
+            to.input = pin;
+        }
+        snarl.connect(from, to);
+    }
+}
+
+fn stage_audio_command(updates: &mut Vec<crate::engine::PluginUpdate>, command: Command) {
+    let node = match &command {
+        Command::ConfigureAudioPorts(node, _) | Command::ConfigureBypass(node, _)
+        | Command::ResumePlugin(node, _) => *node,
+        _ => unreachable!("only prepared plugin changes belong in a graph update"),
+    };
+    let index = updates.iter().position(|update| update.node == node).unwrap_or_else(|| {
+        updates.push(crate::engine::PluginUpdate::new(node));
+        updates.len() - 1
+    });
+    let update = &mut updates[index];
+    match command {
+        Command::ConfigureAudioPorts(_, buffers) => update.audio = Some(buffers),
+        Command::ConfigureBypass(_, bypass) => update.bypass = Some(bypass),
+        Command::ResumePlugin(_, processor) => update.processor = Some(processor),
+        _ => unreachable!(),
+    }
+}
+
 /// Admit a reactivated processor before it becomes eligible for audio callbacks.
 /// Preparation failure leaves the existing wrapper's continuously warmed fallback active.
 fn queue_plugin_resume(
@@ -49,16 +148,20 @@ fn queue_plugin_resume(
     plugin: &mut PluginNode,
     mut processor: Box<dyn crate::engine::Processor>,
     mut send: impl FnMut(Command),
-    prepare: impl FnOnce(u32, u32, bool) -> anyhow::Result<crate::engine::nodes::LatencyBypass>,
+    prepare: impl FnOnce(u32, u32, bool, &plugins::AudioPorts) -> anyhow::Result<crate::engine::nodes::LatencyBypass>,
 ) -> anyhow::Result<()> {
     let timing = (plugin.instance.latency(), plugin.instance.bridge_latency());
-    let bypass = match prepare(timing.0, timing.1, plugin.info().is_instrument()) {
+    let ports = plugin.instance.audio_ports();
+    let bypass = match ports.validate().and_then(|()| prepare(timing.0, timing.1, plugin.info().is_instrument(), &ports)) {
         Ok(bypass) => bypass,
         Err(error) => {
             processor.deactivate();
             return Err(error);
         }
     };
+    if !ports.same_topology(&plugin.audio_ports) {
+        send(Command::ConfigureAudioPorts(eid, Box::new(crate::engine::AudioBuffers::new(&ports))));
+    }
     send(Command::ConfigureBypass(eid, Box::new(bypass)));
     send(Command::ResumePlugin(eid, processor));
     plugin.timing = timing;
@@ -271,6 +374,8 @@ enum Action {
 pub struct App {
     // Declared first so the audio stream stops before any plugin is torn down.
     engine: Option<Engine>,
+    /// Prepared audio ownership is submitted with its matching graph schedule.
+    pending_audio_updates: Vec<crate::engine::PluginUpdate>,
     diagnostic: Option<diagnostic::GuiDiagnostic>,
     sample_rate: f32,
     player: Player,
@@ -398,6 +503,7 @@ impl App {
         let mut app = Self {
             player: Player::new(sample_rate),
             engine,
+            pending_audio_updates: Vec::new(),
             diagnostic: None,
             sample_rate: sample_rate as f32,
             snarl: Snarl::new(),
@@ -1000,6 +1106,8 @@ impl App {
         for &[a, out, b, inp] in &g.wires {
             let out = if midi_files.contains(&a) { NodeKind::Player.audio_outputs() } else { out };
             let (Some(&Some(from)), Some(&Some(to))) = (ids.get(a), ids.get(b)) else { continue };
+            let Some(out) = restore_pin(&g.nodes[a].kind, &self.snarl[from].kind, out, false) else { continue };
+            let Some(inp) = restore_pin(&g.nodes[b].kind, &self.snarl[to].kind, inp, true) else { continue };
             let (a, b) = (&self.snarl[from].kind, &self.snarl[to].kind);
             if out < a.outputs()
                 && inp < b.inputs()
@@ -1022,6 +1130,8 @@ impl App {
             bypass,
             editor,
             state,
+            audio_ports,
+            midi_ports,
         } = kind
         else {
             return None;
@@ -1067,6 +1177,20 @@ impl App {
                 log::warn!("{name}: can't restore state: {e:#}");
             }
             p.bypass = *bypass;
+            // Isolated workers discover their buses asynchronously. Keep saved pins until
+            // their first complete metadata arrives so auxiliary/MIDI wires can be restored.
+            if p.instance.remote_status().is_some_and(|status| status != "running") {
+                if let Some(ports) = audio_ports.as_ref().filter(|ports| ports.validate().is_ok()) {
+                    p.audio_ports = ports.clone();
+                    p.ports_known = true;
+                }
+                if let Some(ports) = midi_ports { p.midi_ports = *ports; }
+                if self.engine.is_some() {
+                    stage_audio_command(&mut self.pending_audio_updates, Command::ConfigureAudioPorts(eid, Box::new(
+                        crate::engine::AudioBuffers::new(&p.audio_ports),
+                    )));
+                }
+            }
         }
         if *bypass
             && let Some(e) = &mut self.engine
@@ -1362,6 +1486,7 @@ impl App {
             return;
         }
         self.engine = None;
+        self.pending_audio_updates.clear();
         self.tick_statistics();
         self.statistics.save();
         // Plugin instances still exist, and their processors can no longer race state
@@ -1390,6 +1515,7 @@ impl App {
         std::mem::forget(std::mem::take(&mut self.snarl));
         std::mem::forget(std::mem::take(&mut self.outer));
         std::mem::forget(std::mem::take(&mut self.pending_teardown));
+        std::mem::forget(std::mem::take(&mut self.pending_audio_updates));
         std::mem::forget(std::mem::take(&mut self.extensions));
         std::mem::forget(std::mem::take(&mut self.host));
     }
@@ -1420,6 +1546,7 @@ impl App {
     /// if it's a group.
     fn retire(&mut self, node: GraphNode) {
         let GraphNode { eid, kind } = node;
+        self.pending_audio_updates.retain(|update| update.node != eid);
         self.restarting.remove(&eid);
         let mut plugin = match kind {
             NodeKind::Plugin(mut p) => {
@@ -1460,7 +1587,14 @@ impl App {
                 if let Some(e) = &mut self.engine {
                     // Preserve FIFO ordering with lifecycle commands, especially the
                     // RemoveNode queued after this schedule stops referencing a slot.
-                    e.send(Command::SetSchedule(Box::new(schedule)));
+                    if self.pending_audio_updates.is_empty() {
+                        e.send(Command::SetSchedule(Box::new(schedule)));
+                    } else {
+                        e.send(Command::UpdateGraph(Box::new(crate::engine::GraphUpdate {
+                            schedule: Box::new(schedule),
+                            plugins: std::mem::take(&mut self.pending_audio_updates),
+                        })));
+                    }
                 }
                 true
             }
@@ -1495,7 +1629,8 @@ impl App {
                         self.finish_restart(eid);
                     }
                 }
-                Garbage::Schedule(_) | Garbage::Bypass(_) | Garbage::PluginInner(_) => {}
+                Garbage::Schedule(_) | Garbage::Bypass(_) | Garbage::PluginInner(_) | Garbage::AudioBuffers(_)
+                | Garbage::GraphUpdate(_) => {}
             }
         }
     }
@@ -1528,13 +1663,13 @@ impl App {
         let _g = guard::enter(&tag);
         match p.instance.restart(self.sample_rate as f64, MAX_BLOCK) {
             Ok(proc) => {
-                if let Some(engine) = &mut self.engine
+                if self.engine.is_some()
                     && let Err(error) = queue_plugin_resume(
                         eid,
                         p,
                         proc,
-                        |command| engine.send(command),
-                        crate::engine::nodes::LatencyBypass::new,
+                        |command| stage_audio_command(&mut self.pending_audio_updates, command),
+                        crate::engine::nodes::LatencyBypass::with_ports,
                     )
                 {
                     self.log(format!(
@@ -1542,6 +1677,10 @@ impl App {
                     ));
                     return;
                 }
+                let NodeKind::Plugin(plugin) = &self.snarl[id].kind else { return };
+                let ports = plugin.instance.audio_ports();
+                let midi = plugin.instance.midi_ports();
+                update_plugin_ports(&mut self.snarl, id, ports, midi);
                 self.drop_stale_wires(id);
                 self.dirty = true;
                 self.log(format!("restarted {name}"));
@@ -1741,28 +1880,42 @@ impl App {
             match &mut node.kind {
                 NodeKind::Plugin(p) => {
                     let _g = guard::enter(&p.tag);
-                    let old_midi_ports = p.instance.midi_ports();
                     p.instance.idle();
-                    if p.instance.midi_ports() != old_midi_ports {
-                        ports_changed.push(node.eid);
-                    }
+                    let metadata_ready = p.instance.remote_status().is_none_or(|status| status == "running");
+                    let ports = if metadata_ready { p.instance.audio_ports() } else { p.audio_ports.clone() };
+                    let midi = if metadata_ready { p.instance.midi_ports() } else { p.midi_ports };
+                    let first_metadata = metadata_ready && !p.ports_known;
+                    let audio_changed = ports != p.audio_ports || first_metadata;
                     let timing = (p.instance.latency(), p.instance.bridge_latency());
-                    if !p.suspended && timing != p.timing {
-                        match crate::engine::nodes::LatencyBypass::new(
+                    let mut admitted = !p.suspended;
+                    if admitted && (timing != p.timing || audio_changed) {
+                        match crate::engine::nodes::LatencyBypass::with_ports(
                             timing.0,
                             timing.1,
                             p.info().is_instrument(),
+                            &ports,
                         ) {
                             Ok(bypass) => {
-                                if let Some(engine) = &mut self.engine {
-                                    engine
-                                        .send(Command::ConfigureBypass(node.eid, Box::new(bypass)));
+                                if self.engine.is_some() {
+                                    if !ports.same_topology(&p.audio_ports) {
+                                        stage_audio_command(&mut self.pending_audio_updates, Command::ConfigureAudioPorts(node.eid, Box::new(
+                                            crate::engine::AudioBuffers::new(&ports),
+                                        )));
+                                    }
+                                    stage_audio_command(&mut self.pending_audio_updates,
+                                        Command::ConfigureBypass(node.eid, Box::new(bypass)));
                                 }
                                 p.timing = timing;
-                                self.dirty |= crate::runtime::get().experimental_pdc;
+                                self.dirty = true;
                             }
-                            Err(error) => log::error!("plugin timing change rejected: {error:#}"),
+                            Err(error) => {
+                                admitted = false;
+                                log::error!("plugin timing/ports change rejected: {error:#}");
+                            }
                         }
+                    }
+                    if admitted && (audio_changed || midi != p.midi_ports) {
+                        ports_changed.push((node.eid, ports, midi));
                     }
                     if p.instance.wants_restart() {
                         restart.push(node.eid);
@@ -1788,10 +1941,11 @@ impl App {
         for eid in restart {
             self.begin_restart(eid);
         }
-        // Metadata can change graph pins without changing the fixed stereo audio slot.
-        // Recompile its routing while preserving the live processor and bridge history.
-        for eid in ports_changed {
-            self.at_eid(eid, |app, id| app.drop_stale_wires(id));
+        for (eid, ports, midi) in ports_changed {
+            self.at_eid(eid, |app, id| {
+                update_plugin_ports(&mut app.snarl, id, ports, midi);
+                app.drop_stale_wires(id);
+            });
         }
     }
 
@@ -3095,6 +3249,8 @@ fn save_nodes_with_state(snarl: &Snarl<GraphNode>, only: Option<&HashSet<NodeId>
                     bypass: p.bypass,
                     editor: p.editor.is_some(),
                     state,
+                    audio_ports: p.ports_known.then(|| p.audio_ports.clone()),
+                    midi_ports: p.ports_known.then_some(p.midi_ports),
                 }
             }
         };
@@ -3272,8 +3428,13 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
             return midi_pin();
         }
         match kind {
-            NodeKind::Mixer { .. } => pin_label(ui, &format!("in {}", pin.id.input + 1)),
-            _ => pin_label(ui, "in"),
+            NodeKind::Plugin(plugin) => {
+                if let Some(port) = plugin.audio_ports.inputs.get(pin.id.input) {
+                    pin_label(ui, &format!("{} ({} ch)", port.name, port.channels));
+                }
+            }
+            NodeKind::Mixer { .. } => { pin_label(ui, &format!("in {}", pin.id.input + 1)); }
+            _ => { pin_label(ui, "in"); }
         };
         PinInfo::circle().with_fill(PIN_COLOR)
     }
@@ -3283,7 +3444,13 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
             pin_label(ui, "MIDI");
             return midi_pin();
         }
-        pin_label(ui, "out");
+        if let NodeKind::Plugin(plugin) = &snarl[pin.id.node].kind {
+            if let Some(port) = plugin.audio_ports.outputs.get(pin.id.output) {
+                pin_label(ui, &format!("{} ({} ch)", port.name, port.channels));
+            }
+        } else {
+            pin_label(ui, "out");
+        }
         PinInfo::circle().with_fill(PIN_COLOR)
     }
 
@@ -4216,9 +4383,9 @@ mod restart_tests {
                 &mut plugin,
                 proc,
                 |command| commands.push(command),
-                |total, bridge, instrument| {
+                |total, bridge, instrument, ports| {
                     if unsupported_latency {
-                        crate::engine::nodes::LatencyBypass::new(total, bridge, instrument)
+                        crate::engine::nodes::LatencyBypass::with_ports(total, bridge, instrument, ports)
                     } else {
                         anyhow::bail!("injected bypass allocation budget exhaustion")
                     }
@@ -4252,7 +4419,7 @@ mod restart_tests {
             &mut plugin,
             proc,
             |command| commands.push(command),
-            crate::engine::nodes::LatencyBypass::new,
+            crate::engine::nodes::LatencyBypass::with_ports,
         )
         .unwrap();
         assert!(matches!(
@@ -4262,5 +4429,95 @@ mod restart_tests {
         assert_eq!(plugin.timing, (64, 0));
         assert!(!plugin.suspended);
         assert_eq!(deactivated.load(Ordering::Relaxed), 0);
+    }
+
+    fn bus(id: &str, channels: usize, main: bool) -> plugins::AudioPort {
+        plugins::AudioPort {
+            id: id.into(), name: id.into(), channels, main, layout: None,
+        }
+    }
+
+    #[test]
+    fn bus_reordering_preserves_sidechain_output_and_midi_wires() {
+        let (mut plugin, _) = suspended_plugin(64);
+        plugin.audio_ports = plugins::AudioPorts {
+            inputs: vec![bus("program", 2, true), bus("detector", 1, false)],
+            outputs: vec![bus("program", 2, true), bus("surround", 6, false)],
+        };
+        plugin.midi_ports = (true, true);
+        let mut snarl = Snarl::new();
+        let source = snarl.insert_node(pos2(0.0, 0.0), GraphNode { eid: 0, kind: NodeKind::Player });
+        let effect = snarl.insert_node(pos2(1.0, 0.0), GraphNode { eid: 1, kind: NodeKind::Plugin(Box::new(plugin)) });
+        let sink = snarl.insert_node(pos2(2.0, 0.0), GraphNode { eid: 2, kind: NodeKind::GroupOut });
+        snarl.connect(OutPinId { node: source, output: 0 }, InPinId { node: effect, input: 1 });
+        snarl.connect(OutPinId { node: source, output: 1 }, InPinId { node: effect, input: 2 });
+        snarl.connect(OutPinId { node: effect, output: 1 }, InPinId { node: sink, input: 0 });
+        snarl.connect(OutPinId { node: effect, output: 2 }, InPinId { node: sink, input: 1 });
+        let ports = plugins::AudioPorts {
+            inputs: vec![bus("detector", 1, false), bus("program", 2, true)],
+            outputs: vec![bus("surround", 6, false), bus("program", 2, true)],
+        };
+        update_plugin_ports(&mut snarl, effect, ports.clone(), (true, true));
+        let wires: Vec<_> = snarl.wires().collect();
+        assert!(wires.contains(&(OutPinId { node: source, output: 0 }, InPinId { node: effect, input: 0 })));
+        assert!(wires.contains(&(OutPinId { node: source, output: 1 }, InPinId { node: effect, input: 2 })));
+        assert!(wires.contains(&(OutPinId { node: effect, output: 0 }, InPinId { node: sink, input: 0 })));
+        assert!(wires.contains(&(OutPinId { node: effect, output: 2 }, InPinId { node: sink, input: 1 })));
+        assert_eq!(wires.len(), 4);
+        graph::compile_with_timing(&snarl, true).unwrap();
+
+        let mut removed = ports;
+        removed.outputs.remove(0);
+        update_plugin_ports(&mut snarl, effect, removed, (true, true));
+        assert_eq!(snarl.wires().count(), 3);
+        assert!(snarl.wires().any(|(from, to)| from == OutPinId { node: effect, output: 1 } && to == InPinId { node: sink, input: 1 }));
+    }
+
+    #[test]
+    fn saved_bus_ids_round_trip_and_legacy_midi_moves_past_new_buses() {
+        let (mut plugin, _) = suspended_plugin(64);
+        plugin.audio_ports = plugins::AudioPorts {
+            inputs: vec![bus("detector", 1, false), bus("program", 2, true)],
+            outputs: vec![bus("program", 6, true), bus("monitor", 2, false)],
+        };
+        plugin.midi_ports = (true, true);
+        let mut snarl = Snarl::new();
+        let id = snarl.insert_node(pos2(0.0, 0.0), GraphNode { eid: 1, kind: NodeKind::Plugin(Box::new(plugin)) });
+        let saved = save_nodes_with_state(&snarl, None, StateCapture::Cached);
+        let saved: SavedGraph = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(restore_pin(&saved.nodes[0].kind, &snarl[id].kind, 0, true), Some(0));
+        assert_eq!(restore_pin(&saved.nodes[0].kind, &snarl[id].kind, 2, false), Some(2));
+        let mut legacy = saved.nodes[0].kind.clone();
+        if let SavedKind::Plugin { audio_ports, midi_ports, .. } = &mut legacy {
+            *audio_ports = None;
+            *midi_ports = None;
+        }
+        assert_eq!(restore_pin(&legacy, &snarl[id].kind, 0, true), Some(1));
+        assert_eq!(restore_pin(&legacy, &snarl[id].kind, 1, true), Some(2));
+        assert_eq!(restore_pin(&legacy, &snarl[id].kind, 1, false), Some(2));
+        assert_eq!(restore_pin(&legacy, &snarl[id].kind, 3, false), None);
+    }
+
+    #[test]
+    fn pending_worker_main_and_midi_wires_survive_first_bus_discovery() {
+        let (mut plugin, _) = suspended_plugin(64);
+        plugin.ports_known = false;
+        plugin.midi_ports = (true, true);
+        let mut snarl = Snarl::new();
+        let source = snarl.insert_node(pos2(0.0, 0.0), GraphNode { eid: 0, kind: NodeKind::Player });
+        let effect = snarl.insert_node(pos2(1.0, 0.0), GraphNode { eid: 1, kind: NodeKind::Plugin(Box::new(plugin)) });
+        snarl.connect(OutPinId { node: source, output: 0 }, InPinId { node: effect, input: 0 });
+        snarl.connect(OutPinId { node: source, output: 1 }, InPinId { node: effect, input: 1 });
+        let saved = save_nodes_with_state(&snarl, None, StateCapture::Cached);
+        assert!(saved.nodes.iter().any(|node| matches!(&node.kind, SavedKind::Plugin { audio_ports: None, .. })));
+        let ports = plugins::AudioPorts {
+            inputs: vec![bus("32768", 2, true), bus("32769", 2, false)],
+            outputs: vec![bus("1", 2, true), bus("2", 2, false)],
+        };
+        update_plugin_ports(&mut snarl, effect, ports, (true, true));
+        assert_eq!(snarl.wires().count(), 2);
+        assert!(snarl.wires().any(|(from, to)| from.output == 0 && to.input == 0));
+        assert!(snarl.wires().any(|(from, to)| from.output == 1 && to.input == 2));
+        assert!(matches!(&snarl[effect].kind, NodeKind::Plugin(plugin) if plugin.ports_known));
     }
 }

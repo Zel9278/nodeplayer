@@ -1,5 +1,5 @@
 //! Versioned, length-bounded control plane. Never carried on plugin stdout.
-use super::super::{ParamDesc, Placement, PluginInfo, Spot};
+use super::super::{AudioPorts, ParamDesc, Placement, PluginInfo, Spot};
 use super::surface::SurfaceDescriptor;
 use crate::plugins::surface::{EditorKeyboard, EditorPointer};
 use anyhow::{Result, bail};
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_STATE: usize = 1024 * 1024;
 pub const MAX_PARAMS: usize = 8192;
@@ -29,6 +29,7 @@ pub struct Init {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Metadata {
+    pub audio_ports: AudioPorts,
     pub params: Vec<ParamDesc>,
     pub values: Vec<(u32, f64, String)>,
     pub latency: u32,

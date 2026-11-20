@@ -263,7 +263,7 @@ fn test_vst3(bundle: &Path, filter: &str) -> Result<()> {
 /// Headless smoke test for any format: instantiate the classes whose name contains `filter`,
 /// run a sine through them, move a parameter and round-trip the state.
 fn test_plugin(format: &str, path: &Path, filter: &str) -> Result<()> {
-    use engine::{Processor, StereoBuf};
+    use engine::Processor;
     let format = plugins::Format::ALL
         .into_iter()
         .find(|f| f.label().eq_ignore_ascii_case(format))
@@ -276,17 +276,30 @@ fn test_plugin(format: &str, path: &Path, filter: &str) -> Result<()> {
         println!("class: {} [{}] by {} ({})", info.name, info.id, info.vendor, info.category);
         let plugins::Created { mut instance, mut processor } = host.create(&info, sr, engine::MAX_BLOCK)?;
         println!("  latency {} samples, {} params, editor {}", instance.latency(), instance.params().len(), instance.has_editor());
-        let (mut ins, mut outs) = ([StereoBuf::new()], [StereoBuf::new()]);
+        let ports = instance.audio_ports();
+        for (direction, buses) in [("in", &ports.inputs), ("out", &ports.outputs)] {
+            for port in buses {
+                println!("  audio {direction}: '{}' [{}], {} channels{}", port.name, port.id, port.channels,
+                    if port.main { " (main)" } else { "" });
+            }
+        }
+        let main_in = ports.inputs.iter().position(|port| port.main).unwrap_or(0);
+        let main_out = ports.outputs.iter().position(|port| port.main).unwrap_or(0);
+        let engine::AudioBuffers { inputs: mut ins, outputs: mut outs } = engine::AudioBuffers::new(&ports);
         let mut run = |p: &mut Box<dyn Processor>| {
             for _ in 0..8 {
-                for k in 0..n {
-                    let v = (k as f32 * 1000.0 * std::f32::consts::TAU / sr).sin() * 0.5;
-                    ins[0].l[k] = v;
-                    ins[0].r[k] = v;
+                if let Some(input) = ins.get_mut(main_in) {
+                    for channel in 0..input.channels() {
+                        for (k, sample) in input.channel_mut(channel)[..n].iter_mut().enumerate() {
+                            *sample = (k as f32 * 1000.0 * std::f32::consts::TAU / sr).sin() * 0.5;
+                        }
+                    }
                 }
                 p.process(n, &mut ins, &mut outs);
             }
-            (rms(&ins[0].l), rms(&outs[0].l), rms(&outs[0].r))
+            (ins.get(main_in).map_or(0.0, |bus| rms(bus.channel(0))),
+                outs.get(main_out).map_or(0.0, |bus| rms(bus.channel(0))),
+                outs.get(main_out).map_or(0.0, |bus| rms(bus.channel(usize::from(bus.channels() > 1)))))
         };
         let (i, l, r) = run(&mut processor);
         println!("  in rms {i:.4} -> out rms {l:.4} / {r:.4}");
@@ -294,7 +307,7 @@ fn test_plugin(format: &str, path: &Path, filter: &str) -> Result<()> {
         println!("  midi in {midi_in}, out {midi_out}");
         if midi_in || midi_out {
             // Middle C for a few blocks of silence, then its note off.
-            let (mut ins, mut outs) = ([StereoBuf::new()], [StereoBuf::new()]);
+            let engine::AudioBuffers { inputs: mut ins, outputs: mut outs } = engine::AudioBuffers::new(&ports);
             let mut out_midi = engine::MidiBuf::new();
             let mut seen = Vec::new();
             let mut peak = 0f32;
@@ -307,7 +320,9 @@ fn test_plugin(format: &str, path: &Path, filter: &str) -> Result<()> {
                 out_midi.clear();
                 processor.process_midi(n, &mut ins, &mut outs, &ev, &mut out_midi);
                 if b < 8 {
-                    peak = peak.max(rms(&outs[0].l));
+                    for output in &outs {
+                        for channel in 0..output.channels() { peak = peak.max(rms(output.channel(channel))); }
+                    }
                 }
                 seen.extend(out_midi.events().iter().map(midi::describe));
             }
