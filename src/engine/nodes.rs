@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::{MidiBuf, MidiEvent, Processor, StereoBuf, Transport};
+use crate::plugins::AudioPorts;
 
 pub(crate) fn db_to_gain(db: f32) -> f32 {
     10f32.powf(db / 20.0)
@@ -617,17 +618,27 @@ static BYPASS_ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// the bound by keeping an old allocation alive until the audio thread acknowledges it.
 type BypassReservation<'a> = super::compensation::StorageReservation<'a>;
 
+#[cfg(test)]
 fn bypass_allocation_bytes(total_latency: u32) -> anyhow::Result<usize> {
+    bypass_allocation_bytes_for_ports(total_latency, &AudioPorts::default())
+}
+
+fn bypass_allocation_bytes_for_ports(total_latency: u32, ports: &AudioPorts) -> anyhow::Result<usize> {
     super::compensation::AudioDelay::allocation_frames(total_latency as u64)?;
+    let channels = ports.outputs.iter().find(|port| port.main).map_or(1, |port| port.channels);
+    // Mono buffers keep a spare right plane for legacy stereo processors.
+    let output_channels: usize = ports.outputs.iter().map(|port| port.channels.max(2)).sum();
     // Include the warmed output and MidiBuf owned by PluginProc as well as delay storage.
     // Standalone restart fallbacks conservatively reserve the same overhead.
     let fixed = BYPASS_MIDI_CAPACITY
         .checked_mul(size_of::<super::compensation::TimedMidi>())
-        .and_then(|n| n.checked_add(super::MAX_BLOCK * 2 * size_of::<f32>()))
+        .and_then(|n| n.checked_add(super::MAX_BLOCK * output_channels * size_of::<f32>()))
         .and_then(|n| n.checked_add(2 * MidiBuf::CAPACITY * size_of::<MidiEvent>()))
         .and_then(|n| n.checked_add(4096))
         .ok_or_else(|| anyhow::anyhow!("prepared bypass allocation size overflow"))?;
-    super::compensation::AudioDelay::allocation_bytes(u64::from(total_latency).max(BYPASS_HISTORY_RESERVE))?
+    super::compensation::AudioDelay::allocation_bytes_channels(
+        u64::from(total_latency).max(BYPASS_HISTORY_RESERVE), channels,
+    )?
     .checked_add(fixed)
     .ok_or_else(|| anyhow::anyhow!("prepared bypass allocation size overflow"))
 }
@@ -638,56 +649,136 @@ pub struct LatencyBypass {
     audio: super::compensation::AudioDelay,
     midi: super::compensation::MidiDelay,
     instrument: bool,
+    ports: AudioPorts,
+    main_input: Option<usize>,
+    main_output: Option<usize>,
+    /// Prepared outputs travel with the fallback when topology changes, so retired
+    /// buffers are reclaimed on the control thread together with their reservation.
+    outputs: Vec<StereoBuf>,
     cursor: u64,
     // Declared last: release the reservation only after delay storage has been destroyed.
     _reservation: BypassReservation<'static>,
 }
 
 impl LatencyBypass {
+    #[cfg(test)]
     pub fn new(total_latency: u32, bridge_latency: u32, instrument: bool) -> anyhow::Result<Self> {
+        Self::with_ports(total_latency, bridge_latency, instrument, &AudioPorts::default())
+    }
+
+    pub fn with_ports(
+        total_latency: u32,
+        bridge_latency: u32,
+        instrument: bool,
+        ports: &AudioPorts,
+    ) -> anyhow::Result<Self> {
         super::timing::NodeTiming::from_total(total_latency, bridge_latency)?;
+        ports.validate()?;
+        let main_input = ports.inputs.iter().position(|port| port.main);
+        let main_output = ports.outputs.iter().position(|port| port.main);
+        let channels = main_output.map_or(1, |index| ports.outputs[index].channels);
+        let capacity = u64::from(total_latency).max(BYPASS_HISTORY_RESERVE);
         let reservation = BypassReservation::reserve_in(
             &BYPASS_ALLOCATED_BYTES,
             BYPASS_BUDGET_BYTES,
-            bypass_allocation_bytes(total_latency)?
-                - super::compensation::AudioDelay::allocation_bytes(u64::from(total_latency).max(BYPASS_HISTORY_RESERVE))?,
+            bypass_allocation_bytes_for_ports(total_latency, ports)?
+                - super::compensation::AudioDelay::allocation_bytes_channels(capacity, channels)?,
         )?;
         Ok(Self {
-            audio: super::compensation::AudioDelay::with_budget(
+            audio: super::compensation::AudioDelay::with_budget_channels(
                 total_latency as u64,
-                u64::from(total_latency).max(BYPASS_HISTORY_RESERVE),
+                capacity,
+                channels,
                 &BYPASS_ALLOCATED_BYTES,
                 BYPASS_BUDGET_BYTES,
             )?,
             midi: super::compensation::MidiDelay::new(bridge_latency as u64, BYPASS_MIDI_CAPACITY)?,
             instrument,
+            ports: ports.clone(),
+            main_input,
+            main_output,
+            outputs: ports.outputs.iter().map(|port| StereoBuf::with_channels(port.channels)).collect(),
             cursor: 0,
             _reservation: reservation,
         })
     }
 
+    fn render_audio(
+        audio: &mut super::compensation::AudioDelay,
+        source: Option<&StereoBuf>,
+        main_output: Option<usize>,
+        n: usize,
+        outputs: &mut [StereoBuf],
+    ) {
+        for output in outputs.iter_mut() { output.clear(n); }
+        if let Some(output) = main_output.and_then(|index| outputs.get_mut(index)) {
+            audio.write(source, output, n);
+        }
+    }
+
+    fn source<'a>(&self, inputs: &'a [StereoBuf]) -> Option<&'a StereoBuf> {
+        if self.instrument { None } else { self.main_input.and_then(|index| inputs.get(index)) }
+    }
+
+    fn render_cached(&mut self, n: usize, inputs: &[StereoBuf]) {
+        let source = self.source(inputs);
+        Self::render_audio(&mut self.audio, source, self.main_output, n, &mut self.outputs);
+    }
+
+    fn render_cached_timed(
+        &mut self,
+        first_sample: u64,
+        n: usize,
+        inputs: &[StereoBuf],
+        midi_in: &[MidiEvent],
+        midi_out: &mut MidiBuf,
+    ) {
+        self.align_cursor(first_sample);
+        self.render_cached(n, inputs);
+        self.midi.process(midi_in, midi_out, first_sample, n);
+        self.cursor = first_sample.saturating_add(n as u64);
+    }
+
+    fn align_cursor(&mut self, first_sample: u64) {
+        if first_sample != self.cursor {
+            self.audio.invalidate();
+            self.midi.invalidate();
+        }
+    }
+
+    /// Manual bypass has one dry route: main input to main output. Auxiliary inputs
+    /// (including sidechains) are never copied to auxiliary outputs.
+    fn copy_immediate(&self, n: usize, inputs: &[StereoBuf], outputs: &mut [StereoBuf]) {
+        for output in outputs.iter_mut() { output.clear(n); }
+        if let Some(source) = self.source(inputs)
+            && let Some(output) = self.main_output.and_then(|index| outputs.get_mut(index))
+        {
+            output.copy_from(source, n);
+        }
+    }
+
     fn inherit(&mut self, previous: &mut Self) {
         // A metadata-only latency change is continuous audio time. Preserve the samples
         // already rendered into the dry history rather than priming a fresh delay.
-        self.audio.inherit(&mut previous.audio);
+        fn identity(port: &crate::plugins::AudioPort) -> (&str, usize, Option<&str>) {
+            (&port.id, port.channels, port.layout.as_deref())
+        }
+        let same_input = self.main_input.map(|index| identity(&self.ports.inputs[index]))
+            == previous.main_input.map(|index| identity(&previous.ports.inputs[index]));
+        let same_output = self.main_output.map(|index| identity(&self.ports.outputs[index]))
+            == previous.main_output.map(|index| identity(&previous.ports.outputs[index]));
+        if same_input && same_output { self.audio.inherit(&mut previous.audio); }
         self.midi.inherit(&mut previous.midi);
         self.cursor = previous.cursor;
     }
 }
 
 impl Processor for LatencyBypass {
+    fn audio_ports(&self) -> Option<AudioPorts> { Some(self.ports.clone()) }
+
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
-        let source = if self.instrument {
-            None
-        } else {
-            inputs.first()
-        };
-        if let Some(out) = outputs.first_mut() {
-            self.audio.write(source, out, n);
-        }
-        for out in outputs.iter_mut().skip(1) {
-            out.clear(n);
-        }
+        let source = self.source(inputs);
+        Self::render_audio(&mut self.audio, source, self.main_output, n, outputs);
     }
 
     fn process_midi(
@@ -710,10 +801,7 @@ impl Processor for LatencyBypass {
         midi_in: &[MidiEvent],
         midi_out: &mut MidiBuf,
     ) {
-        if first_sample != self.cursor {
-            self.audio.invalidate();
-            self.midi.invalidate();
-        }
+        self.align_cursor(first_sample);
         self.process(n, inputs, outputs);
         self.midi.process(midi_in, midi_out, first_sample, n);
         self.cursor = first_sample.saturating_add(n as u64);
@@ -722,7 +810,6 @@ impl Processor for LatencyBypass {
 
 struct PreparedBypass {
     fallback: Box<LatencyBypass>,
-    audio: Vec<StereoBuf>,
     midi: MidiBuf,
 }
 
@@ -749,6 +836,7 @@ impl PluginProc {
         bridge_latency: u32,
         instrument: bool,
     ) -> anyhow::Result<Self> {
+        let ports = inner.audio_ports().unwrap_or_default();
         Ok(Self {
             inner: Some(inner),
             bypass: false,
@@ -758,12 +846,12 @@ impl PluginProc {
             inner_cleanup: false,
             resume_midi: MidiBuf::new(),
             delayed: Some(PreparedBypass {
-                fallback: Box::new(LatencyBypass::new(
+                fallback: Box::new(LatencyBypass::with_ports(
                     total_latency,
                     bridge_latency,
                     instrument,
+                    &ports,
                 )?),
-                audio: vec![StereoBuf::new()],
                 midi: MidiBuf::new(),
             }),
         })
@@ -783,6 +871,11 @@ impl PluginProc {
 }
 
 impl Processor for PluginProc {
+    fn audio_ports(&self) -> Option<AudioPorts> {
+        self.delayed.as_ref().map(|delayed| delayed.fallback.ports.clone())
+            .or_else(|| self.inner.as_ref().and_then(|inner| inner.audio_ports()))
+    }
+
     fn set_transport(&mut self, transport: Transport) {
         if let Some(inner) = &mut self.inner {
             inner.set_transport(transport);
@@ -791,36 +884,25 @@ impl Processor for PluginProc {
 
     fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
         if let Some(delayed) = &mut self.delayed {
-            delayed.fallback.process(n, inputs, &mut delayed.audio);
+            delayed.fallback.render_cached(n, inputs);
             if let Some(inner) = &mut self.inner
                 && (!self.bypass || self.delay_manual_bypass)
             {
                 inner.process(n, inputs, outputs);
             }
             if self.bypass || self.inner.is_none() {
-                for (index, out) in outputs.iter_mut().enumerate() {
-                    let dry = if self.bypass && !self.delay_manual_bypass {
-                        inputs.get(index)
-                    } else {
-                        delayed.audio.get(index)
-                    };
-                    if let Some(dry) = dry {
-                        out.l[..n].copy_from_slice(&dry.l[..n]);
-                        out.r[..n].copy_from_slice(&dry.r[..n]);
-                    } else {
-                        out.clear(n);
+                if self.bypass && !self.delay_manual_bypass {
+                    delayed.fallback.copy_immediate(n, inputs, outputs);
+                } else {
+                    for (index, output) in outputs.iter_mut().enumerate() {
+                        if let Some(dry) = delayed.fallback.outputs.get(index) {
+                            output.copy_from(dry, n);
+                        } else { output.clear(n); }
                     }
                 }
             }
         } else if self.bypass || self.inner.is_none() {
-            for (index, out) in outputs.iter_mut().enumerate() {
-                if let Some(input) = inputs.get(index) {
-                    out.l[..n].copy_from_slice(&input.l[..n]);
-                    out.r[..n].copy_from_slice(&input.r[..n]);
-                } else {
-                    out.clear(n);
-                }
-            }
+            for output in outputs { output.clear(n); }
         } else if let Some(inner) = &mut self.inner {
             inner.process(n, inputs, outputs);
         }
@@ -869,11 +951,10 @@ impl Processor for PluginProc {
         };
         if let Some(delayed) = &mut self.delayed {
             delayed.midi.clear();
-            delayed.fallback.process_timed(
+            delayed.fallback.render_cached_timed(
                 first_sample,
                 n,
                 inputs,
-                &mut delayed.audio,
                 midi_in,
                 &mut delayed.midi,
             );
@@ -883,17 +964,13 @@ impl Processor for PluginProc {
                 inner.process_timed(first_sample, n, inputs, outputs, inner_midi, midi_out);
             }
             if self.bypass || self.inner.is_none() {
-                for (index, output) in outputs.iter_mut().enumerate() {
-                    let dry = if self.bypass && !self.delay_manual_bypass {
-                        inputs.get(index)
-                    } else {
-                        delayed.audio.get(index)
-                    };
-                    if let Some(dry) = dry {
-                        output.l[..n].copy_from_slice(&dry.l[..n]);
-                        output.r[..n].copy_from_slice(&dry.r[..n]);
-                    } else {
-                        output.clear(n);
+                if self.bypass && !self.delay_manual_bypass {
+                    delayed.fallback.copy_immediate(n, inputs, outputs);
+                } else {
+                    for (index, output) in outputs.iter_mut().enumerate() {
+                        if let Some(dry) = delayed.fallback.outputs.get(index) {
+                            output.copy_from(dry, n);
+                        } else { output.clear(n); }
                     }
                 }
                 midi_out.clear();
@@ -907,14 +984,7 @@ impl Processor for PluginProc {
                 }
             }
         } else if self.bypass || self.inner.is_none() {
-            for (index, output) in outputs.iter_mut().enumerate() {
-                if let Some(input) = inputs.get(index) {
-                    output.l[..n].copy_from_slice(&input.l[..n]);
-                    output.r[..n].copy_from_slice(&input.r[..n]);
-                } else {
-                    output.clear(n);
-                }
-            }
+            for output in outputs { output.clear(n); }
             for event in midi_in {
                 midi_out.push(*event);
             }
@@ -1308,6 +1378,104 @@ mod tests {
                 .all(|event| event.data[0] & 0xf0 == 0xb0)
         );
         assert_eq!(midi.events().last(), Some(&on));
+    }
+
+    fn multibus_ports() -> AudioPorts {
+        let port = |id: &str, channels, main| crate::plugins::AudioPort {
+            id: id.into(), name: id.into(), channels, main, layout: None,
+        };
+        AudioPorts {
+            inputs: vec![port("detector", 1, false), port("program", 6, true)],
+            outputs: vec![port("aux", 2, false), port("processed", 6, true)],
+        }
+    }
+
+    struct BusProbe(AudioPorts);
+
+    impl Processor for BusProbe {
+        fn audio_ports(&self) -> Option<AudioPorts> { Some(self.0.clone()) }
+        fn process(&mut self, n: usize, _: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
+            for output in outputs {
+                for channel in 0..output.channels() { output.channel_mut(channel)[..n].fill(100.0); }
+            }
+        }
+    }
+
+    #[test]
+    fn multichannel_bypass_routes_only_the_named_main_buses() {
+        let ports = multibus_ports();
+        for delayed in [false, true] {
+            let mut proc = if delayed {
+                PluginProc::with_latency(Box::new(BusProbe(ports.clone())), 2, 0, false)
+            } else {
+                PluginProc::with_restart_latency(Box::new(BusProbe(ports.clone())), 2, 0, false)
+            }.unwrap();
+            assert_eq!(proc.audio_ports(), Some(ports.clone()));
+            proc.set_param(0, 1.0);
+            let mut inputs = vec![StereoBuf::with_channels(1), StereoBuf::with_channels(6)];
+            inputs[0].l[..8].fill(99.0);
+            for channel in 0..6 { inputs[1].channel_mut(channel)[..8].fill((channel + 1) as f32); }
+            let mut outputs = vec![StereoBuf::new(), StereoBuf::with_channels(6)];
+            let mut midi = MidiBuf::new();
+            proc.process_timed(0, 8, &mut inputs, &mut outputs, &[], &mut midi);
+            assert!(outputs[0].l[..8].iter().all(|sample| *sample == 0.0));
+            assert!(outputs[0].r[..8].iter().all(|sample| *sample == 0.0));
+            for channel in 0..6 {
+                let start = if delayed { 2 } else { 0 };
+                assert!(outputs[1].channel(channel)[..start].iter().all(|sample| *sample == 0.0));
+                assert!(outputs[1].channel(channel)[start..8].iter().all(|sample| *sample == (channel + 1) as f32));
+            }
+        }
+    }
+
+    #[test]
+    fn multichannel_restart_retains_warm_main_history_across_port_reordering() {
+        let ports = multibus_ports();
+        let mut proc = PluginProc::with_latency(Box::new(BusProbe(ports.clone())), 2, 0, false).unwrap();
+        let mut inputs = vec![StereoBuf::with_channels(1), StereoBuf::with_channels(6)];
+        for channel in 0..6 {
+            for frame in 0..8 { inputs[1].channel_mut(channel)[frame] = (10 * channel + frame) as f32; }
+        }
+        let mut outputs = vec![StereoBuf::new(), StereoBuf::with_channels(6)];
+        let mut midi = MidiBuf::new();
+        proc.process_timed(0, 8, &mut inputs, &mut outputs, &[], &mut midi);
+        let parked = proc.replace_plugin_inner(None);
+        assert!(parked.is_some());
+        assert_eq!(proc.audio_ports(), Some(ports.clone()));
+        let mut reordered = ports;
+        reordered.outputs.swap(0, 1);
+        reordered.outputs[0].name = "Renamed main output".into();
+        let retired = proc.replace_latency_bypass(Box::new(
+            LatencyBypass::with_ports(4, 0, false, &reordered).unwrap(),
+        ));
+        assert_eq!(retired.audio.frames(), 2);
+        assert_eq!(proc.audio_ports(), Some(reordered));
+        let mut outputs = vec![StereoBuf::with_channels(6), StereoBuf::new()];
+        proc.process_timed(8, 1, &mut inputs, &mut outputs, &[], &mut midi);
+        for channel in 0..6 { assert_eq!(outputs[0].channel(channel)[0], (10 * channel + 4) as f32); }
+        assert_eq!(outputs[1].l[0], 0.0);
+        assert_eq!(outputs[1].r[0], 0.0);
+    }
+
+    #[test]
+    fn immediate_instrument_bypass_and_unmarked_aux_buses_are_silent() {
+        let ports = multibus_ports();
+        for instrument in [false, true] {
+            let mut ports = ports.clone();
+            if !instrument { ports.inputs[1].main = false; }
+            let mut proc = PluginProc::with_restart_latency(Box::new(BusProbe(ports)), 0, 0, instrument).unwrap();
+            proc.set_param(0, 1.0);
+            let mut inputs = vec![StereoBuf::with_channels(1), StereoBuf::with_channels(6)];
+            inputs[0].l[..8].fill(99.0);
+            for channel in 0..6 { inputs[1].channel_mut(channel)[..8].fill(1.0); }
+            let mut outputs = vec![StereoBuf::new(), StereoBuf::with_channels(6)];
+            proc.process(8, &mut inputs, &mut outputs);
+            for output in outputs {
+                for channel in 0..output.channels() {
+                    assert!(output.channel(channel)[..8].iter().all(|sample| *sample == 0.0));
+                }
+            }
+        }
     }
 
     #[test]

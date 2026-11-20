@@ -19,8 +19,10 @@ are not routed here.
 - Worker uses `Host::default().create_local`, avoiding recursive isolation.
 - Optional instance hooks: `remote_status`, `request_remote_restart`, `bridge_latency`,
   `remote_counters` (underrun blocks, overflow events/slot submissions).
-- `idle` adopts latency, parameter and MIDI-port metadata without replacing the live
-  processor. Graph routing and prepared dry-path timing update independently.
+- `idle` adopts latency, parameter, MIDI-port and named audio-bus metadata. Changes to
+  bus identity, order, channel widths, layout or main-bus designation request a graph-side
+  processor replacement with buffers prepared on the control thread. Display-name,
+  parameter and latency updates retain the live processor and its audio history.
 - `Editor::ready` is a cached acknowledgement that child open completed, not merely
   that parent enqueued a request. Each editor has a monotonic token; acknowledgements,
   geometry and close requests cannot accidentally affect a replacement editor.
@@ -31,8 +33,12 @@ Native 64-bit targets with 32/64-bit atomics only. The file-backed memmap contai
 no process addresses, Rust containers, rtrb endpoints or ownership pointers. Header
 checks validate protocol version, layout size, immutable worker generation, quantum
 and capacities. An independently advanced processing epoch invalidates samples on
-destructive state load. Warm plugin activation preserves the epoch and queued audio;
-manual worker recreation supplies a new mapping generation.
+destructive state load or an audio-bus topology change. Warm plugin activation with
+unchanged buses preserves the epoch and queued audio. Manual worker recreation supplies
+a new mapping generation. Each quantum includes bounded input/output bus shapes and
+bus-identity signatures, so audio from an old topology cannot be read as new buses.
+The shared audio plane contains consecutive planar channels and is reused for output
+only after the worker has copied every input channel into its prepared bus buffers.
 
 Current **provisional**, not performance-qualified values:
 
@@ -42,6 +48,8 @@ Current **provisional**, not performance-qualified values:
 | Bridge delay D | 4096 frames (16 Q) |
 | Slots | 32 |
 | Short MIDI per slot | 512 |
+| Audio buses per direction | 32 |
+| Total audio channels per direction | 64 |
 | Parent tagged audio history | 131072 frames |
 | Maximum plugin algorithm latency | 65536 frames |
 | State cache blob | 1 MiB |
@@ -74,7 +82,8 @@ minimum pending sequence (not physical array index). The parent never waits for
 completion and never spins for a free slot.
 
 Every output sample is overwritten. Missing results use fixed D+algorithm-latency
-dry history for effects and silence for instruments. MIDI is **not** replayed on
+dry history for an effect's main output and silence for instruments and auxiliary
+outputs. Sidechain inputs never become dry auxiliary outputs. MIDI is **not** replayed on
 fault; bounded all-notes-off/sustain-reset is emitted after detected discontinuity.
 Overflow and underrun counters are available; no malloc, formatting, file IO,
 spawn, join or blocking lock is used by parent process callbacks. Parent uses

@@ -3,6 +3,7 @@ use super::{
     shared::{self, DELAY, FREE, INPUT, MAX_LATENCY, MIDI, OUTPUT, Q, SLOTS},
 };
 use crate::engine::{MidiBuf, MidiEvent, Processor, StereoBuf, Transport};
+use crate::plugins::AudioPorts;
 use std::sync::{Arc, atomic::Ordering};
 
 const HISTORY: usize = 131072;
@@ -18,8 +19,14 @@ pub(super) struct RemoteProcessor {
     core: Arc<Core>,
     cursor: u64,
     active: bool,
-    in_l: [f32; Q],
-    in_r: [f32; Q],
+    ports: AudioPorts,
+    input_layout: shared::WireAudioLayout,
+    output_layout: shared::WireAudioLayout,
+    input_audio: Vec<[f32; Q]>,
+    input_bindings: Vec<(usize, usize)>,
+    output_bindings: Vec<(usize, usize)>,
+    main_input: Option<usize>,
+    main_output: Option<usize>,
     in_midi: [shared::WireMidi; MIDI],
     in_count: usize,
     fill: usize,
@@ -27,11 +34,9 @@ pub(super) struct RemoteProcessor {
     transport: Transport,
     in_transport: Transport,
     sequence: u64,
-    wet_l: Vec<f32>,
-    wet_r: Vec<f32>,
+    wet: Vec<Vec<f32>>,
     wet_tags: Vec<u64>,
-    dry_l: Vec<f32>,
-    dry_r: Vec<f32>,
+    dry: Vec<Vec<f32>>,
     dry_tags: Vec<u64>,
     future: Vec<Timed>,
     notes_reset: bool,
@@ -43,14 +48,48 @@ pub(super) struct RemoteProcessor {
 }
 impl RemoteProcessor {
     pub fn new(core: Arc<Core>) -> Self {
+        let ports = core
+            .snapshot
+            .lock()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.audio_ports.clone())
+            .unwrap_or_default();
+        Self::with_ports(core, ports)
+    }
+
+    fn with_ports(core: Arc<Core>, ports: AudioPorts) -> Self {
+        // Called only on the control thread. Metadata has already passed validation.
+        debug_assert!(ports.validate().is_ok());
         let cursor = core.cursor.load(Ordering::Acquire);
+        let bindings = |ports: &[crate::plugins::AudioPort]| -> Vec<(usize, usize)> {
+            ports
+                .iter()
+                .enumerate()
+                .flat_map(|(bus, port)| (0..port.channels).map(move |channel| (bus, channel)))
+                .collect()
+        };
+        let input_bindings = bindings(&ports.inputs);
+        let output_bindings = bindings(&ports.outputs);
+        let main_input = ports.inputs.iter().position(|port| port.main);
+        let main_output = ports.outputs.iter().position(|port| port.main);
+        let dry_channels = main_output.map_or(0, |index| ports.outputs[index].channels);
         Self {
             core,
             map: None,
             cursor,
             active: true,
-            in_l: [0.0; Q],
-            in_r: [0.0; Q],
+            input_layout: shared::WireAudioLayout::new(&ports.inputs),
+            output_layout: shared::WireAudioLayout::new(&ports.outputs),
+            input_audio: vec![[0.0; Q]; input_bindings.len()],
+            wet: vec![vec![0.0; HISTORY]; output_bindings.len()],
+            dry: vec![vec![0.0; HISTORY]; dry_channels],
+            input_bindings,
+            output_bindings,
+            main_input,
+            main_output,
+            ports,
             in_midi: [shared::WireMidi::default(); MIDI],
             in_count: 0,
             fill: 0,
@@ -58,11 +97,7 @@ impl RemoteProcessor {
             transport: Transport::default(),
             in_transport: Transport::default(),
             sequence: 0,
-            wet_l: vec![0.0; HISTORY],
-            wet_r: vec![0.0; HISTORY],
             wet_tags: vec![u64::MAX; HISTORY],
-            dry_l: vec![0.0; HISTORY],
-            dry_r: vec![0.0; HISTORY],
             dry_tags: vec![u64::MAX; HISTORY],
             future: Vec::with_capacity(SLOTS * MIDI),
             notes_reset: false,
@@ -132,8 +167,16 @@ impl RemoteProcessor {
                     std::ptr::read_volatile(std::ptr::addr_of!((*payload).sequence)),
                 )
             };
+            let (input_layout, output_layout) = unsafe {
+                (
+                    std::ptr::read_volatile(std::ptr::addr_of!((*payload).input_layout)),
+                    std::ptr::read_volatile(std::ptr::addr_of!((*payload).output_layout)),
+                )
+            };
             let count = midi_count as usize;
-            if generation == self.epoch
+            if input_layout == self.input_layout
+                && output_layout == self.output_layout
+                && generation == self.epoch
                 && first_sample >= self.minimum_input
                 && frames as usize == Q
                 && count <= MIDI
@@ -145,14 +188,13 @@ impl RemoteProcessor {
                     let t = at + j as u64;
                     if t >= self.cursor {
                         let k = t as usize & (HISTORY - 1);
-                        let (left, right) = unsafe {
-                            (
-                                std::ptr::read_volatile(std::ptr::addr_of!((*payload).left[j])),
-                                std::ptr::read_volatile(std::ptr::addr_of!((*payload).right[j])),
-                            )
-                        };
-                        self.wet_l[k] = left;
-                        self.wet_r[k] = right;
+                        for (channel, history) in self.wet.iter_mut().enumerate() {
+                            history[k] = unsafe {
+                                std::ptr::read_volatile(
+                                    shared::Payload::channel_ptr(payload, channel).add(j),
+                                )
+                            };
+                        }
                         self.wet_tags[k] = t;
                     }
                 }
@@ -197,8 +239,11 @@ impl RemoteProcessor {
             p.frames = Q as u32;
             p.midi_count = self.in_count as u32;
             p.transport = self.in_transport.into();
-            p.left.copy_from_slice(&self.in_l);
-            p.right.copy_from_slice(&self.in_r);
+            p.input_layout = self.input_layout;
+            p.output_layout = self.output_layout;
+            for (channel, data) in self.input_audio.iter().enumerate() {
+                p.channel_mut(channel).copy_from_slice(data);
+            }
             if self.child_reset {
                 // A dropped quantum may contain a note-off. Deliver bounded panic to
                 // the child itself, not merely downstream; discard this quantum's notes.
@@ -235,8 +280,7 @@ impl RemoteProcessor {
         mut midi_out: Option<&mut MidiBuf>,
     ) {
         for o in outputs.iter_mut() {
-            o.l[..n].fill(0.0);
-            o.r[..n].fill(0.0);
+            o.clear(n);
         }
         if let Some(out) = midi_out.as_deref_mut() {
             out.clear();
@@ -255,40 +299,54 @@ impl RemoteProcessor {
         for j in 0..n {
             let t = self.cursor;
             let k = t as usize & (HISTORY - 1);
-            let (l, r) = inputs
-                .first()
-                .map(|b| (b.l[j], b.r[j]))
-                .unwrap_or((0.0, 0.0));
-            self.dry_l[k] = l;
-            self.dry_r[k] = r;
+            let input = self.main_input.and_then(|index| inputs.get(index));
+            let dry_channels = self.dry.len();
+            for (channel, history) in self.dry.iter_mut().enumerate() {
+                history[k] =
+                    input.map_or(0.0, |input| input.mapped_sample(channel, dry_channels, j));
+            }
             self.dry_tags[k] = t;
-            let mut audio = (0.0, 0.0);
-            if ready && t >= self.prime_until && self.wet_tags[k] == t {
-                audio = (self.wet_l[k], self.wet_r[k]);
-                self.wet_tags[k] = u64::MAX;
-            } else {
+            let wet = ready && t >= self.prime_until && self.wet_tags[k] == t;
+            let source = t.checked_sub(delay as u64).filter(|&source| {
+                source >= self.minimum_dry
+                    && self.dry_tags[source as usize & (HISTORY - 1)] == source
+            });
+            if !wet {
                 missed |= t >= self.prime_until;
-                if !self.core.instrument.load(Ordering::Relaxed)
-                    && let Some(source) = t.checked_sub(delay as u64)
+            }
+            for (flat, &(bus, channel)) in self.output_bindings.iter().enumerate() {
+                let audio = if wet {
+                    self.wet[flat][k]
+                } else if Some(bus) == self.main_output
+                    && !self.core.instrument.load(Ordering::Relaxed)
                 {
-                    let x = source as usize & (HISTORY - 1);
-                    if source >= self.minimum_dry && self.dry_tags[x] == source {
-                        audio = (self.dry_l[x], self.dry_r[x]);
-                    }
+                    source.map_or(0.0, |source| {
+                        self.dry[channel][source as usize & (HISTORY - 1)]
+                    })
+                } else {
+                    0.0
+                };
+                if let Some(output) = outputs
+                    .get_mut(bus)
+                    .filter(|output| channel < output.channels())
+                {
+                    output.channel_mut(channel)[j] = audio;
                 }
             }
-            if let Some(o) = outputs.first_mut() {
-                o.l[j] = audio.0;
-                o.r[j] = audio.1;
+            if wet {
+                self.wet_tags[k] = u64::MAX;
             }
             if self.fill == 0 {
                 self.first = t;
-                // Retain the clock at this quantum's first sample, even if a later host
-                // callback changes state before the quantum has finished accumulating.
+                // Preserve the song clock of a partial quantum across host callbacks.
                 self.in_transport = self.transport.at_offset(j);
             }
-            self.in_l[self.fill] = l;
-            self.in_r[self.fill] = r;
+            for (flat, &(bus, channel)) in self.input_bindings.iter().enumerate() {
+                self.input_audio[flat][self.fill] = inputs
+                    .get(bus)
+                    .filter(|input| channel < input.channels())
+                    .map_or(0.0, |input| input.channel(channel)[j]);
+            }
             // MIDI already has block-relative offsets; never clamp future events into now.
             while midi_index < midi.len() && (midi[midi_index].time as usize) <= j {
                 let e = &midi[midi_index];
@@ -354,6 +412,9 @@ impl RemoteProcessor {
 }
 
 impl Processor for RemoteProcessor {
+    fn audio_ports(&self) -> Option<AudioPorts> {
+        Some(self.ports.clone())
+    }
     fn set_transport(&mut self, transport: Transport) {
         self.transport = transport;
     }
@@ -440,6 +501,169 @@ mod tests {
         );
         let core = core(map.clone());
         (map, core)
+    }
+
+    fn ports(inputs: &[(usize, bool)], outputs: &[(usize, bool)]) -> AudioPorts {
+        let side = |values: &[(usize, bool)]| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, &(channels, main))| crate::plugins::AudioPort {
+                    id: index.to_string(),
+                    name: format!("Bus {index}"),
+                    channels,
+                    main,
+                    layout: None,
+                })
+                .collect()
+        };
+        AudioPorts {
+            inputs: side(inputs),
+            outputs: side(outputs),
+        }
+    }
+
+    #[test]
+    fn multibus_bridge_preserves_surround_sidechain_and_aux_outputs() {
+        let (map, core) = fixture();
+        let ports = ports(&[(4, true), (1, false)], &[(4, true), (2, false)]);
+        let mut processor = RemoteProcessor::with_ports(core.clone(), ports);
+        let mut input = [StereoBuf::with_channels(4), StereoBuf::with_channels(1)];
+        let mut output = [StereoBuf::with_channels(4), StereoBuf::with_channels(2)];
+        for channel in 0..4 {
+            input[0].channel_mut(channel)[..Q].fill(channel as f32 + 1.0);
+        }
+        input[1].channel_mut(0)[..Q].fill(0.5);
+        for quantum in 0..=DELAY / Q + 2 {
+            processor.process(Q, &mut input, &mut output);
+            if quantum >= DELAY / Q {
+                for (channel, expected) in [1.5, 2.0, 3.0, 4.0].into_iter().enumerate() {
+                    assert!(
+                        output[0].channel(channel)[..Q]
+                            .iter()
+                            .all(|&sample| sample == expected)
+                    );
+                }
+                assert!(
+                    output[1].channel(0)[..Q]
+                        .iter()
+                        .all(|&sample| sample == 1.0)
+                );
+                assert!(
+                    output[1].channel(1)[..Q]
+                        .iter()
+                        .all(|&sample| sample == 12.0)
+                );
+            }
+            for index in 0..SLOTS {
+                let slot = map.slot(index);
+                if slot
+                    .state
+                    .compare_exchange(INPUT, shared::WORKING, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    let payload = unsafe { slot.payload() };
+                    for frame in 0..Q {
+                        let sidechain = payload.channel(4)[frame];
+                        let room = payload.channel(3)[frame];
+                        payload.channel_mut(0)[frame] += sidechain;
+                        payload.channel_mut(4)[frame] = sidechain * 2.0;
+                        payload.channel_mut(5)[frame] = room * 3.0;
+                    }
+                    slot.state.store(OUTPUT, Ordering::Release);
+                }
+            }
+        }
+        // Failed effects return only the main stream; sidechain audio must never
+        // appear on an auxiliary output just because the bus indices line up.
+        core.ready.store(false, Ordering::Release);
+        processor.process(Q, &mut input, &mut output);
+        for channel in 0..4 {
+            assert!(
+                output[0].channel(channel)[..Q]
+                    .iter()
+                    .all(|&sample| sample == channel as f32 + 1.0)
+            );
+        }
+        assert!(
+            output[1].channel(0)[..Q]
+                .iter()
+                .all(|&sample| sample == 0.0)
+        );
+        assert!(
+            output[1].channel(1)[..Q]
+                .iter()
+                .all(|&sample| sample == 0.0)
+        );
+    }
+
+    #[test]
+    fn zero_input_instrument_and_zero_output_effect_keep_valid_timelines() {
+        let (map, core) = fixture();
+        core.instrument.store(true, Ordering::Release);
+        let mut instrument = RemoteProcessor::with_ports(core.clone(), ports(&[], &[(6, true)]));
+        let mut output = [StereoBuf::with_channels(6)];
+        for quantum in 0..=DELAY / Q {
+            instrument.process(Q, &mut [], &mut output);
+            if quantum == DELAY / Q {
+                for channel in 0..6 {
+                    assert!(
+                        output[0].channel(channel)[..Q]
+                            .iter()
+                            .all(|&sample| sample == channel as f32 + 1.0)
+                    );
+                }
+            }
+            for index in 0..SLOTS {
+                let slot = map.slot(index);
+                if slot
+                    .state
+                    .compare_exchange(INPUT, shared::WORKING, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    let payload = unsafe { slot.payload() };
+                    for channel in 0..6 {
+                        payload.channel_mut(channel).fill(channel as f32 + 1.0);
+                    }
+                    slot.state.store(OUTPUT, Ordering::Release);
+                }
+            }
+        }
+        core.ready.store(false, Ordering::Release);
+        instrument.process(Q, &mut [], &mut output);
+        for channel in 0..6 {
+            assert!(
+                output[0].channel(channel)[..Q]
+                    .iter()
+                    .all(|&sample| sample == 0.0)
+            );
+        }
+
+        let (map, core) = fixture();
+        let mut sink = RemoteProcessor::with_ports(core, ports(&[(1, true)], &[]));
+        let mut input = [StereoBuf::with_channels(1)];
+        for _ in 0..=DELAY / Q {
+            sink.process(Q, &mut input, &mut []);
+            echo(&map);
+        }
+        assert_eq!(sink.cursor, (DELAY + Q) as u64);
+    }
+
+    #[test]
+    fn topology_mismatch_does_not_reinterpret_queued_channels() {
+        let (map, core) = fixture();
+        let mut processor = RemoteProcessor::with_ports(core, ports(&[(2, true)], &[(4, true)]));
+        let mut input = [StereoBuf::new()];
+        let mut output = [StereoBuf::with_channels(4)];
+        processor.process(Q, &mut input, &mut output);
+        let slot = map.slot(0);
+        let payload = unsafe { slot.payload() };
+        payload.output_layout = shared::WireAudioLayout::new(&AudioPorts::default().outputs);
+        payload.left.fill(99.0);
+        slot.state.store(OUTPUT, Ordering::Release);
+        processor.collect();
+        assert!(processor.wet_tags.iter().all(|&tag| tag == u64::MAX));
+        assert_eq!(slot.state.load(Ordering::Acquire), FREE);
     }
     fn echo(map: &shared::Shared) {
         for i in 0..SLOTS {
@@ -669,7 +893,7 @@ mod tests {
             echo(&map);
         }
         let cursor = processor.cursor;
-        processor.wet_l[cursor as usize & (HISTORY - 1)] = 99.0;
+        processor.wet[0][cursor as usize & (HISTORY - 1)] = 99.0;
         processor.wet_tags[cursor as usize & (HISTORY - 1)] = cursor;
         processor.future.push(Timed {
             at: cursor,

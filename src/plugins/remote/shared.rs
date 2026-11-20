@@ -20,11 +20,64 @@ pub const DELAY: usize = 4096;
 pub const SLOTS: usize = 32;
 pub const MIDI: usize = 512;
 pub const MAX_LATENCY: usize = 65536;
+pub const AUDIO_CHANNELS: usize = crate::plugins::AudioPorts::MAX_CHANNELS;
+pub const AUDIO_PORTS: usize = crate::plugins::AudioPorts::MAX_PORTS;
 pub const FREE: u32 = 0;
 pub const INPUT: u32 = 1;
 pub const WORKING: u32 = 2;
 pub const OUTPUT: u32 = 3;
 const MAGIC: u64 = 0x4e504c4159455231;
+
+/// A bounded bus shape travels with each quantum so a configuration change cannot
+/// reinterpret old audio as new buses. Samples use consecutive planar channels.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WireAudioLayout {
+    pub count: u32,
+    pub channels: [u32; AUDIO_PORTS],
+    pub signature: u64,
+}
+
+impl WireAudioLayout {
+    pub fn new(ports: &[crate::plugins::AudioPort]) -> Self {
+        let mut layout = Self {
+            count: ports.len() as u32,
+            ..Self::default()
+        };
+        for (channel_count, port) in layout.channels.iter_mut().zip(ports) {
+            *channel_count = port.channels as u32;
+        }
+        // A deterministic signature also distinguishes reordered buses of equal width.
+        // It is a format discriminator, not an authentication or security mechanism.
+        layout.signature = 0xcbf29ce484222325;
+        for port in ports {
+            for byte in (port.id.len() as u64)
+                .to_le_bytes()
+                .into_iter()
+                .chain(port.id.bytes())
+                .chain((port.channels as u64).to_le_bytes())
+                .chain([u8::from(port.main)])
+                .chain((port.layout.as_ref().map_or(0, String::len) as u64).to_le_bytes())
+                .chain(port.layout.as_deref().unwrap_or_default().bytes())
+            {
+                layout.signature = (layout.signature ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+        layout
+    }
+
+    pub fn valid(&self) -> bool {
+        let count = self.count as usize;
+        count <= AUDIO_PORTS
+            && self.channels[..count].iter().all(|&channels| channels > 0)
+            && self.channels[..count]
+                .iter()
+                .map(|&channels| channels as u64)
+                .sum::<u64>()
+                <= AUDIO_CHANNELS as u64
+            && self.channels[count..].iter().all(|&channels| channels == 0)
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct WireMidi {
@@ -87,9 +140,41 @@ pub struct Payload {
     pub frames: u32,
     pub midi_count: u32,
     pub transport: WireTransport,
+    pub input_layout: WireAudioLayout,
+    pub output_layout: WireAudioLayout,
     pub left: [f32; Q],
     pub right: [f32; Q],
+    pub extra: [[f32; Q]; AUDIO_CHANNELS - 2],
     pub midi: [WireMidi; MIDI],
+}
+
+impl Payload {
+    pub fn channel(&self, index: usize) -> &[f32; Q] {
+        match index {
+            0 => &self.left,
+            1 => &self.right,
+            _ => &self.extra[index - 2],
+        }
+    }
+
+    pub fn channel_mut(&mut self, index: usize) -> &mut [f32; Q] {
+        match index {
+            0 => &mut self.left,
+            1 => &mut self.right,
+            _ => &mut self.extra[index - 2],
+        }
+    }
+
+    /// Obtain an address without borrowing memory a child may modify after publication.
+    pub unsafe fn channel_ptr(payload: *const Self, index: usize) -> *const f32 {
+        unsafe {
+            match index {
+                0 => std::ptr::addr_of!((*payload).left).cast(),
+                1 => std::ptr::addr_of!((*payload).right).cast(),
+                _ => std::ptr::addr_of!((*payload).extra[index - 2]).cast(),
+            }
+        }
+    }
 }
 #[repr(C, align(64))]
 pub struct Slot {
@@ -227,6 +312,34 @@ impl Drop for Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audio_layout_limits_and_bus_identity_are_checked() {
+        let ports = crate::plugins::AudioPorts::default();
+        let layout = WireAudioLayout::new(&ports.inputs);
+        assert!(layout.valid());
+        assert!(WireAudioLayout::new(&[]).valid());
+        let mut invalid = layout;
+        invalid.count = (AUDIO_PORTS + 1) as u32;
+        assert!(!invalid.valid());
+        invalid = layout;
+        invalid.channels[0] = (AUDIO_CHANNELS + 1) as u32;
+        assert!(!invalid.valid());
+        invalid = layout;
+        invalid.channels[0] = 0;
+        assert!(!invalid.valid());
+        invalid = layout;
+        invalid.channels[1] = 1;
+        assert!(!invalid.valid());
+        let mut renamed = ports.inputs.clone();
+        renamed[0].name = "A new display name".into();
+        assert_eq!(layout, WireAudioLayout::new(&renamed));
+        renamed[0].layout = Some("another channel arrangement".into());
+        assert_ne!(layout, WireAudioLayout::new(&renamed));
+        renamed[0].layout = ports.inputs[0].layout.clone();
+        renamed[0].id = "another bus".into();
+        assert_ne!(layout, WireAudioLayout::new(&renamed));
+    }
+
     #[test]
     fn rejects_invalid_transport_metadata() {
         for invalid in [

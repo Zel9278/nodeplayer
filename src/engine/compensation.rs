@@ -40,6 +40,11 @@ pub struct AudioDelay {
     pages: Vec<Box<AudioPage>>,
     cursor: u64,
     valid: usize,
+    channels: usize,
+    /// Additional channel pairs retain the same paged, constant-time inheritance as the
+    /// original stereo history. A mono bus intentionally reserves one complete pair.
+    extra: Vec<AudioDelay>,
+    _extra_reservation: Option<StorageReservation<'static>>,
 }
 
 impl AudioDelay {
@@ -62,8 +67,34 @@ impl AudioDelay {
             * (size_of::<AudioPage>() + size_of::<Box<AudioPage>>()))
     }
 
+    pub fn allocation_bytes_channels(frames: u64, channels: usize) -> Result<usize> {
+        ensure!(
+            (1..=crate::plugins::AudioPorts::MAX_CHANNELS).contains(&channels),
+            "invalid delay channel count"
+        );
+        let pairs = channels.div_ceil(2);
+        Self::allocation_bytes(frames)?
+            .checked_mul(pairs)
+            .and_then(|bytes| bytes.checked_add((pairs - 1) * size_of::<Self>()))
+            .ok_or_else(|| anyhow::anyhow!("audio delay allocation size overflow"))
+    }
+
     pub fn new(frames: u64) -> Result<Self> {
         Self::prepare(frames, frames, None)
+    }
+
+    pub fn new_channels(frames: u64, channels: usize) -> Result<Self> {
+        ensure!(
+            (1..=crate::plugins::AudioPorts::MAX_CHANNELS).contains(&channels),
+            "invalid delay channel count"
+        );
+        let mut delay = Self::new(frames)?;
+        delay.channels = channels;
+        delay.extra = Vec::with_capacity(channels.div_ceil(2) - 1);
+        for _ in 1..channels.div_ceil(2) {
+            delay.extra.push(Self::new(frames)?);
+        }
+        Ok(delay)
     }
 
     pub(super) fn with_budget(
@@ -75,6 +106,31 @@ impl AudioDelay {
         let reservation =
             StorageReservation::reserve_in(budget, limit, Self::allocation_bytes(capacity)?)?;
         Self::prepare(frames, capacity, Some(reservation))
+    }
+
+    pub(super) fn with_budget_channels(
+        frames: u64,
+        capacity: u64,
+        channels: usize,
+        budget: &'static AtomicUsize,
+        limit: usize,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=crate::plugins::AudioPorts::MAX_CHANNELS).contains(&channels),
+            "invalid delay channel count"
+        );
+        let mut delay = Self::with_budget(frames, capacity, budget, limit)?;
+        delay.channels = channels;
+        delay._extra_reservation = Some(StorageReservation::reserve_in(
+            budget,
+            limit,
+            (channels.div_ceil(2) - 1) * size_of::<Self>(),
+        )?);
+        delay.extra = Vec::with_capacity(channels.div_ceil(2) - 1);
+        for _ in 1..channels.div_ceil(2) {
+            delay.extra.push(Self::with_budget(frames, capacity, budget, limit)?);
+        }
+        Ok(delay)
     }
 
     fn prepare(
@@ -107,6 +163,9 @@ impl AudioDelay {
             pages,
             cursor: 0,
             valid: 0,
+            channels: 2,
+            extra: Vec::new(),
+            _extra_reservation: None,
         })
     }
 
@@ -117,6 +176,8 @@ impl AudioDelay {
 
     fn allocated_bytes(&self) -> usize {
         self.pages.len() * (size_of::<AudioPage>() + size_of::<Box<AudioPage>>())
+            + self.extra.iter().map(Self::allocated_bytes).sum::<usize>()
+            + self.extra.capacity() * size_of::<Self>()
     }
 
     fn capacity(&self) -> usize {
@@ -126,6 +187,9 @@ impl AudioDelay {
     /// Invalidate without zeroing a potentially long allocation on the audio thread.
     pub fn invalidate(&mut self) {
         self.valid = 0;
+        for extra in &mut self.extra {
+            extra.invalidate();
+        }
     }
 
     /// Move prepared pages, never copy an arbitrary-length audio history. Ordinary edits
@@ -133,6 +197,12 @@ impl AudioDelay {
     /// explicit latency limit) and copies at most one fixed 1024-frame boundary page. All
     /// unused allocations stay in `previous` for control-thread retirement.
     pub fn inherit(&mut self, previous: &mut Self) {
+        if self.channels != previous.channels {
+            return;
+        }
+        for (new, old) in self.extra.iter_mut().zip(&mut previous.extra) {
+            new.inherit(old);
+        }
         let retained = previous.valid.min(self.capacity());
         if previous.capacity() == self.capacity() {
             std::mem::swap(&mut self.pages, &mut previous.pages);
@@ -195,13 +265,76 @@ impl AudioDelay {
         delayed
     }
 
+    fn next_bus_frame(
+        &mut self,
+        source: Option<&StereoBuf>,
+        frame: usize,
+        delayed: &mut [f32; crate::plugins::AudioPorts::MAX_CHANNELS],
+    ) {
+        let channels = self.channels;
+        let input = source
+            .map(|bus| {
+                [
+                    bus.mapped_sample(0, channels, frame),
+                    if channels > 1 {
+                        bus.mapped_sample(1, channels, frame)
+                    } else {
+                        0.0
+                    },
+                ]
+            })
+            .unwrap_or([0.0; 2]);
+        let value = self.next(input);
+        delayed[0] = value[0];
+        if channels > 1 {
+            delayed[1] = value[1];
+        }
+        for (pair, delay) in self.extra.iter_mut().enumerate() {
+            let channel = 2 + pair * 2;
+            let input = source
+                .map(|bus| {
+                    [
+                        bus.mapped_sample(channel, channels, frame),
+                        if channel + 1 < channels {
+                            bus.mapped_sample(channel + 1, channels, frame)
+                        } else {
+                            0.0
+                        },
+                    ]
+                })
+                .unwrap_or([0.0; 2]);
+            let value = delay.next(input);
+            delayed[channel] = value[0];
+            if channel + 1 < channels {
+                delayed[channel + 1] = value[1];
+            }
+        }
+    }
+
+    fn mapped_value(&self, values: &[f32], channels: usize, channel: usize) -> f32 {
+        if self.channels == 2 && channels == 1 {
+            0.5 * (values[0] + values[1])
+        } else if self.channels == 1 && channels == 2 {
+            values[0]
+        } else if channel < self.channels {
+            values[channel]
+        } else {
+            0.0
+        }
+    }
+
     /// A missing source feeds silence but still advances history.
     pub fn add(&mut self, source: Option<&StereoBuf>, target: &mut StereoBuf, n: usize) {
-        for i in 0..n {
-            let input = source.map(|b| [b.l[i], b.r[i]]).unwrap_or([0.0; 2]);
-            let value = self.next(input);
-            target.l[i] += value[0];
-            target.r[i] += value[1];
+        let mut delayed = [0.0; crate::plugins::AudioPorts::MAX_CHANNELS];
+        for frame in 0..n {
+            self.next_bus_frame(source, frame, &mut delayed);
+            let target_channels = target.channels();
+            for channel in 0..target_channels {
+                // Layout changes are published separately from schedules. Keep any
+                // transient old plan safe until its prepared replacement is applied.
+                target.channel_mut(channel)[frame] +=
+                    self.mapped_value(&delayed, target_channels, channel);
+            }
         }
     }
 
@@ -211,12 +344,11 @@ impl AudioDelay {
     }
 
     pub fn mix_device(&mut self, source: Option<&StereoBuf>, out: &mut [f32], channels: usize) {
+        let mut delayed = [0.0; crate::plugins::AudioPorts::MAX_CHANNELS];
         for (i, frame) in out.chunks_exact_mut(channels).enumerate() {
-            let input = source.map(|b| [b.l[i], b.r[i]]).unwrap_or([0.0; 2]);
-            let value = self.next(input);
-            frame[0] += value[0];
-            if channels > 1 {
-                frame[1] += value[1];
+            self.next_bus_frame(source, i, &mut delayed);
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                *sample += self.mapped_value(&delayed, channels, channel);
             }
         }
     }
@@ -450,42 +582,63 @@ pub struct TimingPlan {
 }
 
 impl TimingPlan {
+    #[cfg(test)]
     pub fn prepare(
         analysis: &TimingAnalysis,
         limits: TimingLimits,
         steps: &[super::Step],
+    ) -> Result<Self> {
+        Self::prepare_with_channels(analysis, limits, steps, &std::collections::BTreeMap::new())
+    }
+
+    /// Destination input widths determine storage because channel conversion happens
+    /// before delay. Missing entries describe legacy stereo inputs.
+    pub fn prepare_with_channels(
+        analysis: &TimingAnalysis,
+        limits: TimingLimits,
+        steps: &[super::Step],
+        input_channels: &std::collections::BTreeMap<(u32, usize), usize>,
     ) -> Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static EPOCH: AtomicU64 = AtomicU64::new(1);
         let epoch = EPOCH
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| anyhow::anyhow!("plan epoch exhausted"))?;
-        // Timing analysis charges the requested signal delay. Charge the continuously
-        // warmed reserve as well, before any route allocation takes place.
-        let mut allocated_delay_bytes = analysis.delay_bytes;
-        for delay in analysis
-            .edges
-            .iter()
-            .filter_map(|edge| {
-                matches!(edge.key.kind, EdgeKind::Audio { .. }).then_some(edge.delay_frames)
-            })
-            .chain(analysis.sinks.iter().map(|&(_, delay)| delay))
-        {
-            let reserve = AudioDelay::allocation_bytes(delay)?
-                - usize::try_from(delay)? * size_of::<[f32; 2]>();
+        // Recalculate exact prepared audio storage, including all channels and the warm
+        // reserve, before allocating routes. The timing analysis itself is width agnostic.
+        let channels = |node, input| input_channels.get(&(node, input)).copied().unwrap_or(2);
+        let midi_bytes = limits
+            .midi_capacity
+            .checked_mul(size_of::<TimedMidi>())
+            .ok_or_else(|| anyhow::anyhow!("MIDI history allocation size overflow"))?;
+        let mut allocated_delay_bytes = 0usize;
+        for edge in &analysis.edges {
+            let bytes = match edge.key.kind {
+                EdgeKind::Audio { input, .. } => AudioDelay::allocation_bytes_channels(
+                    edge.delay_frames,
+                    channels(edge.key.to, input),
+                )?,
+                EdgeKind::Midi => midi_bytes,
+            };
             allocated_delay_bytes = allocated_delay_bytes
-                .checked_add(reserve)
+                .checked_add(bytes)
                 .ok_or_else(|| anyhow::anyhow!("audio history allocation size overflow"))?;
         }
-        for _ in analysis
-            .midi_outputs
-            .iter()
-            .filter(|(_, delay)| *delay == 0)
-        {
+        for &(node, delay) in &analysis.sinks {
             allocated_delay_bytes = allocated_delay_bytes
-                .checked_add(limits.midi_capacity * size_of::<TimedMidi>())
-                .ok_or_else(|| anyhow::anyhow!("MIDI history allocation size overflow"))?;
+                .checked_add(AudioDelay::allocation_bytes_channels(
+                    delay,
+                    channels(node, 0),
+                )?)
+                .ok_or_else(|| anyhow::anyhow!("sink history allocation size overflow"))?;
         }
+        allocated_delay_bytes = allocated_delay_bytes
+            .checked_add(
+                midi_bytes
+                    .checked_mul(analysis.midi_outputs.len())
+                    .ok_or_else(|| anyhow::anyhow!("MIDI history allocation size overflow"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("MIDI history allocation size overflow"))?;
         ensure!(
             allocated_delay_bytes <= limits.max_delay_bytes,
             "PDC delay memory budget exceeded ({} > {} bytes)",
@@ -495,7 +648,10 @@ impl TimingPlan {
         let mut edges = Vec::with_capacity(analysis.edges.len());
         for edge in &analysis.edges {
             let delay = match edge.key.kind {
-                EdgeKind::Audio { .. } => EdgeDelay::Audio(AudioDelay::new(edge.delay_frames)?),
+                EdgeKind::Audio { input, .. } => EdgeDelay::Audio(AudioDelay::new_channels(
+                    edge.delay_frames,
+                    channels(edge.key.to, input),
+                )?),
                 EdgeKind::Midi => EdgeDelay::Midi(Box::new(MidiDelay::new(
                     edge.delay_frames,
                     limits.midi_capacity,
@@ -544,7 +700,7 @@ impl TimingPlan {
             .map(|&(node, delay)| {
                 Ok(PreparedSink {
                     node,
-                    delay: AudioDelay::new(delay)?,
+                    delay: AudioDelay::new_channels(delay, channels(node, 0))?,
                     reusable: true,
                 })
             })
@@ -686,6 +842,90 @@ impl TimingPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn six_channel_delay_preserves_each_plane_and_inherits_warm_history() {
+        let mut source = StereoBuf::with_channels(6);
+        for channel in 0..6 {
+            for frame in 0..13 {
+                source.channel_mut(channel)[frame] = (channel * 100 + frame) as f32;
+            }
+        }
+        let mut old = AudioDelay::new_channels(0, 6).unwrap();
+        let mut output = StereoBuf::with_channels(6);
+        old.write(Some(&source), &mut output, 13);
+        for channel in 0..6 {
+            assert_eq!(
+                &output.channel(channel)[..13],
+                &source.channel(channel)[..13]
+            );
+        }
+        let mut new = AudioDelay::new_channels(4, 6).unwrap();
+        new.inherit(&mut old);
+        source.clear(4);
+        new.write(Some(&source), &mut output, 4);
+        for channel in 0..6 {
+            for frame in 0..4 {
+                assert_eq!(
+                    output.channel(channel)[frame],
+                    (channel * 100 + frame + 9) as f32
+                );
+            }
+        }
+        let mut incompatible = AudioDelay::new_channels(4, 4).unwrap();
+        incompatible.inherit(&mut new);
+        let mut four = StereoBuf::with_channels(4);
+        incompatible.write(None, &mut four, 4);
+        for channel in 0..4 {
+            assert!(
+                four.channel(channel)[..4]
+                    .iter()
+                    .all(|&sample| sample == 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn plan_charges_full_multichannel_history_before_allocating() {
+        let analysis = TimingAnalysis {
+            edges: vec![super::super::timing::EdgeTiming {
+                key: EdgeKey {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::Audio {
+                        output: 0,
+                        input: 0,
+                    },
+                    occurrence: 0,
+                },
+                delay_frames: 0,
+            }],
+            ..TimingAnalysis::default()
+        };
+        let widths = std::collections::BTreeMap::from([((1, 0), 6)]);
+        let required = AudioDelay::allocation_bytes_channels(0, 6).unwrap();
+        let steps = [super::super::Step {
+            node: 1,
+            inputs: vec![vec![(0, 0)]],
+            midi: vec![],
+        }];
+        let limits = TimingLimits {
+            max_delay_bytes: required - 1,
+            ..TimingLimits::default()
+        };
+        assert!(TimingPlan::prepare_with_channels(&analysis, limits, &steps, &widths).is_err());
+        let limits = TimingLimits {
+            max_delay_bytes: required,
+            ..TimingLimits::default()
+        };
+        let mut plan =
+            TimingPlan::prepare_with_channels(&analysis, limits, &steps, &widths).unwrap();
+        assert_eq!(plan.allocated_delay_bytes, required);
+        let mut newer =
+            TimingPlan::prepare_with_channels(&analysis, limits, &steps, &widths).unwrap();
+        newer.inherit(&mut plan);
+        assert_eq!(newer.allocated_delay_bytes, required);
+    }
 
     #[test]
     fn audio_impulse_with_irregular_blocks_and_fanout() {

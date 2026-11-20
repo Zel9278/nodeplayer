@@ -44,6 +44,10 @@ pub struct PluginNode {
     pub editor: Option<Box<dyn Editor>>,
     pub editor_view: crate::plugins::surface::view::EditorView,
     pub instance: Box<dyn Instance>,
+    /// Admitted graph ports, kept stable until wires and audio buffers are updated together.
+    pub audio_ports: crate::plugins::AudioPorts,
+    pub midi_ports: (bool, bool),
+    pub ports_known: bool,
     /// Last control-side timing accepted for the prepared bypass/graph plan.
     pub timing: (u32, u32),
     /// Keep the accepted timing while restart admission retains the warm fallback.
@@ -57,11 +61,17 @@ impl PluginNode {
     pub fn new(instance: Box<dyn Instance>) -> Self {
         let tag = Tag::of(instance.info());
         let timing = (instance.latency(), instance.bridge_latency());
+        let audio_ports = instance.audio_ports();
+        let midi_ports = instance.midi_ports();
+        let ports_known = instance.remote_status().is_none_or(|status| status == "running");
         Self {
             tag,
             editor: None,
             editor_view: Default::default(),
             instance,
+            audio_ports,
+            midi_ports,
+            ports_known,
             timing,
             suspended: false,
             bypass: false,
@@ -179,9 +189,10 @@ impl NodeKind {
         }
     }
 
-    /// Stereo inputs; a MIDI input, if any, comes after them.
+    /// Audio buses; a MIDI input, if any, comes after them.
     pub fn audio_inputs(&self) -> usize {
         match self {
+            Self::Plugin(p) => p.audio_ports.inputs.len(),
             Self::Player
             | Self::MidiIn(_)
             | Self::MidiOut(_)
@@ -196,6 +207,7 @@ impl NodeKind {
 
     pub fn audio_outputs(&self) -> usize {
         match self {
+            Self::Plugin(p) => p.audio_ports.outputs.len(),
             Self::Output { .. }
             | Self::MidiIn(_)
             | Self::MidiOut(_)
@@ -209,7 +221,7 @@ impl NodeKind {
     pub fn midi_input(&self) -> bool {
         match self {
             Self::MidiOut(_) | Self::MidiMonitor(_) | Self::CSynth(_) | Self::Group(_) | Self::GroupOut | Self::Send { .. } => true,
-            Self::Plugin(p) => p.instance.midi_ports().0,
+            Self::Plugin(p) => p.midi_ports.0,
             _ => false,
         }
     }
@@ -223,7 +235,7 @@ impl NodeKind {
             | Self::Group(_)
             | Self::GroupIn
             | Self::Receive { .. } => true,
-            Self::Plugin(p) => p.instance.midi_ports().1,
+            Self::Plugin(p) => p.midi_ports.1,
             _ => false,
         }
     }
@@ -235,6 +247,13 @@ impl NodeKind {
         match self {
             Self::GroupIn | Self::GroupOut | Self::Send { .. } | Self::Receive { .. } => (1, 1),
             k => (k.audio_inputs(), k.audio_outputs()),
+        }
+    }
+
+    pub fn input_channels(&self, input: usize) -> usize {
+        match self {
+            Self::Plugin(p) => p.audio_ports.inputs.get(input).map_or(0, |port| port.channels),
+            _ => 2,
         }
     }
 
@@ -437,6 +456,7 @@ pub fn path_to(snarl: &Snarl<GraphNode>, eid: u32) -> Option<(Vec<NodeId>, NodeI
 #[derive(Default)]
 struct Flat {
     nodes: Vec<NodeSpec>,
+    channels: BTreeMap<(u32, usize), usize>,
     /// `(from slot, output) -> (to slot, input)`.
     audio: Vec<((u32, u32), (u32, usize))>,
     /// MIDI from one slot to another.
@@ -447,6 +467,9 @@ impl Flat {
     fn add(&mut self, snarl: &Snarl<GraphNode>, enabled: bool) -> Result<()> {
         for node in snarl.nodes() {
             let (audio_inputs, audio_outputs) = node.kind.engine_ports();
+            for input in 0..audio_inputs {
+                self.channels.insert((node.eid, input), node.kind.input_channels(input));
+            }
             let timing = if enabled {
                 if let NodeKind::Plugin(plugin) = &node.kind {
                     // Use admitted timing, including while a rejected restart stays suspended.
@@ -599,10 +622,11 @@ impl Flat {
             }
         }
         if enabled {
-            schedule.timing = Some(crate::engine::compensation::TimingPlan::prepare(
+            schedule.timing = Some(crate::engine::compensation::TimingPlan::prepare_with_channels(
                 analysis.as_ref().unwrap(),
                 limits,
                 &schedule.steps,
+                &self.channels,
             )?);
         }
         Ok(schedule)

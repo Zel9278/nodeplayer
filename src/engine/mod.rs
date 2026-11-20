@@ -23,28 +23,86 @@ pub const MAX_NODES: usize = 1024;
 const CMD_QUEUE_LEN: usize = 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Planar audio for one bus. The first two planes retain their legacy field names so
+/// built-in stereo processors need not change. Mono buses use only `l`.
 pub struct StereoBuf {
     pub l: Vec<f32>,
     pub r: Vec<f32>,
+    channels: usize,
+    extra: Vec<Vec<f32>>,
 }
 
 impl StereoBuf {
     pub fn new() -> Self {
-        Self { l: vec![0.0; MAX_BLOCK], r: vec![0.0; MAX_BLOCK] }
+        Self::with_channels(2)
+    }
+
+    pub fn with_channels(channels: usize) -> Self {
+        assert!((1..=crate::plugins::AudioPorts::MAX_CHANNELS).contains(&channels));
+        Self {
+            l: vec![0.0; MAX_BLOCK],
+            r: vec![0.0; MAX_BLOCK],
+            channels,
+            extra: (2..channels).map(|_| vec![0.0; MAX_BLOCK]).collect(),
+        }
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    pub fn channel(&self, channel: usize) -> &[f32] {
+        assert!(channel < self.channels);
+        match channel {
+            0 => &self.l,
+            1 => &self.r,
+            _ => &self.extra[channel - 2],
+        }
+    }
+
+    pub fn channel_mut(&mut self, channel: usize) -> &mut [f32] {
+        assert!(channel < self.channels);
+        match channel {
+            0 => &mut self.l,
+            1 => &mut self.r,
+            _ => &mut self.extra[channel - 2],
+        }
+    }
+
+    /// Mono/stereo use the familiar duplicate/average conversions. Other mismatches
+    /// preserve channel positions, with missing channels silent, without a surround mix.
+    pub fn mapped_sample(&self, channel: usize, target_channels: usize, frame: usize) -> f32 {
+        if target_channels == 1 && self.channels == 2 {
+            0.5 * (self.l[frame] + self.r[frame])
+        } else if target_channels == 2 && self.channels == 1 {
+            self.l[frame]
+        } else if channel < self.channels {
+            self.channel(channel)[frame]
+        } else {
+            0.0
+        }
     }
 
     pub fn clear(&mut self, n: usize) {
         self.l[..n].fill(0.0);
         self.r[..n].fill(0.0);
+        for channel in &mut self.extra {
+            channel[..n].fill(0.0);
+        }
     }
 
     pub fn add_from(&mut self, other: &StereoBuf, n: usize) {
-        for (d, s) in self.l[..n].iter_mut().zip(&other.l[..n]) {
-            *d += s;
+        let channels = self.channels;
+        for channel in 0..channels {
+            for (frame, sample) in self.channel_mut(channel)[..n].iter_mut().enumerate() {
+                *sample += other.mapped_sample(channel, channels, frame);
+            }
         }
-        for (d, s) in self.r[..n].iter_mut().zip(&other.r[..n]) {
-            *d += s;
-        }
+    }
+
+    pub fn copy_from(&mut self, other: &Self, n: usize) {
+        self.clear(n);
+        self.add_from(other, n);
     }
 }
 
@@ -181,9 +239,13 @@ impl Transport {
     }
 }
 
-/// A DSP node running on the audio thread. All audio ports are stereo; a node has at most one
-/// MIDI input and one MIDI output.
+/// A DSP node running on the audio thread, with at most one MIDI input and output.
 pub trait Processor: Send {
+    /// Control-thread description used to prepare buffers. Legacy processors retain the
+    /// stereo port counts supplied by the graph.
+    fn audio_ports(&self) -> Option<crate::plugins::AudioPorts> {
+        None
+    }
     /// Source nodes provide the block's song clock. Must never wait for another thread.
     fn transport(&mut self) -> Option<Transport> {
         None
@@ -256,19 +318,52 @@ pub struct NodeSlot {
     midi_out: MidiBuf,
 }
 
+/// Audio-thread buffer replacements prepared and eventually freed on the control thread.
+pub struct AudioBuffers {
+    pub inputs: Vec<StereoBuf>,
+    pub outputs: Vec<StereoBuf>,
+}
+
+impl AudioBuffers {
+    pub fn new(ports: &crate::plugins::AudioPorts) -> Self {
+        Self {
+            inputs: ports
+                .inputs
+                .iter()
+                .map(|port| StereoBuf::with_channels(port.channels))
+                .collect(),
+            outputs: ports
+                .outputs
+                .iter()
+                .map(|port| StereoBuf::with_channels(port.channels))
+                .collect(),
+        }
+    }
+}
+
 impl NodeSlot {
     pub fn new(proc: Box<dyn Processor>, inputs: usize, outputs: usize) -> Box<Self> {
+        let audio = proc
+            .audio_ports()
+            .map(|ports| AudioBuffers::new(&ports))
+            .unwrap_or_else(|| AudioBuffers {
+                inputs: (0..inputs).map(|_| StereoBuf::new()).collect(),
+                outputs: (0..outputs).map(|_| StereoBuf::new()).collect(),
+            });
         Box::new(Self {
             proc,
             tag: None,
-            ins: (0..inputs).map(|_| StereoBuf::new()).collect(),
-            outs: (0..outputs).map(|_| StereoBuf::new()).collect(),
+            ins: audio.inputs,
+            outs: audio.outputs,
             midi_in: MidiBuf::new(),
             midi_out: MidiBuf::new(),
         })
     }
 
-    pub fn with_tag(mut self: Box<Self>, tag: Option<std::sync::Arc<crate::plugins::guard::Tag>>) -> Box<Self> {
+    pub fn with_tag(
+        mut self: Box<Self>,
+        tag: Option<std::sync::Arc<crate::plugins::guard::Tag>>,
+    ) -> Box<Self> {
         self.tag = tag;
         self
     }
@@ -312,6 +407,27 @@ impl Schedule {
     }
 }
 
+/// One plugin's prepared changes. Applied changes are replaced with their retired
+/// ownership so the entire transaction returns through one garbage queue slot.
+pub struct PluginUpdate {
+    pub node: u32,
+    pub audio: Option<Box<AudioBuffers>>,
+    pub bypass: Option<Box<nodes::LatencyBypass>>,
+    pub processor: Option<Box<dyn Processor>>,
+}
+
+impl PluginUpdate {
+    pub fn new(node: u32) -> Self {
+        Self { node, audio: None, bypass: None, processor: None }
+    }
+}
+
+/// A schedule and all buffer/processor changes that must become visible together.
+pub struct GraphUpdate {
+    pub schedule: Box<Schedule>,
+    pub plugins: Vec<PluginUpdate>,
+}
+
 #[derive(Default)]
 struct EngineStatus {
     sample_clock: AtomicU64,
@@ -323,8 +439,10 @@ pub enum Command {
     AddNode(u32, Box<NodeSlot>),
     RemoveNode(u32),
     SetSchedule(Box<Schedule>),
+    UpdateGraph(Box<GraphUpdate>),
     SetParam(u32, usize, f32),
     ConfigureBypass(u32, Box<nodes::LatencyBypass>),
+    ConfigureAudioPorts(u32, Box<AudioBuffers>),
     SuspendPlugin(u32),
     ResumePlugin(u32, Box<dyn Processor>),
 }
@@ -333,7 +451,9 @@ pub enum Command {
 pub enum Garbage {
     Node(u32, Box<NodeSlot>),
     Schedule(#[allow(dead_code)] Box<Schedule>),
+    GraphUpdate(#[allow(dead_code)] Box<GraphUpdate>),
     Bypass(#[allow(dead_code)] Box<nodes::LatencyBypass>),
+    AudioBuffers(#[allow(dead_code)] Box<AudioBuffers>),
     PluginSuspended(u32, Option<Box<dyn Processor>>),
     PluginInner(#[allow(dead_code)] Box<dyn Processor>),
 }
@@ -423,6 +543,41 @@ impl AudioState {
                     self.status.applied_epoch.store(epoch, Ordering::Release);
                     self.throw_away(Garbage::Schedule(old));
                 }
+                Command::UpdateGraph(mut update) => {
+                    for plugin in &mut update.plugins {
+                        // Even equal-width ports can have exchanged identities. Do not
+                        // inherit audio recorded against their previous numeric indices.
+                        if plugin.audio.is_some() && let Some(plan) = &mut self.schedule.timing {
+                            plan.invalidate_node(plugin.node);
+                        }
+                        if let Some(slot) = &mut self.slots[plugin.node as usize] {
+                            let _g = slot.tag.as_deref().map(crate::plugins::guard::enter_borrowed);
+                            if let Some(audio) = &mut plugin.audio {
+                                std::mem::swap(&mut slot.ins, &mut audio.inputs);
+                                std::mem::swap(&mut slot.outs, &mut audio.outputs);
+                            }
+                            if let Some(bypass) = plugin.bypass.take() {
+                                plugin.bypass = Some(slot.proc.replace_latency_bypass(bypass));
+                            }
+                            if let Some(processor) = plugin.processor.take() {
+                                plugin.processor = slot.proc.replace_plugin_inner(Some(processor));
+                            }
+                            if let Some(processor) = &mut plugin.processor {
+                                processor.deactivate();
+                            }
+                        } else if let Some(processor) = &mut plugin.processor {
+                            // Rejected replacements return in the transaction too.
+                            processor.deactivate();
+                        }
+                    }
+                    if let (Some(new), Some(old)) = (&mut update.schedule.timing, &mut self.schedule.timing) {
+                        new.inherit(old);
+                    }
+                    let epoch = update.schedule.epoch();
+                    std::mem::swap(&mut self.schedule, &mut update.schedule);
+                    self.status.applied_epoch.store(epoch, Ordering::Release);
+                    self.throw_away(Garbage::GraphUpdate(update));
+                }
                 Command::SetParam(id, idx, v) => {
                     if let Some(slot) = &mut self.slots[id as usize] {
                         slot.proc.set_param(idx, v);
@@ -434,6 +589,18 @@ impl AudioState {
                         None => bypass,
                     };
                     self.throw_away(Garbage::Bypass(retired));
+                }
+                Command::ConfigureAudioPorts(id, mut buffers) => {
+                    if let Some(slot) = &mut self.slots[id as usize] {
+                        std::mem::swap(&mut slot.ins, &mut buffers.inputs);
+                        std::mem::swap(&mut slot.outs, &mut buffers.outputs);
+                    }
+                    // Equal-width buses may have exchanged identities or channel layouts.
+                    // The control thread sends this command only for a topology change.
+                    if let Some(plan) = &mut self.schedule.timing {
+                        plan.invalidate_node(id);
+                    }
+                    self.throw_away(Garbage::AudioBuffers(buffers));
                 }
                 Command::SuspendPlugin(id) => {
                     let old = if let Some(slot) = &mut self.slots[id as usize] {
@@ -583,9 +750,8 @@ impl AudioState {
                         continue;
                     };
                     for (i, frame) in out.chunks_exact_mut(channels).enumerate() {
-                        frame[0] += buf.l[i];
-                        if channels > 1 {
-                            frame[1] += buf.r[i];
+                        for (channel, sample) in frame.iter_mut().enumerate() {
+                            *sample += buf.mapped_sample(channel, channels, i);
                         }
                     }
                 }
@@ -954,6 +1120,287 @@ mod tests {
 
     use super::*;
     use crate::player::Player;
+
+    fn bus_ports(inputs: &[usize], outputs: &[usize]) -> crate::plugins::AudioPorts {
+        let ports = |widths: &[usize]| {
+            widths
+                .iter()
+                .enumerate()
+                .map(|(id, &channels)| crate::plugins::AudioPort {
+                    id: id.to_string(),
+                    name: format!("Bus {id}"),
+                    channels,
+                    main: id == 0,
+                    layout: None,
+                })
+                .collect()
+        };
+        crate::plugins::AudioPorts {
+            inputs: ports(inputs),
+            outputs: ports(outputs),
+        }
+    }
+
+    #[test]
+    fn audio_bus_mapping_preserves_channels_and_converts_only_mono_stereo() {
+        let mut surround = StereoBuf::with_channels(6);
+        for channel in 0..6 {
+            surround.channel_mut(channel)[..3].fill((channel + 1) as f32);
+        }
+        let mut copy = StereoBuf::with_channels(6);
+        copy.add_from(&surround, 3);
+        for channel in 0..6 {
+            assert_eq!(&copy.channel(channel)[..3], &[(channel + 1) as f32; 3]);
+        }
+        copy.clear(3);
+        for channel in 0..6 {
+            assert_eq!(&copy.channel(channel)[..3], &[0.0; 3]);
+        }
+        let mut mono = StereoBuf::with_channels(1);
+        mono.add_from(&surround, 3);
+        assert_eq!(
+            &mono.l[..3],
+            &[1.0; 3],
+            "surround is positional, not implicitly downmixed"
+        );
+        let mut stereo = StereoBuf::new();
+        stereo.l[..3].fill(0.25);
+        stereo.r[..3].fill(0.75);
+        mono.copy_from(&stereo, 3);
+        assert_eq!(&mono.l[..3], &[0.5; 3]);
+        stereo.copy_from(&mono, 3);
+        assert_eq!(&stereo.l[..3], &[0.5; 3]);
+        assert_eq!(&stereo.r[..3], &[0.5; 3]);
+        surround.copy_from(&stereo, 3);
+        assert_eq!(&surround.channel(2)[..3], &[0.0; 3]);
+    }
+
+    #[test]
+    fn multibus_graph_keeps_six_channels_and_independent_mono_sidechain() {
+        struct Source;
+        impl Processor for Source {
+            fn audio_ports(&self) -> Option<crate::plugins::AudioPorts> {
+                Some(bus_ports(&[], &[6, 1]))
+            }
+            fn process(&mut self, n: usize, _: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
+                for channel in 0..6 {
+                    outputs[0].channel_mut(channel)[..n].fill(channel as f32 + 1.0);
+                }
+                outputs[1].l[..n].fill(0.125);
+            }
+        }
+        struct Effect;
+        impl Processor for Effect {
+            fn audio_ports(&self) -> Option<crate::plugins::AudioPorts> {
+                Some(bus_ports(&[6, 1], &[6, 1]))
+            }
+            fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
+                for bus in 0..2 {
+                    outputs[bus].copy_from(&inputs[bus], n);
+                }
+            }
+        }
+        for compensated in [false, true] {
+            let mut schedule = Schedule {
+                steps: vec![
+                    Step {
+                        node: 0,
+                        inputs: vec![],
+                        midi: vec![],
+                    },
+                    Step {
+                        node: 1,
+                        inputs: vec![vec![(0, 0)], vec![(0, 1)]],
+                        midi: vec![],
+                    },
+                ],
+                ..Schedule::default()
+            };
+            if compensated {
+                let analysis = timing::TimingAnalysis {
+                    edges: (0..2)
+                        .map(|port| timing::EdgeTiming {
+                            key: timing::EdgeKey {
+                                from: 0,
+                                to: 1,
+                                kind: timing::EdgeKind::Audio {
+                                    output: port as u32,
+                                    input: port,
+                                },
+                                occurrence: 0,
+                            },
+                            delay_frames: 3,
+                        })
+                        .collect(),
+                    ..timing::TimingAnalysis::default()
+                };
+                schedule.timing = Some(
+                    compensation::TimingPlan::prepare_with_channels(
+                        &analysis,
+                        timing::TimingLimits::default(),
+                        &schedule.steps,
+                        &std::collections::BTreeMap::from([((1, 0), 6), ((1, 1), 1)]),
+                    )
+                    .unwrap(),
+                );
+            }
+            let mut state = offline_state(
+                schedule,
+                vec![
+                    (0, NodeSlot::new(Box::new(Source), 1, 1)),
+                    (1, NodeSlot::new(Box::new(Effect), 1, 1)),
+                ],
+            );
+            state.run_block(13);
+            let slot = state.slots[1].as_ref().unwrap();
+            assert_eq!(slot.ins.len(), 2);
+            let start = if compensated { 3 } else { 0 };
+            for channel in 0..6 {
+                assert!(
+                    slot.outs[0].channel(channel)[..start]
+                        .iter()
+                        .all(|&sample| sample == 0.0)
+                );
+                assert!(
+                    slot.outs[0].channel(channel)[start..13]
+                        .iter()
+                        .all(|&sample| sample == channel as f32 + 1.0)
+                );
+            }
+            assert_eq!(slot.outs[1].channels(), 1);
+            assert!(
+                slot.outs[1].l[start..13]
+                    .iter()
+                    .all(|&sample| sample == 0.125)
+            );
+        }
+    }
+
+    #[test]
+    fn audio_layout_replacement_returns_old_buffers_for_control_thread_retirement() {
+        struct Noop;
+        impl Processor for Noop {
+            fn process(&mut self, _: usize, _: &mut [StereoBuf], _: &mut [StereoBuf]) {}
+        }
+        let mut state = offline_state(
+            Schedule::default(),
+            vec![(0, NodeSlot::new(Box::new(Noop), 1, 1))],
+        );
+        let (mut commands, receiver) = rtrb::RingBuffer::new(2);
+        let (sender, mut garbage) = rtrb::RingBuffer::new(2);
+        state.cmd_rx = receiver;
+        state.garbage_tx = sender;
+        commands
+            .push(Command::ConfigureAudioPorts(
+                0,
+                Box::new(AudioBuffers::new(&bus_ports(&[6, 1], &[4]))),
+            ))
+            .ok()
+            .unwrap();
+        state.handle_commands();
+        let slot = state.slots[0].as_ref().unwrap();
+        assert_eq!(
+            slot.ins.iter().map(StereoBuf::channels).collect::<Vec<_>>(),
+            [6, 1]
+        );
+        assert_eq!(slot.outs[0].channels(), 4);
+        let Garbage::AudioBuffers(old) = garbage.pop().ok().unwrap() else {
+            panic!("old buffers were not retired")
+        };
+        assert_eq!(old.inputs.len(), 1);
+        assert_eq!(old.inputs[0].channels(), 2);
+        assert_eq!(old.outputs[0].channels(), 2);
+    }
+
+    #[test]
+    fn graph_update_adopts_same_shape_port_reorder_and_retires_one_bundle() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct Source;
+        impl Processor for Source {
+            fn audio_ports(&self) -> Option<crate::plugins::AudioPorts> {
+                Some(bus_ports(&[], &[2, 2]))
+            }
+            fn process(&mut self, n: usize, _: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
+                for (index, output) in outputs.iter_mut().enumerate() {
+                    output.l[..n].fill(index as f32 + 1.0);
+                    output.r[..n].fill(index as f32 + 1.0);
+                }
+            }
+        }
+        struct Effect {
+            ports: crate::plugins::AudioPorts,
+            stopped: Arc<AtomicUsize>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Processor for Effect {
+            fn audio_ports(&self) -> Option<crate::plugins::AudioPorts> { Some(self.ports.clone()) }
+            fn process(&mut self, n: usize, inputs: &mut [StereoBuf], outputs: &mut [StereoBuf]) {
+                outputs[0].copy_from(&inputs[0], n);
+            }
+            fn deactivate(&mut self) { self.stopped.fetch_add(1, Ordering::Relaxed); }
+        }
+        impl Drop for Effect {
+            fn drop(&mut self) { self.dropped.fetch_add(1, Ordering::Relaxed); }
+        }
+        let schedule = |swapped| Schedule {
+            steps: vec![
+                Step { node: 0, inputs: vec![], midi: vec![] },
+                Step { node: 1, inputs: if swapped {
+                    vec![vec![(0, 1)], vec![(0, 0)]]
+                } else {
+                    vec![vec![(0, 0)], vec![(0, 1)]]
+                }, midi: vec![] },
+            ], ..Schedule::default()
+        };
+        let ports = bus_ports(&[2, 2], &[2]);
+        let old_stopped = Arc::new(AtomicUsize::new(0));
+        let old_dropped = Arc::new(AtomicUsize::new(0));
+        let new_stopped = Arc::new(AtomicUsize::new(0));
+        let new_dropped = Arc::new(AtomicUsize::new(0));
+        let old = nodes::PluginProc::with_latency(Box::new(Effect {
+            ports: ports.clone(), stopped: old_stopped.clone(), dropped: old_dropped.clone(),
+        }), 0, 0, false).unwrap();
+        let mut state = offline_state(schedule(false), vec![
+            (0, NodeSlot::new(Box::new(Source), 0, 1)),
+            (1, NodeSlot::new(Box::new(old), 1, 1)),
+        ]);
+        state.run_block(8);
+        let old_buffer = state.slots[1].as_ref().unwrap().ins[0].l.as_ptr();
+        assert_eq!(state.slots[1].as_ref().unwrap().outs[0].l[0], 1.0);
+        let mut reordered = ports.clone();
+        reordered.inputs.swap(0, 1);
+        let mut plugin = PluginUpdate::new(1);
+        plugin.audio = Some(Box::new(AudioBuffers::new(&reordered)));
+        plugin.bypass = Some(Box::new(nodes::LatencyBypass::with_ports(0, 0, false, &reordered).unwrap()));
+        plugin.processor = Some(Box::new(Effect {
+            ports: reordered, stopped: new_stopped.clone(), dropped: new_dropped.clone(),
+        }));
+        let (mut commands, receiver) = rtrb::RingBuffer::new(2);
+        let (sender, mut garbage) = rtrb::RingBuffer::new(1);
+        state.cmd_rx = receiver;
+        state.garbage_tx = sender;
+        commands.push(Command::UpdateGraph(Box::new(GraphUpdate {
+            schedule: Box::new(schedule(true)), plugins: vec![plugin],
+        }))).ok().unwrap();
+        state.handle_commands();
+        state.run_block(8);
+        assert_eq!(state.slots[1].as_ref().unwrap().outs[0].l[0], 2.0);
+        assert_eq!(old_stopped.load(Ordering::Relaxed), 1);
+        assert_eq!(old_dropped.load(Ordering::Relaxed), 0, "callback must retain retired ownership");
+        assert_eq!(new_stopped.load(Ordering::Relaxed), 0);
+        assert_eq!(new_dropped.load(Ordering::Relaxed), 0);
+        let Garbage::GraphUpdate(retired) = garbage.pop().ok().unwrap() else {
+            panic!("transaction must use one retirement slot")
+        };
+        assert_eq!(retired.schedule.steps[1].inputs, vec![vec![(0, 0)], vec![(0, 1)]]);
+        assert_eq!(retired.plugins[0].audio.as_ref().unwrap().inputs[0].l.as_ptr(), old_buffer);
+        assert_eq!(retired.plugins[0].bypass.as_ref().unwrap().audio_ports().unwrap().inputs[0].id, "0");
+        assert!(retired.plugins[0].processor.is_some());
+        assert!(garbage.pop().is_err());
+        drop(retired);
+        assert_eq!(old_dropped.load(Ordering::Relaxed), 1);
+    }
 
     fn write_sine_wav(path: &std::path::Path, rate: u32, secs: f32, amp: f32) {
         let frames = (rate as f32 * secs) as u32;

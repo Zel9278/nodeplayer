@@ -5,7 +5,9 @@ mod shared;
 mod supervisor;
 mod surface;
 mod worker;
-use super::{Created, Editor, Format, Instance, ParamDesc, Placement, PluginInfo, Spot};
+use super::{
+    AudioPorts, Created, Editor, Format, Instance, ParamDesc, Placement, PluginInfo, Spot,
+};
 use crate::engine::Processor;
 use crate::plugins::surface::{EditorFrame, EditorKeyboard, EditorPointer, PointerKind};
 use anyhow::{Context, Result, bail};
@@ -123,6 +125,8 @@ pub fn create(info: &PluginInfo, sr: f32, max_block: usize) -> Result<Created> {
             state: None,
             latency: 0,
             midi: (true, true),
+            audio_ports: AudioPorts::default(),
+            ports_pending: false,
             editor: true,
             status: "pending".into(),
             revision: 0,
@@ -140,6 +144,8 @@ struct RemoteInstance {
     state: Option<Vec<u8>>,
     latency: u32,
     midi: (bool, bool),
+    audio_ports: AudioPorts,
+    ports_pending: bool,
     editor: bool,
     status: String,
     revision: u64,
@@ -150,7 +156,14 @@ impl Drop for RemoteInstance {
         self.core.stop.store(true, Ordering::Release);
     }
 }
+fn same_audio_topology(left: &AudioPorts, right: &AudioPorts) -> bool {
+    left.same_topology(right)
+}
+
 impl Instance for RemoteInstance {
+    fn audio_ports(&self) -> AudioPorts {
+        self.audio_ports.clone()
+    }
     fn info(&self) -> &PluginInfo {
         &self.info
     }
@@ -211,6 +224,8 @@ impl Instance for RemoteInstance {
                 self.params = m.params.clone();
                 self.latency = m.latency;
                 self.midi = m.midi;
+                self.ports_pending |= !same_audio_topology(&self.audio_ports, &m.audio_ports);
+                self.audio_ports = m.audio_ports.clone();
                 self.editor = m.editor;
                 for (id, v, display) in &m.values {
                     self.values.insert(*id, *v);
@@ -221,9 +236,9 @@ impl Instance for RemoteInstance {
         self.displays.extend(s.displays.clone());
     }
     fn wants_restart(&mut self) -> bool {
-        // Parameter/MIDI-port metadata changes update only graph pins. The worker and
-        // fixed stereo bridge continue in place, including their queued dry/wet history.
-        false
+        // Only changed bus identities/channel widths require preallocated DSP storage.
+        // Parameter, latency and display-name metadata retain the continuous bridge.
+        self.ports_pending
     }
     fn restart(&mut self, sr: f64, max_block: usize) -> Result<Box<dyn Processor>> {
         // This replaces only graph metadata/ports. Instance/supervisor owns the worker,
@@ -231,6 +246,7 @@ impl Instance for RemoteInstance {
         if !sr.is_finite() || max_block > crate::engine::MAX_BLOCK {
             bail!("invalid remote restart configuration");
         }
+        self.ports_pending = false;
         Ok(Box::new(processor::RemoteProcessor::new(self.core.clone())))
     }
     fn save_state(&self) -> Option<Vec<u8>> {
@@ -640,6 +656,7 @@ mod tests {
             tx,
             snapshot: Mutex::new(Snapshot {
                 metadata: Some(Metadata {
+                    audio_ports: AudioPorts::default(),
                     params: Vec::new(),
                     values: Vec::new(),
                     latency: 0,
@@ -1020,6 +1037,8 @@ mod tests {
             state: Some(vec![1]),
             latency: 0,
             midi: (false, false),
+            audio_ports: AudioPorts::default(),
+            ports_pending: false,
             editor: false,
             status: "running".into(),
             revision: 0,
@@ -1056,6 +1075,7 @@ mod tests {
     fn editor_ignores_prior_open_and_close_acknowledgements() {
         let (tx, rx) = crossbeam_channel::bounded(8);
         let metadata = Metadata {
+            audio_ports: AudioPorts::default(),
             params: Vec::new(),
             values: Vec::new(),
             latency: 0,
