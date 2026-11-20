@@ -40,7 +40,7 @@ pub struct About {
 }
 
 impl About {
-    pub fn show(&mut self, ctx: &egui::Context, updater: &mut crate::updater::Updater) {
+    pub fn show(&mut self, ctx: &egui::Context, workspace: egui::Rect, updater: &mut crate::updater::Updater) {
         if !self.open {
             return;
         }
@@ -50,9 +50,11 @@ impl About {
                 Crates::default()
             })
         });
+        let size = egui::vec2(560.0, 520.0).min(workspace.size() * 0.9);
         egui::Window::new("About nodeplayer")
             .open(&mut self.open)
-            .default_size([560.0, 520.0])
+            .constrain_to(workspace)
+            .default_rect(egui::Rect::from_center_size(workspace.center(), size))
             .show(ctx, |ui| {
                 ui.heading(format!("nodeplayer {}", env!("CARGO_PKG_VERSION")));
                 ui.label(format!("Created by {}", env!("CARGO_PKG_AUTHORS")));

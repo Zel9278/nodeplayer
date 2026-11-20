@@ -207,8 +207,8 @@ impl Tab {
     fn title(self) -> &'static str {
         match self {
             Self::Graph => "Graph",
-            Self::Logs => "Logs",
-            Self::Statistics => "Statistics",
+            Self::Logs => "▤ Logs",
+            Self::Statistics => "▥ Statistics",
             Self::Library => "🎵 Library",
             Self::Presets => "💾 Presets",
             Self::Plugins => "🔌 Plugins",
@@ -222,17 +222,23 @@ impl Tab {
     }
 }
 
-/// Puts a panel this version added into a layout saved before it: the "Now playing" panel
-/// under the library, others with the library's tabs.
+/// Adds a new panel to a saved layout without switching away from the active tab.
 fn add_new_tab(dock: &mut egui_dock::DockState<Tab>, tab: Tab) {
-    let library = dock.find_main_surface_tab(&Tab::Library).map(|(node, _)| node);
-    match (tab, library) {
+    let neighbor = match tab {
+        Tab::Logs | Tab::Statistics => Tab::Info,
+        _ => Tab::Library,
+    };
+    let target = dock.find_main_surface_tab(&neighbor).map(|(node, _)| node);
+    match (tab, target) {
         (Tab::Info, Some(node)) => {
             dock.main_surface_mut().split_below(node, 0.62, vec![tab]);
         }
         (_, Some(node)) => {
-            dock.set_focused_node_and_surface(egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node });
-            dock.push_to_focused_leaf(tab);
+            let path = egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node };
+            if let Ok(leaf) = dock.leaf_mut(path) {
+                // Newly available panels should leave the active panel in place.
+                leaf.tabs.push(tab);
+            }
         }
         _ => dock.push_to_first_leaf(tab),
     }
@@ -241,12 +247,12 @@ fn add_new_tab(dock: &mut egui_dock::DockState<Tab>, tab: Tab) {
 /// The layout before any rearranging: the side tabs left of the graph.
 fn default_dock(extensions: bool) -> egui_dock::DockState<Tab> {
     let mut dock = egui_dock::DockState::new(vec![Tab::Graph]);
-    let mut side = vec![Tab::Library, Tab::Presets, Tab::Plugins, Tab::Misskey, Tab::Discord, Tab::Logs, Tab::Statistics];
+    let mut side = vec![Tab::Library, Tab::Presets, Tab::Plugins, Tab::Misskey, Tab::Discord];
     if extensions {
         side.push(Tab::Extensions);
     }
     let [_, left] = dock.main_surface_mut().split_left(egui_dock::NodeIndex::root(), 0.35, side);
-    dock.main_surface_mut().split_below(left, 0.62, vec![Tab::Info]);
+    dock.main_surface_mut().split_below(left, 0.62, vec![Tab::Info, Tab::Logs, Tab::Statistics]);
     // The library in front.
     dock.set_focused_node_and_surface(egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node: left });
     dock
@@ -258,8 +264,9 @@ struct Tabs<'a> {
     actions: &'a mut Vec<Action>,
     /// Closed tabs, offered by the "+" buttons.
     closed: Vec<Tab>,
-    /// A closed tab picked from a "+" button, and where.
-    reopen: Option<(egui_dock::NodePath, Tab)>,
+    open: HashMap<egui_dock::NodePath, (Vec<Tab>, Option<Tab>)>,
+    chosen: Option<(egui_dock::NodePath, Tab)>,
+    buttons: HashMap<Tab, egui::Response>,
 }
 
 impl egui_dock::TabViewer for Tabs<'_> {
@@ -273,11 +280,18 @@ impl egui_dock::TabViewer for Tabs<'_> {
         tab.title().into()
     }
 
+    fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        self.buttons.insert(*tab, response.clone());
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         let app = &mut *self.app;
         if !crate::runtime::get().allow_network() && matches!(tab, Tab::Misskey | Tab::Discord) {
             ui.label("External networking is disabled during diagnostics.");
             return;
+        }
+        if matches!(tab, Tab::Library | Tab::Info | Tab::Statistics | Tab::Discord) {
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
         }
         match tab {
             Tab::Graph => app.graph_ui(ui, self.actions),
@@ -324,13 +338,59 @@ impl egui_dock::TabViewer for Tabs<'_> {
     }
 
     fn add_popup(&mut self, ui: &mut egui::Ui, path: egui_dock::NodePath) {
-        if self.closed.is_empty() {
-            ui.weak("Every panel is open.");
+        if let Some((tabs, active)) = self.open.get(&path) {
+            for &tab in tabs {
+                if ui.selectable_label(Some(tab) == *active, tab.title()).clicked() {
+                    self.chosen = Some((path, tab));
+                    ui.close();
+                }
+            }
+            if !tabs.is_empty() && !self.closed.is_empty() {
+                ui.separator();
+            }
         }
         for tab in &self.closed {
             if ui.button(tab.title()).clicked() {
-                self.reopen = Some((path, *tab));
+                self.chosen = Some((path, *tab));
                 ui.close();
+            }
+        }
+    }
+}
+
+fn update_dock_tabs(dock: &mut egui_dock::DockState<Tab>, buttons: &HashMap<Tab, egui::Response>) {
+    for (path, leaf) in dock.iter_leaves_mut() {
+        let active = leaf.tabs.get(leaf.active.0).copied();
+        for tab in &leaf.tabs {
+            let Some(response) = buttons.get(tab) else { continue };
+            let selected = Some(*tab) == active;
+            let name = tab.title().trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+            response.widget_info(|| egui::WidgetInfo::selected(
+                egui::WidgetType::SelectableLabel, response.enabled(), selected, name,
+            ));
+            response.ctx.accesskit_node_builder(response.id, |node| {
+                node.set_role(egui::accesskit::Role::Tab);
+                node.set_selected(selected);
+            });
+            if !selected {
+                continue;
+            }
+            let key = egui::Id::new(("active dock tab", path.surface, path.node));
+            let state = (*tab, leaf.rect.width());
+            let changed = response.ctx.data_mut(|data| {
+                let changed = data.get_temp::<(Tab, f32)>(key) != Some(state);
+                data.insert_temp(key, state);
+                changed
+            });
+            if changed {
+                // Adjust only on activation or resize, so the strip can still be scrolled.
+                let clipped = response.interact_rect;
+                let delta = (clipped.left() - response.rect.left()).max(0.0)
+                    - (response.rect.right() - clipped.right()).max(0.0);
+                if delta != 0.0 {
+                    leaf.scroll = (leaf.scroll + delta).min(0.0);
+                    response.ctx.request_repaint();
+                }
             }
         }
     }
@@ -663,10 +723,6 @@ impl App {
                     if !saved.tabs_seen.contains(&tab) && d.find_tab(&tab).is_none() {
                         add_new_tab(&mut d, tab);
                     }
-                }
-                // Adding a tab brings it to the front; keep the library there.
-                if let Some(path) = d.find_tab(&Tab::Library) {
-                    let _ = d.set_active_tab(path);
                 }
                 d
             }
@@ -1835,7 +1891,7 @@ impl App {
         if self.library.poll(loaded.as_deref()) {
             self.reveal_current = true;
             self.library_changed = true;
-            self.log(format!("{} tracks in {} source(s)", self.library.tracks.len(), self.library.sources.len()));
+            self.log(format!("{} in {}", counted(self.library.tracks.len(), "track"), counted(self.library.sources.len(), "source")));
         }
         if self.player.take_ended() {
             self.track_ended = true;
@@ -1973,7 +2029,8 @@ impl App {
         let playing = self.player.is_playing();
         let pos = self.player.position();
         let dur = status.duration.unwrap_or(0.0);
-        ui.horizontal(|ui| {
+        let compact = ui.available_width() < 760.0;
+        ui.horizontal_wrapped(|ui| {
             if ui.button("📂 Open").clicked() {
                 let media: Vec<&str> = AUDIO_EXTS.iter().chain(crate::av::VIDEO_EXTS).chain(MIDI_EXTS).copied().collect();
                 if let Some(p) = rfd::FileDialog::new()
@@ -1987,21 +2044,22 @@ impl App {
                 }
             }
             let has_tracks = !self.library.tracks.is_empty();
-            if ui.add_enabled(has_tracks, egui::Button::new("⏮")).on_hover_text("previous (or restart)").clicked() {
+            if transport_button(ui, has_tracks, "⏮", "Previous (or restart)").clicked() {
                 self.previous_track();
             }
             let label = if playing { "⏸" } else { "▶" };
-            if ui.add_enabled(status.path.is_some() || has_tracks, egui::Button::new(label)).clicked() {
+            let action = if playing { "Pause" } else { "Play" };
+            if transport_button(ui, status.path.is_some() || has_tracks, label, action).clicked() {
                 if playing {
                     self.player.set_playing(false);
                 } else {
                     self.play();
                 }
             }
-            if ui.button("⏹").clicked() {
+            if transport_button(ui, status.path.is_some(), "⏹", "Stop").clicked() {
                 self.stop();
             }
-            if ui.add_enabled(has_tracks, egui::Button::new("⏭")).on_hover_text("next").clicked() {
+            if transport_button(ui, has_tracks, "⏭", "Next").clicked() {
                 self.next_track();
             }
             if ui
@@ -2011,7 +2069,10 @@ impl App {
             {
                 self.library.repeat = self.library.repeat.next();
             }
-            if ui.selectable_label(self.loop_editor.open, "〰").on_hover_text("loop editor: select a stretch of the track to play over and over").clicked() {
+            let open = self.loop_editor.open;
+            let loop_editor = ui.selectable_label(open, "〰").on_hover_text("Loop Editor");
+            loop_editor.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, open, "Loop Editor"));
+            if loop_editor.clicked() {
                 self.loop_editor.open = !self.loop_editor.open;
             }
             ui.toggle_value(&mut self.library.shuffle, "🔀").on_hover_text("shuffle");
@@ -2036,43 +2097,51 @@ impl App {
             ui.label(format!("{} / {}", fmt_time(self.seek_drag.unwrap_or(pos)), fmt_time(dur)));
             self.rate_control(ui);
 
-            let mut t = self.seek_drag.unwrap_or(pos).min(dur);
-            ui.spacing_mut().slider_width = (ui.available_width() - 220.0).max(100.0);
-            let r = ui.add_enabled(dur > 0.0, egui::Slider::new(&mut t, 0.0..=dur.max(0.001)).show_value(false));
-            if r.dragged() {
-                self.seek_drag = Some(t);
-            }
-            if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                self.player.seek(t);
-                self.seek_drag = None;
-            }
-            // The selection, under the slider.
-            if let Some(s) = self.selection.as_ref().filter(|s| Some(&s.path) == status.path.as_ref() && dur > 0.0) {
-                let rail = r.rect.shrink2(egui::vec2(ui.spacing().interact_size.y / 2.0, 0.0));
-                let x = |t: f64| rail.left() + (t / dur).clamp(0.0, 1.0) as f32 * rail.width();
-                let looping = self.library.repeat == library::Repeat::Selection;
-                let color = if looping { Color32::from_rgb(110, 170, 255) } else { Color32::from_gray(120) };
-                let band = egui::Rect::from_x_y_ranges(x(s.start)..=x(s.end).max(x(s.start) + 2.0), rail.bottom() - 3.0..=rail.bottom() - 1.0);
-                ui.painter().rect_filled(band, 1.0, color);
-            }
-
-            if let Some(p) = &status.path {
-                let title = status.title().unwrap_or_default();
-                let text = match &status.tags.artist {
-                    Some(a) => format!("{a} — {title}"),
-                    None => title,
-                };
-                let album = status.tags.album.as_deref().map(|a| format!("{a}\n")).unwrap_or_default();
-                ui.label(text).on_hover_text(format!(
-                    "{album}{}\n{} Hz, {} ch",
-                    p.display(),
-                    status.source_rate,
-                    status.channels
-                ));
+            if !compact {
+                ui.horizontal(|ui| self.seek_bar(ui, &status, pos, dur));
             }
         });
+        if compact {
+            ui.horizontal(|ui| self.seek_bar(ui, &status, pos, dur));
+        }
         if let Some(e) = &status.error {
             ui.colored_label(Color32::LIGHT_RED, e);
+        }
+    }
+
+    fn seek_bar(&mut self, ui: &mut egui::Ui, status: &crate::player::Status, pos: f64, dur: f64) {
+        let mut t = self.seek_drag.unwrap_or(pos).min(dur);
+        let width = ui.available_width();
+        let title_width = if status.path.is_some() { (width * 0.40).min(300.0) + ui.spacing().item_spacing.x } else { 0.0 };
+        ui.spacing_mut().slider_width = (width - title_width).max(1.0);
+        let r = ui.add_enabled(dur > 0.0, egui::Slider::new(&mut t, 0.0..=dur.max(0.001)).show_value(false));
+        r.ctx.accesskit_node_builder(r.id, |node| node.set_label("Playback position"));
+        if r.dragged() {
+            self.seek_drag = Some(t);
+        }
+        if r.drag_stopped() || (r.changed() && !r.dragged()) {
+            self.player.seek(t);
+            self.seek_drag = None;
+        }
+        // The selection, under the slider.
+        if let Some(s) = self.selection.as_ref().filter(|s| Some(&s.path) == status.path.as_ref() && dur > 0.0) {
+            let rail = r.rect.shrink2(egui::vec2(ui.spacing().interact_size.y / 2.0, 0.0));
+            let x = |t: f64| rail.left() + (t / dur).clamp(0.0, 1.0) as f32 * rail.width();
+            let looping = self.library.repeat == library::Repeat::Selection;
+            let color = if looping { Color32::from_rgb(110, 170, 255) } else { Color32::from_gray(120) };
+            let band = Rect::from_x_y_ranges(x(s.start)..=x(s.end).max(x(s.start) + 2.0), rail.bottom() - 3.0..=rail.bottom() - 1.0);
+            ui.painter().rect_filled(band, 1.0, color);
+        }
+        if let Some(p) = &status.path {
+            let title = status.title().unwrap_or_default();
+            let text = match &status.tags.artist {
+                Some(a) => format!("{a} — {title}"),
+                None => title,
+            };
+            let album = status.tags.album.as_deref().map(|a| format!("{a}\n")).unwrap_or_default();
+            ui.add(egui::Label::new(&text).truncate()).on_hover_text(format!(
+                "{text}\n{album}{}\n{} Hz, {} ch", p.display(), status.source_rate, status.channels
+            ));
         }
     }
 
@@ -2110,53 +2179,80 @@ impl App {
         {
             self.library.restore_removed();
         }
-        ui.horizontal(|ui| {
-            let start = self.library.sources.last().map(|s| s.path().to_path_buf());
-            let start = start.map(|p| if p.is_dir() { p } else { p.parent().map(Path::to_path_buf).unwrap_or(p) });
-            if ui.button("📁 Add folder…").on_hover_text("list the audio and video files under a folder, with its subfolders").clicked() {
-                let mut dlg = rfd::FileDialog::new();
-                if let Some(d) = &start {
-                    dlg = dlg.set_directory(d);
-                }
-                for dir in dlg.pick_folders().unwrap_or_default() {
-                    self.library.add(library::Source::Folder(dir));
-                }
-            }
-            if ui.button("🎵 Add files…").on_hover_text("add single tracks").clicked() {
-                let media: Vec<&str> = AUDIO_EXTS.iter().chain(crate::av::VIDEO_EXTS).chain(MIDI_EXTS).copied().collect();
-                let mut dlg = rfd::FileDialog::new().add_filter("Audio, video and MIDI", &media);
-                if let Some(d) = &start {
-                    dlg = dlg.set_directory(d);
-                }
-                for f in dlg.pick_files().unwrap_or_default() {
-                    self.library.add(library::Source::File(f));
-                }
-            }
+        let compact = ui.available_width() < 220.0;
+        let picked = ui.horizontal_wrapped(|ui| {
+            let choose = |ui: &mut egui::Ui| {
+                let folders = ui.button("📁 Add folder…")
+                    .on_hover_text("Include files in this folder and its subfolders").clicked();
+                let files = ui.button("🎵 Add files…").clicked();
+                if folders { Some(true) } else if files { Some(false) } else { None }
+            };
+            let picked = if compact {
+                ui.menu_button("Add…", |ui| {
+                    let picked = choose(ui);
+                    if picked.is_some() {
+                        ui.close();
+                    }
+                    picked
+                }).inner.flatten()
+            } else {
+                choose(ui)
+            };
             let can_rescan = !self.library.sources.is_empty() && !self.library.scanning();
-            if ui.add_enabled(can_rescan, egui::Button::new("⟳")).on_hover_text("scan again").clicked() {
+            if transport_button(ui, can_rescan, "⟳", "Rescan the library").clicked() {
                 self.library.rescan();
+            }
+            if compact && !self.library.sources.is_empty() {
+                self.library_sources(ui, compact);
             }
             if self.library.scanning() {
                 ui.spinner();
             } else if self.library.reading_tags() {
                 ui.spinner().on_hover_text("reading tags");
             }
-        });
+            picked
+        }).inner;
+        if let Some(folders) = picked {
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(path) = self.library.sources.last().map(library::Source::path) {
+                if let Some(dir) = if path.is_dir() { Some(path) } else { path.parent() } {
+                    dialog = dialog.set_directory(dir);
+                }
+            }
+            if folders {
+                for dir in dialog.pick_folders().unwrap_or_default() {
+                    self.library.add(library::Source::Folder(dir));
+                }
+            } else {
+                let media: Vec<&str> = AUDIO_EXTS.iter().chain(crate::av::VIDEO_EXTS).chain(MIDI_EXTS).copied().collect();
+                for file in dialog.add_filter("Audio, video and MIDI", &media).pick_files().unwrap_or_default() {
+                    self.library.add(library::Source::File(file));
+                }
+            }
+        }
         if self.library.sources.is_empty() {
             ui.weak("Add a folder or files, or drop them onto the window.");
             return;
         }
+        if !compact {
+            self.library_sources(ui, compact);
+        }
+        filter_field(ui, &mut self.library.filter, "Filter tracks");
+        self.track_table(ui);
+    }
+
+    fn library_sources(&mut self, ui: &mut egui::Ui, compact: bool) {
         let (folders, files) = self.library.sources.iter().fold((0, 0), |(d, f), s| match s {
             library::Source::Folder(_) => (d + 1, f),
             library::Source::File(_) => (d, f + 1),
         });
         let summary = match (folders, files) {
-            (d, 0) => format!("{d} folder(s)"),
-            (0, f) => format!("{f} file(s)"),
-            (d, f) => format!("{d} folder(s), {f} file(s)"),
+            (d, 0) => counted(d, "folder"),
+            (0, f) => counted(f, "file"),
+            (d, f) => format!("{}, {}", counted(d, "folder"), counted(f, "file")),
         };
         let mut remove = None;
-        egui::CollapsingHeader::new(egui::RichText::new(summary).small()).id_salt("library sources").show(ui, |ui| {
+        let sources = |ui: &mut egui::Ui| {
             egui::ScrollArea::vertical().id_salt("sources").max_height(120.0).show(ui, |ui| {
                 for (i, src) in self.library.sources.iter().enumerate() {
                     ui.horizontal(|ui| {
@@ -2170,15 +2266,15 @@ impl App {
                     });
                 }
             });
-        });
+        };
+        if compact {
+            ui.menu_button("Sources", sources).response.on_hover_text(summary);
+        } else {
+            egui::CollapsingHeader::new(egui::RichText::new(summary).small()).id_salt("library sources").show(ui, sources);
+        }
         if let Some(i) = remove {
             self.library.remove(i);
         }
-        right_to_left_row(ui, |ui| {
-            ui.small(format!("{} tracks", self.library.tracks.len()));
-            ui.add(egui::TextEdit::singleline(&mut self.library.filter).hint_text("filter").desired_width(f32::INFINITY));
-        });
-        self.track_table(ui);
     }
 
     /// The tracks as a table: number, title, artist, album, length, release date, when the
@@ -2207,11 +2303,13 @@ impl App {
                 .any(|s| s.to_lowercase().contains(&filter))
         };
         let mut rows = Vec::new();
+        let mut matching_tracks = 0;
         let mut last_dir: Option<&str> = None;
         for (i, t) in lib.tracks.iter().enumerate() {
             if !matches(t) {
                 continue;
             }
+            matching_tracks += 1;
             if grouped && last_dir != Some(t.dir.as_str()) {
                 last_dir = Some(&t.dir);
                 if !t.dir.is_empty() {
@@ -2220,6 +2318,8 @@ impl App {
             }
             rows.push(Row::Track(i));
         }
+        let total = counted(lib.tracks.len(), "track");
+        ui.weak(if filter.is_empty() { total } else { format!("{matching_tracks} of {total}") });
 
         let cols: Vec<(usize, Column)> = Column::ALL.into_iter().enumerate().filter(|(k, _)| lib.columns.shown[*k]).collect();
         let pad = 4.0;
@@ -2234,6 +2334,9 @@ impl App {
         }
 
         let current = lib.current;
+        let player_path = self.player.status().path;
+        let playing = self.player.is_playing();
+        let paused = self.player.is_paused();
         let mut play = None;
         let mut remove_track = None;
         let mut new_sort = None;
@@ -2244,6 +2347,7 @@ impl App {
             ui.set_min_width(table_w);
             // Headings.
             let (head, mut head_resp) = ui.allocate_exact_size(egui::vec2(table_w, row_h), egui::Sense::click());
+            head_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Library columns"));
             let painter = ui.painter_at(head);
             painter.rect_filled(head, 0.0, ui.visuals().faint_bg_color);
             let mut x = head.left();
@@ -2251,6 +2355,7 @@ impl App {
                 let w = widths[*k];
                 let cell = egui::Rect::from_min_size(pos2(x, head.top()), egui::vec2(w, row_h));
                 let r = ui.interact(cell.shrink2(egui::vec2(3.0, 0.0)), ui.id().with(("col", *k)), egui::Sense::click());
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, r.enabled(), format!("Sort by {}", col.label())));
                 let arrow = match lib.sort {
                     Some((c, false)) if c == *col => " ⏶",
                     Some((c, true)) if c == *col => " ⏷",
@@ -2324,7 +2429,17 @@ impl App {
                         Row::Track(i) => {
                             let t = &lib.tracks[i];
                             let is_cur = Some(i) == current;
+                            let title = t.title();
+                            let playback = if is_cur && player_path.as_ref() == Some(&t.path) {
+                                if playing { "Playing" } else if paused { "Paused" } else { "" }
+                            } else { "" };
                             let (rect, resp) = ui.allocate_exact_size(egui::vec2(table_w, row_h), egui::Sense::click());
+                            resp.widget_info(|| {
+                                let artist = t.meta.as_ref().and_then(|meta| meta.artist.as_deref()).unwrap_or("");
+                                let label = [title.as_str(), artist, playback].into_iter()
+                                    .filter(|part| !part.is_empty()).collect::<Vec<_>>().join(", ");
+                                egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, resp.enabled(), is_cur, label)
+                            });
                             let visuals = ui.style().interact_selectable(&resp, is_cur);
                             if is_cur || resp.hovered() {
                                 ui.painter().rect_filled(rect, 2.0, visuals.weak_bg_fill);
@@ -2337,9 +2452,10 @@ impl App {
                                 let cell = egui::Rect::from_min_size(pos2(x, rect.top()), egui::vec2(widths[*k], row_h));
                                 x += widths[*k];
                                 let text = match col {
+                                    Column::Track if playback == "Playing" => "▶".into(),
+                                    Column::Track if playback == "Paused" => "⏸".into(),
                                     Column::Track => m.and_then(|m| m.track).map(|n| n.to_string()).unwrap_or_default(),
-                                    Column::Title if is_cur => format!("▶ {}", t.title()),
-                                    Column::Title => t.title(),
+                                    Column::Title => title.clone(),
                                     Column::Artist => m.and_then(|m| m.artist.clone()).unwrap_or_default(),
                                     Column::Album => m.and_then(|m| m.album.clone()).unwrap_or_default(),
                                     Column::Length => m.and_then(|m| m.duration).map(fmt_time).unwrap_or_default(),
@@ -2937,7 +3053,7 @@ impl App {
         }
     }
 
-    fn param_windows(&mut self, ctx: &egui::Context) {
+    fn param_windows(&mut self, ctx: &egui::Context, workspace: Rect) {
         for node in every_node(&mut self.snarl, &mut self.outer) {
             let eid = node.eid;
             let NodeKind::Plugin(p) = &mut node.kind else { continue };
@@ -2946,10 +3062,12 @@ impl App {
             }
             let PluginNode { instance, show_params, param_filter, tag, .. } = &mut **p;
             let _g = guard::enter(tag);
+            let size = vec2(420.0, 480.0).min(workspace.size() * 0.9);
             egui::Window::new(format!("{} — Parameters", plugin_title(instance.info())))
                 .id(egui::Id::new(("params", eid)))
                 .open(show_params)
-                .default_size([420.0, 480.0])
+                .constrain_to(workspace)
+                .default_rect(Rect::from_center_size(workspace.center(), size))
                 .show(ctx, |ui| {
                     filter_field(ui, param_filter, "Filter parameters");
                     let f = param_filter.to_lowercase();
@@ -2995,6 +3113,11 @@ impl Drop for App {
 }
 
 impl eframe::App for App {
+    fn persist_egui_memory(&self) -> bool {
+        // The session owns the application layout. eframe only saves the main window.
+        false
+    }
+
     fn on_exit(&mut self) {
         self.shutdown();
     }
@@ -3115,53 +3238,66 @@ impl eframe::App for App {
             });
         }
         egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                match &self.engine {
-                    Some(e) => ui.small(format!("{} · {} Hz · {} ch", e.device_name, e.sample_rate, e.channels)),
-                    None => ui.colored_label(Color32::LIGHT_RED, "no audio device"),
-                };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("About").clicked() {
+                    self.about.open = !self.about.open;
+                }
+                if self.updater.has_update() && ui.small_button("Update available").clicked() {
+                    self.about.open = true;
+                }
                 if self.ffmpeg.1.elapsed() > Duration::from_secs(2) {
                     self.ffmpeg = (crate::av::available(), Instant::now());
                 }
-                if !self.ffmpeg.0 && !self.setup.busy() {
-                    ui.separator();
-                    let b = ui.small_button("FFmpeg isn't installed: get it…");
-                    if b.on_hover_text("needed for video, some audio formats and library tags").clicked() {
-                        self.setup.ask_ffmpeg();
-                    }
+                if !self.ffmpeg.0 && !self.setup.busy()
+                    && ui.small_button("Get FFmpeg…")
+                        .on_hover_text("Required for video, some audio formats, and library tags").clicked()
+                {
+                    self.setup.ask_ffmpeg();
                 }
-                if let Some(m) = self.messages.last() {
-                    ui.separator();
-                    ui.small(m).on_hover_text(self.messages.join("\n"));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("About").clicked() {
-                        self.about.open = !self.about.open;
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    match &self.engine {
+                        Some(e) => {
+                            let device = format!("{} · {} Hz · {} ch", e.device_name, e.sample_rate, e.channels);
+                            let width = if self.messages.is_empty() { ui.available_width() } else { ui.available_width() * 0.5 };
+                            ui.scope(|ui| {
+                                ui.set_max_width(width);
+                                ui.add(egui::Label::new(egui::RichText::new(&device).small()).truncate())
+                                    .on_hover_text(device);
+                            });
+                        }
+                        None => { ui.colored_label(Color32::LIGHT_RED, "No audio device"); }
                     }
-                    if self.updater.has_update() && ui.small_button("Update available").clicked() {
-                        self.about.open = true;
+                    if let Some(message) = self.messages.last() {
+                        ui.separator();
+                        let response = ui.add(egui::Label::new(egui::RichText::new(message).small()).truncate());
+                        if response.hovered() {
+                            response.on_hover_text(self.messages.join("\n"));
+                        }
                     }
                 });
             });
         });
-        self.param_windows(&ctx);
-        self.about.show(&ctx, &mut self.updater);
-        self.loop_editor.show(&ctx, &self.player, &mut self.selection, &mut self.library.repeat, &mut self.loops);
-
+        let workspace = ui.available_rect_before_wrap();
         let mut dock = std::mem::replace(&mut self.dock, egui_dock::DockState::new(Vec::new()));
         let closed: Vec<Tab> = Tab::ALL
             .into_iter()
             .filter(|t| dock.find_tab(t).is_none())
             .filter(|t| *t != Tab::Extensions || !self.extensions.panels().is_empty())
             .collect();
+        let open = dock.iter_leaves().map(|(path, leaf)| {
+            (path, (leaf.tabs.clone(), leaf.tabs.get(leaf.active.0).copied()))
+        }).collect();
         self.placements.clear();
         self.node_rects.clear();
         self.graph_view = None;
-        let mut tabs = Tabs { app: self, actions: &mut actions, closed, reopen: None };
+        let mut tabs = Tabs { app: self, actions: &mut actions, closed, open, chosen: None, buttons: HashMap::new() };
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            let mut style = egui_dock::Style::from_egui(ui.style());
+            style.tab_bar.show_scroll_bar_on_overflow = true;
             egui_dock::DockArea::new(&mut dock)
                 .id(egui::Id::new("dock"))
-                .style(egui_dock::Style::from_egui(ui.style()))
+                .style(style)
+                .show_tab_name_on_hover(true)
                 // Right-click a tab to close it; buttons on every tab would leave no room.
                 .show_close_buttons(false)
                 .show_add_buttons(true)
@@ -3170,11 +3306,21 @@ impl eframe::App for App {
                 .show_leaf_collapse_buttons(false)
                 .show_inside(ui, &mut tabs);
         });
-        if let Some((path, tab)) = tabs.reopen.take() {
-            dock.set_focused_node_and_surface(path);
-            dock.push_to_focused_leaf(tab);
+        update_dock_tabs(&mut dock, &tabs.buttons);
+        if let Some((path, tab)) = tabs.chosen.take() {
+            if let Some(tab_path) = dock.find_tab(&tab) {
+                if dock.set_active_tab(tab_path).is_ok() {
+                    dock.set_focused_node_and_surface(tab_path.node_path());
+                }
+            } else {
+                dock.set_focused_node_and_surface(path);
+                dock.push_to_focused_leaf(tab);
+            }
         }
         self.dock = dock;
+        self.param_windows(&ctx, workspace);
+        self.about.show(&ctx, workspace, &mut self.updater);
+        self.loop_editor.show(&ctx, workspace, &self.player, &mut self.selection, &mut self.library.repeat, &mut self.loops);
         // Move embedded editors over the space their nodes reserved this frame (none when the
         // graph tab is behind another), less what egui draws over them: native views sit
         // above everything the app draws, so they are cut out where they should be covered.
@@ -4180,6 +4326,9 @@ fn table_cell(ui: &egui::Ui, painter: &egui::Painter, cell: egui::Rect, text: &s
 
 fn list_row(ui: &mut egui::Ui, height: f32, selected: bool, text: egui::RichText, sense: egui::Sense) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), sense);
+    if sense.senses_click() {
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, resp.enabled(), selected, text.text()));
+    }
     let visuals = ui.style().interact_selectable(&resp, selected);
     if selected || (resp.hovered() && sense.senses_click()) {
         ui.painter().rect_filled(rect, 2.0, visuals.weak_bg_fill);
@@ -4247,6 +4396,12 @@ fn plugin_latency(plugin: &dyn plugins::Instance) -> String {
         let processing = total.saturating_sub(bridge);
         format!("Latency {samples} ({processing} plugin + {bridge} isolation)")
     }
+}
+
+fn transport_button(ui: &mut egui::Ui, enabled: bool, glyph: &str, label: &str) -> egui::Response {
+    let response = ui.add_enabled(enabled, egui::Button::new(glyph)).on_hover_text(label);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    response
 }
 
 pub(crate) fn filter_field(ui: &mut egui::Ui, filter: &mut String, hint: &str) {

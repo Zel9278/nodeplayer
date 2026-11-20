@@ -318,7 +318,11 @@ fn nice_top(kbps: f32) -> f32 {
 /// A titled grid of label / value rows.
 fn section(ui: &mut egui::Ui, title: &str, rows: impl FnOnce(&mut egui::Ui)) {
     egui::CollapsingHeader::new(RichText::new(title).strong()).id_salt(("now playing", title)).default_open(true).show(ui, |ui| {
-        egui::Grid::new(("now playing grid", title)).num_columns(2).spacing([12.0, 3.0]).striped(true).show(ui, rows);
+        if ui.available_width() < 155.0 {
+            rows(ui);
+        } else {
+            egui::Grid::new(("now playing grid", title)).num_columns(2).spacing([12.0, 3.0]).striped(true).show(ui, rows);
+        }
     });
 }
 

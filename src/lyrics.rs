@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use egui::{Align2, Color32, FontId, Rect, Sense, pos2, vec2};
+use egui::{Align2, Color32, FontId, Rect, Sense, pos2};
 use serde::{Deserialize, Serialize};
 
 use crate::player::Player;
@@ -630,7 +630,7 @@ impl LyricsPanel {
         let state = self.state.lock().unwrap().clone();
         let mut kept = self.track.as_deref().map(|p| self.store.get(p));
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if let Some(kept) = &mut kept {
                 let before = kept.provider;
                 egui::ComboBox::from_id_salt("lyrics provider")
@@ -651,22 +651,9 @@ impl LyricsPanel {
                     self.start_lookup(player, false);
                 }
             }
-            match &state {
-                Some(State::Searching) => {
-                    ui.spinner();
-                    ui.small("looking for lyrics…");
-                }
-                Some(State::Found(_, source)) => {
-                    ui.small(format!("from {source}"));
-                }
-                Some(State::Missing(why)) => {
-                    ui.small(format!("no lyrics ({why})"));
-                }
-                None => {
-                    ui.small("nothing playing");
-                }
-            }
-            if ui.small_button("⟳").on_hover_text("look again (skips the cache)").clicked() {
+            if ui.add_enabled(self.track.is_some(), egui::Button::new("⟳").small())
+                .on_hover_text("Look again (skips the cache)").clicked()
+            {
                 self.start_lookup(player, true);
             }
             if ui
@@ -680,21 +667,25 @@ impl LyricsPanel {
             }
         });
         let synced = matches!(state, Some(State::Found(Lyrics::Synced(_), _)));
-        if synced && let (Some(mut kept), Some(path)) = (kept, self.track.clone()) {
-            ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            if synced && let (Some(mut kept), Some(path)) = (kept, self.track.clone()) {
                 ui.add(egui::DragValue::new(&mut kept.offset).speed(0.05).range(-30.0..=30.0).fixed_decimals(2).prefix("offset ").suffix(" s"))
                     .on_hover_text("positive shows lines earlier; kept for this track");
                 if kept.offset != 0.0 && ui.small_button("↺").on_hover_text("offset back to 0").clicked() {
                     kept.offset = 0.0;
                 }
-                ui.add(egui::DragValue::new(&mut self.settings.font_size).speed(0.2).range(9.0..=48.0).fixed_decimals(0).prefix("size "));
-            });
-            self.store.set(&path, kept);
-        } else {
+                self.store.set(&path, kept);
+            }
             ui.add(egui::DragValue::new(&mut self.settings.font_size).speed(0.2).range(9.0..=48.0).fixed_decimals(0).prefix("size "));
+        });
+        match &state {
+            Some(State::Searching) => { ui.small("Looking for lyrics…"); }
+            Some(State::Found(_, source)) => { ui.small(format!("From {source}")); }
+            Some(State::Missing(why)) => { ui.small(format!("No lyrics · {why}")); }
+            None => { ui.small("Nothing playing"); }
         }
 
-        let size = ui.available_size().max(vec2(80.0, 40.0));
+        let size = ui.available_size().max(egui::Vec2::ZERO);
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
@@ -708,7 +699,7 @@ impl LyricsPanel {
     #[allow(clippy::too_many_arguments)]
     fn draw(&mut self, ui: &egui::Ui, painter: &egui::Painter, rect: Rect, resp: &egui::Response, lyrics: &Lyrics, player: &Player, scroll: f32) {
         let font = FontId::proportional(self.settings.font_size);
-        let wrap = rect.width() - 24.0;
+        let wrap = (rect.width() - 24.0).max(1.0);
         let gap = self.settings.font_size * 0.45;
         let visuals = ui.visuals();
         let lines = lyrics.lines();

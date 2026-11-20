@@ -68,8 +68,9 @@ gap: the decoder goes back to the start itself, and the few milliseconds after t
 out under the start, so there is no click. Without a selection, the whole track loops without
 a gap. MIDI files loop the same way, with the notes timed across the jump.
 
-The selection is made in the **loop editor** (〰 next to the repeat button). It's a window of
-its own that draws the track's waveform like an oscilloscope, left channel over right:
+Open the **Loop Editor** with 〰 next to the repeat button. It draws the track's waveform with
+the left channel above the right. Choose **Pop out** to move it to its own window, then
+**Return to workspace** to bring it back.
 
 - **Drag** across the waveform to select. **Drag an edge** to move it, **Ctrl+drag** inside
   the selection to move all of it, and **click** to seek. The ruler above seeks too.
@@ -82,7 +83,7 @@ its own that draws the track's waveform like an oscilloscope, left channel over 
 - **Loop selection** turns the loop on and off; off brings back the repeat mode from before.
 - **Follow playback** keeps the playhead in view. For MIDI files, which have no waveform, the
   editor draws the bars and beats instead, and **Snap to beats** pulls the edges onto them.
-- **Presets** (the panel on the right) keep selections of the track under a name: type one
+- **Presets** (the panel on the right or the toolbar menu) keep selections of the track under a name: type one
   (or leave it as `Loop 1`, `Loop 2`, …) and press **Save selection** or Enter. Click a preset
   to select it again, or press its number key (1–9); ✖ deletes it. Saving under a name already
   there replaces that preset.

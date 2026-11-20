@@ -655,6 +655,9 @@ name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "block"
@@ -1398,6 +1401,8 @@ dependencies = [
  "pollster 1.0.1",
  "profiling",
  "raw-window-handle",
+ "ron",
+ "serde",
  "static_assertions",
  "wasm-bindgen",
  "web-sys",
@@ -1422,6 +1427,7 @@ dependencies = [
  "log",
  "nohash-hasher",
  "profiling",
+ "ron",
  "serde",
  "smallvec",
  "unicode-segmentation",
@@ -1486,6 +1492,7 @@ dependencies = [
  "objc2-ui-kit 0.3.2",
  "profiling",
  "raw-window-handle",
+ "serde",
  "smithay-clipboard",
  "web-time",
  "webbrowser",
@@ -4038,6 +4045,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ron"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81116b9531d61eabc41aeb228e4b6b2435bcca3233b98cf3b3077d4e6e9debb3"
+dependencies = [
+ "bitflags 2.13.2",
+ "once_cell",
+ "serde",
+ "serde_derive",
+ "typeid",
+ "unicode-ident",
+]
+
+[[package]]
 name = "rtrb"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5017,6 +5038,12 @@ name = "typed-path"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
+
+[[package]]
+name = "typeid"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
 
 [[package]]
 name = "typenum"

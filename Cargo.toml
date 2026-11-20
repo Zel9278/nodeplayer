@@ -15,7 +15,7 @@ base64 = "0.22"
 clap-sys = "0.5"
 cpal = "0.18"
 crossbeam-channel = "0.5.17"
-eframe = "0.36"
+eframe = { version = "0.36", features = ["persistence"] }
 egui = "0.36"
 egui-snarl = "0.12"
 egui_dock = { version = "0.21", features = ["serde"] }
