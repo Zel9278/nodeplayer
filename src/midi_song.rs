@@ -55,11 +55,14 @@ impl MidiSong {
 
     /// The Player node's MIDI section: the file, its keys, and the MIDI-only settings.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        const WIDTH: f32 = 172.0;
+        ui.set_width(WIDTH);
         let status = self.player.status();
         if let Some(p) = self.player.load_progress() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.add(egui::ProgressBar::new(status.loading.unwrap_or(0.0)).desired_width(200.0).text(format!("loading {}", p.name)));
+                ui.add(egui::ProgressBar::new(status.loading.unwrap_or(0.0)).desired_width(ui.available_width()))
+                    .on_hover_text(format!("Loading {}", p.name));
             });
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
@@ -67,18 +70,18 @@ impl MidiSong {
             ui.colored_label(egui::Color32::from_rgb(230, 120, 90), e);
         }
         let Some(info) = self.player.info().cloned() else { return };
-        ui.small(format!(
-            "MIDI · {} tracks · {} notes · {} PPQ · {} tempo changes",
-            info.tracks,
-            group_digits(info.note_on),
-            info.division,
-            info.tempo_changes
-        ));
+        let tracks = if info.tracks == 1 { "track" } else { "tracks" };
+        let notes = if info.note_on == 1 { "note" } else { "notes" };
+        let changes = if info.tempo_changes == 1 { "tempo change" } else { "tempo changes" };
+        ui.add(egui::Label::new(egui::RichText::new(format!(
+            "MIDI · {} {tracks} · {} {notes}", info.tracks, group_digits(info.note_on),
+        )).small()).wrap())
+            .on_hover_text(format!("{} PPQ · {} {changes}", info.division, info.tempo_changes));
         let mut skip = self.player.settings.skip_drums;
         if ui.checkbox(&mut skip, "no drums").on_hover_text("leave out channel 10").changed() {
             self.player.set_skip_drums(skip);
         }
-        self.keys(ui);
+        self.keys(ui, WIDTH);
         let skipped = self.player.notes_skipped() + self.out.dropped.load(Ordering::Relaxed) + self.late.load(Ordering::Relaxed);
         ui.small(format!(
             "{} of {} notes{}",
@@ -99,8 +102,8 @@ impl MidiSong {
 
     /// The 128 keys as a keyboard, each lit while the file holds it, in the colour of the
     /// channel and track that struck it.
-    fn keys(&self, ui: &mut egui::Ui) {
-        crate::piano::keyboard(ui, |key| {
+    fn keys(&self, ui: &mut egui::Ui, width: f32) {
+        crate::piano::keyboard_with_width(ui, width, |key| {
             self.player.key_down(key).then(|| {
                 let (channel, track) = (self.player.channel(key), self.player.track(key));
                 crate::piano::Lit {

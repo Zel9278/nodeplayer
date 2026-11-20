@@ -13,7 +13,8 @@ use std::rc::{Rc, Weak};
 use std::sync::Once;
 
 use anyhow::{Context, Result, ensure};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     BLACK_BRUSH, ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, GetStockObject, HBRUSH, HRGN, MapWindowPoints, RDW_ALLCHILDREN, RDW_UPDATENOW, RGN_OR,
     RedrawWindow, SetWindowRgn,
@@ -869,11 +870,21 @@ fn instance() -> HINSTANCE {
 fn register_class() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
+        // Win32 icon resources require DWORD-aligned input.
+        #[repr(align(4))]
+        struct IconResource([u8; crate::setup::ICON.len()]);
+        static ICON: IconResource = IconResource({
+            let mut bytes = [0; crate::setup::ICON.len()];
+            bytes.copy_from_slice(crate::setup::ICON);
+            bytes
+        });
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance(),
             lpszClassName: CLASS,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hIcon: CreateIconFromResourceEx(&ICON.0, true, 0x00030000, 0, 0, LR_DEFAULTSIZE | LR_SHARED)
+                .unwrap_or_default(),
             hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
             ..Default::default()
         };
@@ -1001,7 +1012,12 @@ impl HostWindow {
         let (id, container) = match placement {
             Placement::Window => {
                 let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
-                let id = create(WINDOW_EX_STYLE::default(), title, style, (0, 0, w as i32, h as i32), None)?;
+                let id = create(WINDOW_EX_STYLE::default(), title, style, (CW_USEDEFAULT, CW_USEDEFAULT, w as i32, h as i32), None)?;
+                // Follow the system's dark window preference. Older systems may reject the attribute.
+                let enabled = BOOL(1);
+                let _ = unsafe {
+                    DwmSetWindowAttribute(id, DWMWA_USE_IMMERSIVE_DARK_MODE, (&raw const enabled).cast(), size_of::<BOOL>() as u32)
+                };
                 (id, None)
             }
             Placement::CaptureSource => {

@@ -62,7 +62,7 @@ MIDI connections remain MIDI when the number of audio buses changes. Older stere
 continue to load.
 
 - **Editor** opens the plugin's own window (VST3 and CLAP), drawn inside the node. **Pop out**
-  moves it into a window of its own.
+  moves it into a window of its own. **Embed** returns it to the node.
 - **Params** opens a list of all parameters with sliders.
 - **Bypass** lets the audio through untouched.
 

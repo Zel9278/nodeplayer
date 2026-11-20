@@ -23,7 +23,11 @@ pub struct Lit {
 /// Draws the keyboard; `lit` tells the keys that sound. Hovering a key names it, and what
 /// plays it while it sounds.
 pub fn keyboard(ui: &mut Ui, lit: impl Fn(usize) -> Option<Lit>) {
-    let size = vec2(WHITE_KEYS as f32 * WHITE_WIDTH, KEYS_HEIGHT + LABELS_HEIGHT);
+    keyboard_with_width(ui, WHITE_KEYS as f32 * WHITE_WIDTH, lit);
+}
+
+pub fn keyboard_with_width(ui: &mut Ui, width: f32, lit: impl Fn(usize) -> Option<Lit>) {
+    let size = vec2(width, KEYS_HEIGHT + LABELS_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     let keys = Rect::from_min_size(rect.min, vec2(rect.width(), KEYS_HEIGHT));
     let p = ui.painter_at(rect);
@@ -41,7 +45,8 @@ pub fn keyboard(ui: &mut Ui, lit: impl Fn(usize) -> Option<Lit>) {
             p.rect_filled(key_rect(keys, key), if black { 1.0 } else { 0.0 }, color);
         }
     }
-    for c in (0..128).step_by(12) {
+    let label_step = if width / WHITE_KEYS as f32 * 7.0 < 19.0 { 24 } else { 12 };
+    for c in (0..128).step_by(label_step) {
         let at = pos2(key_rect(keys, c).left(), keys.bottom() + 1.0);
         p.text(at, egui::Align2::LEFT_TOP, key_name(c), egui::FontId::proportional(8.0), Color32::from_gray(120));
     }
@@ -75,18 +80,20 @@ fn whites_before(key: usize) -> usize {
 /// Where `key` is drawn: a white key fills its column (less a gap), a black key straddles the
 /// line between the two white keys around it, from the top.
 fn key_rect(keys: Rect, key: usize) -> Rect {
-    let x = keys.left() + whites_before(key) as f32 * WHITE_WIDTH;
+    let white_width = keys.width() / WHITE_KEYS as f32;
+    let x = keys.left() + whites_before(key) as f32 * white_width;
     if is_black(key) {
-        let w = WHITE_WIDTH * BLACK_WIDTH;
+        let w = white_width * BLACK_WIDTH;
         Rect::from_min_size(pos2(x - w / 2.0, keys.top()), vec2(w, keys.height() * BLACK_HEIGHT))
     } else {
-        Rect::from_min_size(pos2(x, keys.top()), vec2(WHITE_WIDTH - 1.0, keys.height()))
+        Rect::from_min_size(pos2(x, keys.top()), vec2(white_width * 0.8, keys.height()))
     }
 }
 
 /// The key under `pos`: a black key where one covers the white ones.
 fn key_at(keys: Rect, pos: Pos2) -> Option<usize> {
-    let hit = |key: &usize| key_rect(keys, *key).expand2(vec2(0.5, 0.0)).contains(pos);
+    let gap = keys.width() / WHITE_KEYS as f32 * 0.1;
+    let hit = |key: &usize| key_rect(keys, *key).expand2(vec2(gap, 0.0)).contains(pos);
     (0..128).filter(|&k| is_black(k)).find(hit).or_else(|| (0..128).filter(|&k| !is_black(k)).find(hit))
 }
 

@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-const ICON: &[u8] = include_bytes!("../assets/icon.png");
+pub(crate) const ICON: &[u8] = include_bytes!("../assets/icon.png");
 const RELEASES: &str = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest";
 const USER_AGENT: &str = concat!("nodeplayer/", env!("CARGO_PKG_VERSION"));
 

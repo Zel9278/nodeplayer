@@ -1,4 +1,4 @@
-//! The normal env_logger output, also retained in a bounded buffer for the Logs dock.
+//! App messages and terminal output, retained in a bounded buffer for the Logs dock.
 //! Logging from an audio/plugin thread never waits for the UI's buffer lock.
 
 use std::collections::VecDeque;
@@ -6,6 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const CAPACITY: usize = 2000;
+pub(crate) const NOTICE_TARGET: &str = "nodeplayer::status";
 static BUFFER: OnceLock<Mutex<Buffer>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -41,13 +42,19 @@ struct Capture {
     start: Instant,
 }
 
+fn capture_by_default(metadata: &log::Metadata<'_>) -> bool {
+    metadata.level() <= log::Level::Info
+        && (metadata.target() == "nodeplayer" || metadata.target().starts_with("nodeplayer::"))
+}
+
 impl log::Log for Capture {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        self.inner.enabled(metadata)
+        capture_by_default(metadata) || self.inner.enabled(metadata)
     }
 
     fn log(&self, record: &log::Record<'_>) {
-        if !self.inner.matches(record) {
+        let terminal = self.inner.matches(record);
+        if !terminal && !capture_by_default(record.metadata()) {
             return;
         }
         if let Some(buffer) = BUFFER.get()
@@ -64,7 +71,9 @@ impl log::Log for Capture {
             });
             buffer.revision = buffer.revision.wrapping_add(1);
         }
-        self.inner.log(record);
+        if terminal {
+            self.inner.log(record);
+        }
     }
 
     fn flush(&self) {
@@ -83,7 +92,7 @@ pub fn init() -> Result<(), log::SetLoggerError> {
         inner,
         start: Instant::now(),
     }))?;
-    log::set_max_level(filter);
+    log::set_max_level(filter.max(log::LevelFilter::Info));
     Ok(())
 }
 
@@ -99,7 +108,7 @@ impl Default for LogDock {
     fn default() -> Self {
         Self {
             filter: String::new(),
-            minimum: log::LevelFilter::Trace,
+            minimum: log::LevelFilter::Info,
             follow: true,
             revision: None,
             entries: Vec::new(),
@@ -117,8 +126,6 @@ impl LogDock {
                 self.revision = Some(buffer.revision);
             }
         }
-        let mut clear = false;
-        let mut copy = false;
         ui.horizontal_wrapped(|ui| {
             ui.label("Show through");
             egui::ComboBox::from_id_salt("log level")
@@ -135,21 +142,8 @@ impl LogDock {
                     }
                 });
             ui.checkbox(&mut self.follow, "Follow");
-            copy = ui.button("Copy").clicked();
-            clear = ui.button("Clear").clicked();
         });
-        ui.add(
-            egui::TextEdit::singleline(&mut self.filter)
-                .hint_text("Filter logs")
-                .desired_width(f32::INFINITY),
-        );
-        if clear {
-            let mut buffer = buffer.lock().unwrap_or_else(|e| e.into_inner());
-            buffer.entries.clear();
-            buffer.revision = buffer.revision.wrapping_add(1);
-            self.entries.clear();
-            self.revision = Some(buffer.revision);
-        }
+        crate::app::filter_field(ui, &mut self.filter, "Filter logs");
         let needle = self.filter.to_lowercase();
         let entries: Vec<_> = self
             .entries
@@ -161,6 +155,21 @@ impl LogDock {
                         || entry.message.to_lowercase().contains(&needle))
             })
             .collect();
+        let (copy, clear) = ui.horizontal_wrapped(|ui| {
+            let copy = ui.add_enabled(!entries.is_empty(), egui::Button::new("Copy")).clicked();
+            let clear = ui.add_enabled(!self.entries.is_empty(), egui::Button::new("Clear")).clicked();
+            ui.small(format!("{} / {}", entries.len(), self.entries.len()))
+                .on_hover_text(format!("Most recent {CAPACITY} entries. Times are relative to startup."));
+            (copy, clear)
+        }).inner;
+        if clear {
+            let mut buffer = buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buffer.entries.clear();
+            buffer.revision = buffer.revision.wrapping_add(1);
+            self.entries.clear();
+            self.revision = Some(buffer.revision);
+            return;
+        }
         if copy {
             ui.ctx().copy_text(
                 entries
@@ -170,11 +179,10 @@ impl LogDock {
                     .join("\n"),
             );
         }
-        ui.small(format!(
-            "{} / {} entries · most recent {CAPACITY} retained · time since startup",
-            entries.len(),
-            self.entries.len()
-        ));
+        if entries.is_empty() {
+            ui.weak(if self.entries.is_empty() { "No logs yet" } else { "No matching entries" });
+            return;
+        }
         egui::ScrollArea::both()
             .id_salt("log entries")
             .auto_shrink([false, false])
@@ -226,7 +234,15 @@ mod tests {
                 .args(format_args!("visible warning"))
                 .build(),
         );
+        capture.log(
+            &log::Record::builder()
+                .level(log::Level::Info)
+                .target(NOTICE_TARGET)
+                .args(format_args!("visible status"))
+                .build(),
+        );
         let held = buffer.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(held.entries.iter().any(|e| e.target == NOTICE_TARGET && e.message == "visible status"));
         assert!(
             held.entries
                 .iter()

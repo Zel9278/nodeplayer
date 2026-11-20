@@ -50,6 +50,7 @@ mod vst3;
 mod windows_identity;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod x11_errors;
+#[cfg(target_os = "linux")]
 mod yabridge;
 
 use std::path::Path;
