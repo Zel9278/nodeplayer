@@ -38,6 +38,10 @@ fn register() -> Result<()> {
         return Ok(());
     }
     unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID)) }?;
+    // A separate profile can belong to a staged copy. The Start menu entry is shared.
+    if crate::runtime::get().data_root.is_some() {
+        return Ok(());
+    }
     let _com = ComApartment::new()?;
     let exe = std::env::current_exe()?;
     // Use the Windows known folder API: the Start menu may be redirected.

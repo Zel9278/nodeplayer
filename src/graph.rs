@@ -48,6 +48,7 @@ pub struct PluginNode {
     pub audio_ports: crate::plugins::AudioPorts,
     pub midi_ports: (bool, bool),
     pub ports_known: bool,
+    pub load_pending: bool,
     /// Last control-side timing accepted for the prepared bypass/graph plan.
     pub timing: (u32, u32),
     /// Keep the accepted timing while restart admission retains the warm fallback.
@@ -72,6 +73,7 @@ impl PluginNode {
             audio_ports,
             midi_ports,
             ports_known,
+            load_pending: !ports_known,
             timing,
             suspended: false,
             bypass: false,

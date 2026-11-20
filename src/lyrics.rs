@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use egui::{Align2, Color32, FontId, Rect, Sense, pos2, vec2};
+use egui::{Align2, Color32, FontId, Rect, Sense, pos2};
 use serde::{Deserialize, Serialize};
 
 use crate::player::Player;
@@ -312,36 +312,37 @@ fn norm(s: &str) -> String {
     if out.is_empty() { s.to_lowercase() } else { out }
 }
 
-/// How well a search result matches the track; `None` when the title doesn't.
+/// Rank compatible search results. A fallback filename needs an exact title and duration
+/// match when there is no matching artist.
 fn match_score(t: &Track, title: &str, name: &str, artists: &[String], secs: Option<f64>) -> Option<i32> {
     let (want, got) = (norm(title), norm(name));
-    let mut score = if want == got {
-        4
-    } else if !want.is_empty() && (got.contains(&want) || want.contains(&got)) {
-        2
-    } else {
+    let exact = want == got;
+    if want.is_empty() || got.is_empty() {
         return None;
-    };
-    if let Some(artist) = &t.artist {
-        let a = norm(artist);
-        if artists.iter().any(|x| {
-            let x = norm(x);
-            !x.is_empty() && (a.contains(&x) || x.contains(&a))
-        }) {
-            score += 3;
-        }
     }
-    if let (Some(d), Some(s)) = (t.duration, secs) {
-        let diff = (d - s).abs();
-        score += if diff < 3.0 {
-            3
-        } else if diff < 10.0 {
-            1
-        } else {
-            -3
-        };
+    let artist = t.artist.as_deref().map(norm).filter(|artist| !artist.is_empty());
+    let artist_matches = artist.as_ref().is_some_and(|artist| {
+        artists.iter().map(|name| norm(name)).any(|name| {
+            !name.is_empty() && (artist.contains(&name) || name.contains(artist))
+        })
+    });
+    if artist.is_some() && !artist_matches && artists.iter().any(|name| !name.trim().is_empty()) {
+        return None;
     }
-    Some(score)
+    let duration_diff = t.duration.zip(secs)
+        .filter(|(a, b)| a.is_finite() && b.is_finite() && *a > 0.0 && *b > 0.0)
+        .map(|(a, b)| (a - b).abs());
+    let close = duration_diff.is_some_and(|diff| diff < 3.0);
+    let partial = want.chars().count().min(got.chars().count()) >= 4
+        && (got.contains(&want) || want.contains(&got));
+    if duration_diff.is_some_and(|diff| diff >= 10.0)
+        || (!artist_matches && !(exact && close))
+        || (!exact && !partial)
+    {
+        return None;
+    }
+    Some(if exact { 4 } else { 2 } + if artist_matches { 3 } else { 0 }
+        + if close { 3 } else { i32::from(duration_diff.is_some()) })
 }
 
 /// Drops the credit lines the services put first ("作词 : …", "Lyrics by：…", the
@@ -483,8 +484,15 @@ type Service = fn(&Track, &str) -> Result<Option<String>, String>;
 /// The lyrics from `choice`, or ("auto", `None`) from the first provider that has them.
 fn lookup(t: &Track, choice: Option<Provider>, online: bool, refresh: bool) -> State {
     let title = t.title.clone().unwrap_or_else(|| t.path.file_stem().unwrap_or_default().to_string_lossy().into_owned());
-    let key = format!("{}\n{}\n{}", title.to_lowercase(), t.artist.as_deref().unwrap_or("").to_lowercase(), t.album.as_deref().unwrap_or("").to_lowercase());
+    // Earlier caches could contain matches accepted with less evidence.
+    let key = format!("v2\n{}\n{}\n{}\n{:.1}", title.to_lowercase(),
+        t.artist.as_deref().unwrap_or("").to_lowercase(),
+        t.album.as_deref().unwrap_or("").to_lowercase(), t.duration.unwrap_or_default());
     let picked = choice.is_some();
+    let untagged_clip = !picked
+        && t.title.as_deref().is_none_or(|tag| tag.trim().is_empty())
+        && t.artist.as_deref().is_none_or(|tag| tag.trim().is_empty())
+        && t.duration.is_some_and(|seconds| seconds > 0.0 && seconds < 30.0);
     let providers = match &choice {
         Some(p) => std::slice::from_ref(p),
         None => &Provider::ALL[..],
@@ -516,6 +524,7 @@ fn lookup(t: &Track, choice: Option<Provider>, online: bool, refresh: bool) -> S
                     why.push("online is off".to_string());
                 }
             }
+            _ if untagged_clip => return State::Missing("untagged clip".into()),
             _ => match online_lookup(t, &title, &key, p, refresh) {
                 Ok(Some((l, true))) => return State::Found(l, format!("{} (cached)", p.label())),
                 Ok(Some((l, false))) => return State::Found(l, p.label().into()),
@@ -590,6 +599,11 @@ impl LyricsPanel {
     }
 
     fn start_lookup(&mut self, player: &Player, refresh: bool) {
+        let generation = {
+            let mut g = self.generation.lock().unwrap();
+            *g += 1;
+            *g
+        };
         let status = player.status();
         let Some(path) = status.path.clone() else {
             *self.state.lock().unwrap() = None;
@@ -603,11 +617,6 @@ impl LyricsPanel {
             album: status.tags.album.clone(),
             duration: status.duration,
             embedded: status.tags.lyrics.clone(),
-        };
-        let generation = {
-            let mut g = self.generation.lock().unwrap();
-            *g += 1;
-            *g
         };
         *self.state.lock().unwrap() = Some(State::Searching);
         self.manual = None;
@@ -630,7 +639,7 @@ impl LyricsPanel {
         let state = self.state.lock().unwrap().clone();
         let mut kept = self.track.as_deref().map(|p| self.store.get(p));
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if let Some(kept) = &mut kept {
                 let before = kept.provider;
                 egui::ComboBox::from_id_salt("lyrics provider")
@@ -651,50 +660,39 @@ impl LyricsPanel {
                     self.start_lookup(player, false);
                 }
             }
-            match &state {
-                Some(State::Searching) => {
-                    ui.spinner();
-                    ui.small("looking for lyrics…");
-                }
-                Some(State::Found(_, source)) => {
-                    ui.small(format!("from {source}"));
-                }
-                Some(State::Missing(why)) => {
-                    ui.small(format!("no lyrics ({why})"));
-                }
-                None => {
-                    ui.small("nothing playing");
-                }
-            }
-            if ui.small_button("⟳").on_hover_text("look again (skips the cache)").clicked() {
+            if ui.add_enabled(self.track.is_some(), egui::Button::new("⟳").small())
+                .on_hover_text("Look again (skips the cache)").clicked()
+            {
                 self.start_lookup(player, true);
             }
             if ui
                 .checkbox(&mut self.settings.online, "online")
                 .on_hover_text("look up NetEase, Kugou and LRCLIB (sends title, artist and length to music.163.com, kugou.com and lrclib.net)")
                 .changed()
-                && self.settings.online
-                && matches!(state, Some(State::Missing(_)))
             {
                 self.start_lookup(player, false);
             }
         });
         let synced = matches!(state, Some(State::Found(Lyrics::Synced(_), _)));
-        if synced && let (Some(mut kept), Some(path)) = (kept, self.track.clone()) {
-            ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            if synced && let (Some(mut kept), Some(path)) = (kept, self.track.clone()) {
                 ui.add(egui::DragValue::new(&mut kept.offset).speed(0.05).range(-30.0..=30.0).fixed_decimals(2).prefix("offset ").suffix(" s"))
                     .on_hover_text("positive shows lines earlier; kept for this track");
                 if kept.offset != 0.0 && ui.small_button("↺").on_hover_text("offset back to 0").clicked() {
                     kept.offset = 0.0;
                 }
-                ui.add(egui::DragValue::new(&mut self.settings.font_size).speed(0.2).range(9.0..=48.0).fixed_decimals(0).prefix("size "));
-            });
-            self.store.set(&path, kept);
-        } else {
+                self.store.set(&path, kept);
+            }
             ui.add(egui::DragValue::new(&mut self.settings.font_size).speed(0.2).range(9.0..=48.0).fixed_decimals(0).prefix("size "));
+        });
+        match &state {
+            Some(State::Searching) => { ui.small("Looking for lyrics…"); }
+            Some(State::Found(_, source)) => { ui.small(format!("From {source}")); }
+            Some(State::Missing(why)) => { ui.small(format!("No lyrics · {why}")); }
+            None => { ui.small("Nothing playing"); }
         }
 
-        let size = ui.available_size().max(vec2(80.0, 40.0));
+        let size = ui.available_size().max(egui::Vec2::ZERO);
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
@@ -708,7 +706,7 @@ impl LyricsPanel {
     #[allow(clippy::too_many_arguments)]
     fn draw(&mut self, ui: &egui::Ui, painter: &egui::Painter, rect: Rect, resp: &egui::Response, lyrics: &Lyrics, player: &Player, scroll: f32) {
         let font = FontId::proportional(self.settings.font_size);
-        let wrap = rect.width() - 24.0;
+        let wrap = (rect.width() - 24.0).max(1.0);
         let gap = self.settings.font_size * 0.45;
         let visuals = ui.visuals();
         let lines = lyrics.lines();
@@ -818,6 +816,16 @@ mod tests {
         assert!(q("Bohemian Rhapsody", "Queen", 355.0) > q("Bohemian Rhapsody", "Queen", 240.0));
         assert_eq!(q("Another One Bites the Dust", "Queen", 355.0), None);
         assert_eq!(norm("夜に駆ける (Yoru ni Kakeru)"), "夜に駆ける");
+    }
+
+    #[test]
+    fn untagged_clips_do_not_get_unrelated_online_lyrics() {
+        let track = Track { path: "Smoke Test B.wav".into(), duration: Some(24.0), ..Default::default() };
+        let artists = vec!["Another artist".into()];
+        assert_eq!(match_score(&track, "Smoke Test B", "Test", &artists, Some(240.0)), None);
+        assert_eq!(match_score(&track, "Smoke Test B", "Smoke Test B", &artists, None), None);
+        assert!(match_score(&track, "Smoke Test B", "Smoke Test B", &artists, Some(24.0)).is_some());
+        assert!(matches!(lookup(&track, None, true, false), State::Missing(why) if why == "untagged clip"));
     }
 
     #[test]

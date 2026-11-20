@@ -50,6 +50,7 @@ mod vst3;
 mod windows_identity;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod x11_errors;
+#[cfg(target_os = "linux")]
 mod yabridge;
 
 use std::path::Path;
@@ -140,6 +141,8 @@ fn main() -> Result<()> {
             .with_icon(setup::icon().unwrap_or_default())
             .with_inner_size([1280.0, 800.0])
             .with_drag_and_drop(true),
+        persist_window: diagnostic.is_none(),
+        persistence_path: dirs::state().map(|dir| dir.join("window.ron")),
         event_loop_builder: x11_event_loop_hook(),
         ..Default::default()
     };

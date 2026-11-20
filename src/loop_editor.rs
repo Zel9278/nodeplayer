@@ -453,6 +453,7 @@ impl Axis {
 
 pub struct LoopEditor {
     pub open: bool,
+    popped_out: bool,
     wave: Option<Wave>,
     /// The track the view is of.
     track: Option<PathBuf>,
@@ -475,6 +476,7 @@ impl Default for LoopEditor {
     fn default() -> Self {
         Self {
             open: false,
+            popped_out: false,
             wave: None,
             track: None,
             view: (0.0, 1.0),
@@ -506,19 +508,21 @@ impl LoopEditor {
     }
 
     /// The editor's window, while open. Call every pass.
-    pub fn show(&mut self, ctx: &egui::Context, player: &Player, selection: &mut Option<Selection>, repeat: &mut Repeat, store: &mut LoopStore) {
+    pub fn show(&mut self, ctx: &egui::Context, workspace: Rect, player: &Player, selection: &mut Option<Selection>, repeat: &mut Repeat, store: &mut LoopStore) {
         if !self.open {
             self.wave = None;
             self.track = None;
+            self.drag = Drag::None;
+            self.popped_out = false;
             return;
         }
-        let id = egui::ViewportId::from_hash_of("loop editor");
         let status = player.status();
         let midi = player.is_midi();
         let duration = status.duration.unwrap_or(0.0);
         if status.path != self.track {
             self.track = status.path.clone();
-            self.wave = self.track.clone().filter(|_| !midi).map(|p| Wave::open(p, ctx.clone(), id));
+            // An immediate viewport also renders when the main window repaints.
+            self.wave = self.track.clone().filter(|_| !midi).map(|p| Wave::open(p, ctx.clone(), egui::ViewportId::ROOT));
             self.fitted = false;
         }
         if !self.fitted && duration > 0.0 {
@@ -528,46 +532,81 @@ impl LoopEditor {
                 None => (0.0, duration),
             };
         }
-        let title = status.title().map_or_else(|| "Loop editor".to_string(), |t| format!("{t} — Loop editor"));
-        let builder = egui::ViewportBuilder::default()
-            .with_title(title)
-            .with_app_id("nodeplayer")
-            .with_inner_size([1000.0, 460.0])
-            .with_min_inner_size([480.0, 260.0]);
-        ctx.show_viewport_immediate(id, builder, |ui, _| {
-            let ctx = ui.ctx().clone();
-            if ctx.input(|i| i.viewport().close_requested()) {
-                self.open = false;
-                return;
-            }
-            let path = self.track.clone();
+        let title = status.title().map_or_else(|| "Loop Editor".to_string(), |t| format!("{t} — Loop Editor"));
+        if self.popped_out && !ctx.embed_viewports() {
+            let id = egui::ViewportId::from_hash_of("loop editor");
+            let builder = egui::ViewportBuilder::default()
+                .with_title(title)
+                .with_app_id("nodeplayer")
+                .with_icon(crate::setup::icon().unwrap_or_default())
+                .with_inner_size([1000.0, 460.0])
+                .with_min_inner_size([480.0, 260.0]);
+            ctx.show_viewport_immediate(id, builder, |ui, _| {
+                if ui.input(|i| i.viewport().close_requested()) {
+                    self.open = false;
+                    return;
+                }
+                self.content(ui, player, selection, repeat, store, duration, midi);
+            });
+        } else {
+            let size = vec2(920.0, 420.0).min((workspace.size() - vec2(12.0, 12.0)).max(egui::Vec2::ZERO));
+            let mut open = self.open;
+            egui::Window::new(title)
+                .id(egui::Id::new("loop editor"))
+                .open(&mut open)
+                .constrain_to(workspace)
+                .min_size(vec2(320.0, 240.0).min(size))
+                .default_rect(Rect::from_center_size(workspace.center(), size))
+                .show(ctx, |ui| self.content(ui, player, selection, repeat, store, duration, midi));
+            self.open = open;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn content(&mut self, ui: &mut egui::Ui, player: &Player, selection: &mut Option<Selection>, repeat: &mut Repeat, store: &mut LoopStore, duration: f64, midi: bool) {
+        let ctx = ui.ctx().clone();
+        let path = self.track.clone();
+        let native = ctx.viewport_id() != egui::ViewportId::ROOT;
+        if native || ctx.top_layer_id() == Some(ui.layer_id()) {
             self.keys(&ctx, player, selection, repeat, path.as_deref(), duration, store);
-            egui::Panel::top("loop tools").show(ui, |ui| {
-                ui.add_space(4.0);
-                self.toolbar(ui, player, selection, repeat, path.as_deref(), duration, midi);
-                ui.add_space(2.0);
-            });
-            if let Some(path) = path.as_deref() {
-                egui::Panel::right("loop presets").resizable(true).default_size(230.0).min_size(170.0).show(ui, |ui| {
-                    self.presets(ui, selection, path, duration, store);
+        }
+        let sidebar = ui.available_width() >= 625.0;
+        egui::Panel::top("loop tools").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if !ctx.embed_viewports() {
+                    let label = if native { "Return to workspace" } else { "Pop out" };
+                    if ui.small_button(label).clicked() {
+                        self.drag = Drag::None;
+                        self.popped_out = !native;
+                    }
+                }
+                if !sidebar && let Some(path) = path.as_deref() {
+                    ui.menu_button("Presets", |ui| {
+                        ui.set_min_width(210.0);
+                        self.presets(ui, selection, path, duration, store);
+                    });
+                }
+                ui.menu_button("Shortcuts", |ui| {
+                    ui.label("Drag to select or resize. Ctrl+drag moves the selection.");
+                    ui.label("Click the ruler to seek. Scroll to zoom.");
+                    ui.label("Shift+scroll or middle-drag pans. Ctrl+scroll adjusts the height.");
+                    ui.label("A/B sets the start/end. L loops. Z zooms to the selection.");
+                    ui.label("F fits the track. Esc clears the selection. 1–9 recalls presets.");
                 });
-            }
-            egui::Panel::bottom("loop hints").show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.weak(
-                        "Drag to select · drag an edge to change it · Ctrl+drag moves the selection · click to seek · \
-                         wheel zooms · Shift+wheel or middle-drag scrolls · Ctrl+wheel scales the height · \
-                         Space play/pause · L loop · A/B start/end at the playhead · Z zoom to the selection · F fit · Esc clear · 1–9 presets",
-                    );
-                });
             });
-            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BACKGROUND)).show(ui, |ui| {
-                self.scope(ui, player, selection, path.as_deref(), duration, midi);
-            });
-            if player.is_playing() || self.wave.as_ref().is_some_and(|w| !w.peaks.lock().unwrap().done) {
-                ctx.request_repaint_after(Duration::from_millis(16));
-            }
+            self.toolbar(ui, player, selection, repeat, path.as_deref(), duration, midi);
         });
+        if sidebar && let Some(path) = path.as_deref() {
+            egui::Panel::right("loop presets").resizable(true).default_size(230.0).min_size(170.0).show(ui, |ui| {
+                self.presets(ui, selection, path, duration, store);
+            });
+        }
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BACKGROUND)).show(ui, |ui| {
+            self.scope(ui, player, selection, path.as_deref(), duration, midi);
+        });
+        if player.is_playing() || self.wave.as_ref().is_some_and(|w| !w.peaks.lock().unwrap().done) {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -631,9 +670,9 @@ impl LoopEditor {
         let current = selection.as_ref().filter(|s| s.path == path).map(|s| (s.start, s.end));
         let presets = store.presets(path).to_vec();
         let (mut chosen, mut remove) = (None, None);
-        egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(ui.available_height() - 70.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, true]).max_height((ui.available_height() - 70.0).max(48.0)).show(ui, |ui| {
             if presets.is_empty() {
-                ui.weak("None yet. Select a stretch, name it below and press Save.");
+                ui.weak("Select a range, name it below, and click Save selection.");
             }
             for (i, p) in presets.iter().enumerate() {
                 ui.horizontal(|ui| {
@@ -668,7 +707,7 @@ impl LoopEditor {
         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let replaces = presets.iter().any(|p| p.name == self.preset_name.trim());
         let label = if replaces { "Save (replace)" } else { "Save selection" };
-        let save = ui.add_enabled(current.is_some(), egui::Button::new(label)).on_disabled_hover_text("select a stretch first");
+        let save = ui.add_enabled(current.is_some(), egui::Button::new(label)).on_disabled_hover_text("Select a range first");
         if let Some(range) = current
             && (save.clicked() || enter)
         {
@@ -778,9 +817,10 @@ impl LoopEditor {
             draw_columns(&painter, overview_rect, &whole, &p, None, None, 1.0, TRACE_DIM);
         }
         let view_rect = Rect::from_x_y_ranges(whole.x(self.view.0)..=whole.x(self.view.1).max(whole.x(self.view.0) + 2.0), overview_rect.y_range());
-        painter.rect_stroke(view_rect, 1.0, Stroke::new(1.0, Color32::from_gray(200)), egui::StrokeKind::Inside);
         painter.vline(whole.x(pos), overview_rect.y_range(), Stroke::new(1.0, PLAYHEAD));
+        painter.rect_stroke(view_rect.intersect(overview_rect), 1.0, Stroke::new(1.0, Color32::from_gray(200)), egui::StrokeKind::Inside);
         let ov = ui.interact(overview_rect, ui.id().with("overview"), Sense::click_and_drag());
+        ov.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Waveform overview"));
         if (ov.clicked() || ov.dragged()) && let Some(p) = ov.interact_pointer_pos() {
             let span = self.view.1 - self.view.0;
             let t = whole.t(p.x);
@@ -890,6 +930,7 @@ impl LoopEditor {
 
         // ── Ruler: click or drag to seek.
         let ruler = ui.interact(ruler_rect, ui.id().with("ruler"), Sense::click_and_drag());
+        ruler.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Timeline ruler"));
         if let Some(p) = ruler.interact_pointer_pos() {
             let at = axis.t(p.x).clamp(0.0, duration);
             if ruler.dragged() {
@@ -910,6 +951,7 @@ impl LoopEditor {
 
         // ── Scope: select, zoom, scroll.
         let resp = ui.interact(scope_rect, ui.id().with("scope"), Sense::click_and_drag());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Loop selection waveform"));
         let snapping = midi && self.snap;
         let snap = |t: f64| -> f64 {
             if !snapping {

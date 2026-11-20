@@ -81,13 +81,13 @@ Without FFmpeg, the files nodeplayer decodes itself still play.
   Drag a tab by its title onto the arrows that appear over a panel to put it beside, above or
   below that panel, or onto the middle to stack it there. Dropped anywhere else, it floats as a
   window. Right-click a tab and pick "Close" to close it (any but the graph); the "+" at the end
-  of each tab bar opens closed ones again. The layout is kept for the next start.
+  of each tab bar switches to an open tab or reopens a closed one. The layout is kept for the next start.
 - **Graph**: where the sound goes. The default graph is Player → Output.
 - **Logs**: a dockable tab, also available from a tab bar's "+" menu. It keeps the latest
   2,000 captured log entries with their level, module and time since startup. Filter by text
-  or level, follow the newest entry, copy the filtered text, or clear the buffer. Capture
-  follows `RUST_LOG`; by default nodeplayer's informational messages and other modules'
-  warnings/errors are included. Logs are kept for this run, rather than saved in the session.
+  or level, follow the newest entry, copy the filtered text, or clear the buffer. The dock
+  captures nodeplayer's informational messages, warnings and errors, plus any output enabled
+  by `RUST_LOG`. The buffer starts empty on each launch.
 - **Statistics**: total application running time, total listening time and a track ranking.
   Select a track to graph its listening history, or use **All tracks** for the overall view.
   Switch between bars and lines, daily and cumulative values, and 7/30/90/365 days. Hover

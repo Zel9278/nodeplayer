@@ -10,8 +10,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crossbeam_channel::Receiver;
-use egui::{Color32, Pos2, pos2};
-use egui_snarl::ui::{AnyPins, PinInfo, SnarlPin, SnarlStyle, SnarlViewer, SnarlWidget};
+use egui::{Color32, Pos2, Rect, emath::TSTransform, pos2, vec2};
+use egui_snarl::ui::{AnyPins, PinInfo, PinPlacement, SnarlPin, SnarlStyle, SnarlViewer, SnarlWidget};
 use egui_snarl::{InPin, NodeId, OutPin, OutPinId, InPinId, Snarl};
 
 use crate::engine::eq::EqSettings;
@@ -33,6 +33,7 @@ use crate::visual::{VisKind, Visualizer};
 use crate::native::ext::{Command as ExtCommand, Extensions};
 use crate::plugins::guard;
 use crate::plugins::{self, Format, Placement, PluginInfo, PxRect};
+#[cfg(target_os = "linux")]
 use crate::yabridge::{self, Yabridge};
 
 enum ScanMsg {
@@ -206,8 +207,8 @@ impl Tab {
     fn title(self) -> &'static str {
         match self {
             Self::Graph => "Graph",
-            Self::Logs => "Logs",
-            Self::Statistics => "Statistics",
+            Self::Logs => "▤ Logs",
+            Self::Statistics => "▥ Statistics",
             Self::Library => "🎵 Library",
             Self::Presets => "💾 Presets",
             Self::Plugins => "🔌 Plugins",
@@ -221,17 +222,23 @@ impl Tab {
     }
 }
 
-/// Puts a panel this version added into a layout saved before it: the "Now playing" panel
-/// under the library, others with the library's tabs.
+/// Adds a new panel to a saved layout without switching away from the active tab.
 fn add_new_tab(dock: &mut egui_dock::DockState<Tab>, tab: Tab) {
-    let library = dock.find_main_surface_tab(&Tab::Library).map(|(node, _)| node);
-    match (tab, library) {
+    let neighbor = match tab {
+        Tab::Logs | Tab::Statistics => Tab::Info,
+        _ => Tab::Library,
+    };
+    let target = dock.find_main_surface_tab(&neighbor).map(|(node, _)| node);
+    match (tab, target) {
         (Tab::Info, Some(node)) => {
             dock.main_surface_mut().split_below(node, 0.62, vec![tab]);
         }
         (_, Some(node)) => {
-            dock.set_focused_node_and_surface(egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node });
-            dock.push_to_focused_leaf(tab);
+            let path = egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node };
+            if let Ok(leaf) = dock.leaf_mut(path) {
+                // Newly available panels should leave the active panel in place.
+                leaf.tabs.push(tab);
+            }
         }
         _ => dock.push_to_first_leaf(tab),
     }
@@ -240,12 +247,12 @@ fn add_new_tab(dock: &mut egui_dock::DockState<Tab>, tab: Tab) {
 /// The layout before any rearranging: the side tabs left of the graph.
 fn default_dock(extensions: bool) -> egui_dock::DockState<Tab> {
     let mut dock = egui_dock::DockState::new(vec![Tab::Graph]);
-    let mut side = vec![Tab::Library, Tab::Presets, Tab::Plugins, Tab::Misskey, Tab::Discord, Tab::Logs, Tab::Statistics];
+    let mut side = vec![Tab::Library, Tab::Presets, Tab::Plugins, Tab::Misskey, Tab::Discord];
     if extensions {
         side.push(Tab::Extensions);
     }
     let [_, left] = dock.main_surface_mut().split_left(egui_dock::NodeIndex::root(), 0.35, side);
-    dock.main_surface_mut().split_below(left, 0.62, vec![Tab::Info]);
+    dock.main_surface_mut().split_below(left, 0.62, vec![Tab::Info, Tab::Logs, Tab::Statistics]);
     // The library in front.
     dock.set_focused_node_and_surface(egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node: left });
     dock
@@ -257,8 +264,9 @@ struct Tabs<'a> {
     actions: &'a mut Vec<Action>,
     /// Closed tabs, offered by the "+" buttons.
     closed: Vec<Tab>,
-    /// A closed tab picked from a "+" button, and where.
-    reopen: Option<(egui_dock::NodePath, Tab)>,
+    open: HashMap<egui_dock::NodePath, (Vec<Tab>, Option<Tab>)>,
+    chosen: Option<(egui_dock::NodePath, Tab)>,
+    buttons: HashMap<Tab, egui::Response>,
 }
 
 impl egui_dock::TabViewer for Tabs<'_> {
@@ -272,11 +280,18 @@ impl egui_dock::TabViewer for Tabs<'_> {
         tab.title().into()
     }
 
+    fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        self.buttons.insert(*tab, response.clone());
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         let app = &mut *self.app;
         if !crate::runtime::get().allow_network() && matches!(tab, Tab::Misskey | Tab::Discord) {
             ui.label("External networking is disabled during diagnostics.");
             return;
+        }
+        if matches!(tab, Tab::Library | Tab::Info | Tab::Statistics | Tab::Discord) {
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
         }
         match tab {
             Tab::Graph => app.graph_ui(ui, self.actions),
@@ -323,13 +338,59 @@ impl egui_dock::TabViewer for Tabs<'_> {
     }
 
     fn add_popup(&mut self, ui: &mut egui::Ui, path: egui_dock::NodePath) {
-        if self.closed.is_empty() {
-            ui.weak("Every panel is open.");
+        if let Some((tabs, active)) = self.open.get(&path) {
+            for &tab in tabs {
+                if ui.selectable_label(Some(tab) == *active, tab.title()).clicked() {
+                    self.chosen = Some((path, tab));
+                    ui.close();
+                }
+            }
+            if !tabs.is_empty() && !self.closed.is_empty() {
+                ui.separator();
+            }
         }
         for tab in &self.closed {
             if ui.button(tab.title()).clicked() {
-                self.reopen = Some((path, *tab));
+                self.chosen = Some((path, *tab));
                 ui.close();
+            }
+        }
+    }
+}
+
+fn update_dock_tabs(dock: &mut egui_dock::DockState<Tab>, buttons: &HashMap<Tab, egui::Response>) {
+    for (path, leaf) in dock.iter_leaves_mut() {
+        let active = leaf.tabs.get(leaf.active.0).copied();
+        for tab in &leaf.tabs {
+            let Some(response) = buttons.get(tab) else { continue };
+            let selected = Some(*tab) == active;
+            let name = tab.title().trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+            response.widget_info(|| egui::WidgetInfo::selected(
+                egui::WidgetType::SelectableLabel, response.enabled(), selected, name,
+            ));
+            response.ctx.accesskit_node_builder(response.id, |node| {
+                node.set_role(egui::accesskit::Role::Tab);
+                node.set_selected(selected);
+            });
+            if !selected {
+                continue;
+            }
+            let key = egui::Id::new(("active dock tab", path.surface, path.node));
+            let state = (*tab, leaf.rect.width());
+            let changed = response.ctx.data_mut(|data| {
+                let changed = data.get_temp::<(Tab, f32)>(key) != Some(state);
+                data.insert_temp(key, state);
+                changed
+            });
+            if changed {
+                // Adjust only on activation or resize, so the strip can still be scrolled.
+                let clipped = response.interact_rect;
+                let delta = (clipped.left() - response.rect.left()).max(0.0)
+                    - (response.rect.right() - clipped.right()).max(0.0);
+                if delta != 0.0 {
+                    leaf.scroll = (leaf.scroll + delta).min(0.0);
+                    response.ctx.request_repaint();
+                }
             }
         }
     }
@@ -342,6 +403,14 @@ const AUTOSAVE: Duration = Duration::from_secs(30);
 struct Level {
     snarl: Snarl<GraphNode>,
     group: NodeId,
+}
+
+#[derive(Clone, Copy)]
+struct GraphMeasurement {
+    view: Rect,
+    bounds: Rect,
+    nodes: usize,
+    follow_layout: bool,
 }
 
 /// Every node at every level: the graph shown, the ones around it, and the groups in them.
@@ -362,10 +431,12 @@ enum Action {
     Leave(usize),
     LoadIntoGroup(NodeId, String),
     AddPlugin(PluginInfo, Pos2),
+    AddPluginFromList(PluginInfo),
     AddWired(node_menu::NewNode, Pos2, node_menu::WireDrag),
     ConnectWired(NodeId, node_menu::WireDrag),
     Remove(NodeId),
     Changed,
+    FitGraph,
     /// Ask for a name, then save the selected nodes as a node preset.
     NameNodePreset,
     AddNodePreset(String, Pos2),
@@ -398,6 +469,7 @@ pub struct App {
     pending_teardown: HashMap<u32, Box<PluginNode>>,
     /// Plugin nodes whose processor is being swapped out so the plugin can restart.
     restarting: HashSet<u32>,
+    #[cfg(target_os = "linux")]
     yabridge: Yabridge,
     messages: Vec<String>,
     logs: crate::logs::LogDock,
@@ -405,7 +477,6 @@ pub struct App {
     seek_drag: Option<f64>,
     /// The transport's playback rate; Rate Shift nodes multiply it.
     rate: f32,
-    added: usize,
     /// The main window's X11 id when running under X11; editors are embedded into it.
     host_xid: Option<crate::plugins::WindowId>,
     debug_done: bool,
@@ -415,6 +486,7 @@ pub struct App {
     /// of the graph's nodes in the order they were drawn.
     placements: HashMap<u32, Placed>,
     node_rects: Vec<(u32, egui::Rect)>,
+    graph_view: Option<(Rect, TSTransform)>,
     /// Scroll the track list to the current track on the next frame.
     reveal_current: bool,
     mpris: Option<Mpris>,
@@ -444,7 +516,7 @@ pub struct App {
     selected: Vec<NodeId>,
     /// The zoom button was clicked: back to 100% on the next frame.
     reset_zoom: bool,
-    /// A background double-click fitted the graph; cap that fit at 100% next frame.
+    /// Fit the measured nodes on the next frame.
     fit_zoom: bool,
     /// Last rendered graph zoom, also recorded in diagnostic screenshots.
     zoom: f32,
@@ -453,7 +525,6 @@ pub struct App {
     /// Track restored from the session, until the player reports it as loaded.
     restored_track: Option<PathBuf>,
     /// The graph view exists (its first frame fits the nodes into view).
-    graph_shown: bool,
     /// An EQ point was under the pointer last frame; the mouse wheel goes to it instead of
     /// panning the graph.
     capture_scroll: bool,
@@ -511,8 +582,7 @@ impl App {
             lyrics: LyricsPanel::new(LyricsSettings::default(), session::load_lyrics()),
             video: VideoPanel::new(VideoSettings::default()),
             open_tabs: Vec::new(),
-            // Editors that support scaling follow the zoom; others stay at their own size.
-            style: SnarlStyle { collapsible: Some(true), max_scale: Some(2.0), ..SnarlStyle::new() },
+            style: graph_style(),
             ids: IdAlloc::default(),
             dirty: true,
             host: plugins::Host::default(),
@@ -522,19 +592,20 @@ impl App {
             scan_progress: String::new(),
             pending_teardown: HashMap::new(),
             restarting: HashSet::new(),
+            #[cfg(target_os = "linux")]
             yabridge: Yabridge::default(),
             messages,
             logs: Default::default(),
             statistics,
             seek_drag: None,
             rate: 1.0,
-            added: 0,
             host_xid: None,
             debug_done: false,
             library: Library::default(),
             dock: default_dock(false),
             placements: HashMap::new(),
             node_rects: Vec::new(),
+            graph_view: None,
             reveal_current: false,
             // On Windows it needs the window, so it's made with the first frame.
             mpris: if cfg!(windows) || !crate::runtime::get().allow_network() {
@@ -564,7 +635,6 @@ impl App {
             zoom: 1.0,
             confirm: None,
             restored_track: None,
-            graph_shown: false,
             capture_scroll: false,
             extensions: Extensions::default(),
             about: Default::default(),
@@ -653,10 +723,6 @@ impl App {
                     if !saved.tabs_seen.contains(&tab) && d.find_tab(&tab).is_none() {
                         add_new_tab(&mut d, tab);
                     }
-                }
-                // Adding a tab brings it to the front; keep the library there.
-                if let Some(path) = d.find_tab(&Tab::Library) {
-                    let _ = d.set_active_tab(path);
                 }
                 d
             }
@@ -806,6 +872,7 @@ impl App {
     }
 
     fn default_graph(&mut self) {
+        self.fit_zoom = true;
         let p = self.add_node(NodeKind::Player, pos2(0.0, 0.0));
         let o = self.add_node(NodeKind::output(), pos2(260.0, 0.0));
         if let (Some(p), Some(o)) = (p, o) {
@@ -942,6 +1009,7 @@ impl App {
     fn load_graph(&mut self, g: &SavedGraph) {
         self.clear_graph();
         self.insert_graph(g, egui::Vec2::ZERO);
+        self.fit_zoom = true;
     }
 
     /// Saves the selected nodes, with the wires between them, as a node preset. Positions are
@@ -1324,7 +1392,7 @@ impl App {
 
     fn log(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
-        log::info!("{msg}");
+        log::info!(target: crate::logs::NOTICE_TARGET, "{msg}");
         self.messages.push(msg);
         if self.messages.len() > 200 {
             self.messages.remove(0);
@@ -1410,13 +1478,6 @@ impl App {
         match self.host.create(info, self.sample_rate, MAX_BLOCK) {
             Ok(created) => {
                 let i = &created.instance;
-                self.log(format!(
-                    "loaded {} {} ({} params, latency {} samples)",
-                    info.format.label(),
-                    info.name,
-                    i.params().len(),
-                    i.latency()
-                ));
                 let prepare = if crate::runtime::get().experimental_pdc {
                     PluginProc::with_latency
                 } else {
@@ -1434,8 +1495,15 @@ impl App {
                         return None;
                     }
                 };
+                let message = if i.remote_status().is_some_and(|status| status != "running") {
+                    format!("Starting {}…", plugin_title(info))
+                } else {
+                    plugin_status("Loaded", i.as_ref())
+                };
                 let node = PluginNode::new(created.instance);
-                self.insert(NodeKind::Plugin(Box::new(node)), Box::new(proc), pos)
+                let id = self.insert(NodeKind::Plugin(Box::new(node)), Box::new(proc), pos)?;
+                self.log(message);
+                Some(id)
             }
             Err(e) => {
                 self.log(format!("failed to load {}: {e:#}", info.name));
@@ -1680,10 +1748,11 @@ impl App {
                 let NodeKind::Plugin(plugin) = &self.snarl[id].kind else { return };
                 let ports = plugin.instance.audio_ports();
                 let midi = plugin.instance.midi_ports();
+                let message = plugin_status("Restarted", plugin.instance.as_ref());
                 update_plugin_ports(&mut self.snarl, id, ports, midi);
                 self.drop_stale_wires(id);
                 self.dirty = true;
-                self.log(format!("restarted {name}"));
+                self.log(message);
             }
             Err(e) => self.log(format!("{name} failed to restart: {e:#}")),
         }
@@ -1748,7 +1817,7 @@ impl App {
         match plugins::scan_isolated(format, path) {
             Ok(found) if !found.is_empty() => {
                 plugins::add_extra_file(path);
-                self.log(format!("added {} {} plugin(s) from {}", found.len(), format.label(), path.display()));
+                self.log(format!("Added {} from {}", counted(found.len(), &format!("{} plugin", format.label())), path.display()));
                 self.plugins.retain(|p| p.path != path);
                 self.plugins.extend(found);
                 self.plugins.sort_by_key(|p| p.name.to_lowercase());
@@ -1822,7 +1891,7 @@ impl App {
         if self.library.poll(loaded.as_deref()) {
             self.reveal_current = true;
             self.library_changed = true;
-            self.log(format!("{} tracks in {} source(s)", self.library.tracks.len(), self.library.sources.len()));
+            self.log(format!("{} in {}", counted(self.library.tracks.len(), "track"), counted(self.library.sources.len(), "source")));
         }
         if self.player.take_ended() {
             self.track_ended = true;
@@ -1859,12 +1928,13 @@ impl App {
                         self.scan_rx = None;
                         self.plugins.sort_by_key(|p| p.name.to_lowercase());
                         plugins::save_cache(&self.plugins);
-                        self.log(format!("scan finished: {} plugins", self.plugins.len()));
+                        self.log(format!("Scan finished · {}", counted(self.plugins.len(), "plugin")));
                     }
                 }
             }
         }
 
+        #[cfg(target_os = "linux")]
         if let Some(r) = self.yabridge.poll() {
             let ok = r.ok;
             self.log(format!("{} {}", r.what, if ok { "ok" } else { "failed" }));
@@ -1873,15 +1943,18 @@ impl App {
             }
         }
 
-        let mut closed = Vec::new();
         let mut restart = Vec::new();
         let mut ports_changed = Vec::new();
+        let mut loaded = Vec::new();
         for node in every_node(&mut self.snarl, &mut self.outer) {
             match &mut node.kind {
                 NodeKind::Plugin(p) => {
                     let _g = guard::enter(&p.tag);
                     p.instance.idle();
                     let metadata_ready = p.instance.remote_status().is_none_or(|status| status == "running");
+                    if metadata_ready && std::mem::take(&mut p.load_pending) {
+                        loaded.push(plugin_status("Loaded", p.instance.as_ref()));
+                    }
                     let ports = if metadata_ready { p.instance.audio_ports() } else { p.audio_ports.clone() };
                     let midi = if metadata_ready { p.instance.midi_ports() } else { p.midi_ports };
                     let first_metadata = metadata_ready && !p.ports_known;
@@ -1923,7 +1996,6 @@ impl App {
                     if let Some(ed) = &mut p.editor
                         && !ed.idle()
                     {
-                        closed.push(p.info().name.clone());
                         p.editor = None;
                     }
                 }
@@ -1947,6 +2019,9 @@ impl App {
                 app.drop_stale_wires(id);
             });
         }
+        for message in loaded {
+            self.log(message);
+        }
     }
 
     fn transport(&mut self, ui: &mut egui::Ui) {
@@ -1954,7 +2029,8 @@ impl App {
         let playing = self.player.is_playing();
         let pos = self.player.position();
         let dur = status.duration.unwrap_or(0.0);
-        ui.horizontal(|ui| {
+        let compact = ui.available_width() < 760.0;
+        ui.horizontal_wrapped(|ui| {
             if ui.button("📂 Open").clicked() {
                 let media: Vec<&str> = AUDIO_EXTS.iter().chain(crate::av::VIDEO_EXTS).chain(MIDI_EXTS).copied().collect();
                 if let Some(p) = rfd::FileDialog::new()
@@ -1968,21 +2044,22 @@ impl App {
                 }
             }
             let has_tracks = !self.library.tracks.is_empty();
-            if ui.add_enabled(has_tracks, egui::Button::new("⏮")).on_hover_text("previous (or restart)").clicked() {
+            if transport_button(ui, has_tracks, "⏮", "Previous (or restart)").clicked() {
                 self.previous_track();
             }
             let label = if playing { "⏸" } else { "▶" };
-            if ui.add_enabled(status.path.is_some() || has_tracks, egui::Button::new(label)).clicked() {
+            let action = if playing { "Pause" } else { "Play" };
+            if transport_button(ui, status.path.is_some() || has_tracks, label, action).clicked() {
                 if playing {
                     self.player.set_playing(false);
                 } else {
                     self.play();
                 }
             }
-            if ui.button("⏹").clicked() {
+            if transport_button(ui, status.path.is_some(), "⏹", "Stop").clicked() {
                 self.stop();
             }
-            if ui.add_enabled(has_tracks, egui::Button::new("⏭")).on_hover_text("next").clicked() {
+            if transport_button(ui, has_tracks, "⏭", "Next").clicked() {
                 self.next_track();
             }
             if ui
@@ -1992,7 +2069,10 @@ impl App {
             {
                 self.library.repeat = self.library.repeat.next();
             }
-            if ui.selectable_label(self.loop_editor.open, "〰").on_hover_text("loop editor: select a stretch of the track to play over and over").clicked() {
+            let open = self.loop_editor.open;
+            let loop_editor = ui.selectable_label(open, "〰").on_hover_text("Loop Editor");
+            loop_editor.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, open, "Loop Editor"));
+            if loop_editor.clicked() {
                 self.loop_editor.open = !self.loop_editor.open;
             }
             ui.toggle_value(&mut self.library.shuffle, "🔀").on_hover_text("shuffle");
@@ -2017,43 +2097,51 @@ impl App {
             ui.label(format!("{} / {}", fmt_time(self.seek_drag.unwrap_or(pos)), fmt_time(dur)));
             self.rate_control(ui);
 
-            let mut t = self.seek_drag.unwrap_or(pos).min(dur);
-            ui.spacing_mut().slider_width = (ui.available_width() - 220.0).max(100.0);
-            let r = ui.add_enabled(dur > 0.0, egui::Slider::new(&mut t, 0.0..=dur.max(0.001)).show_value(false));
-            if r.dragged() {
-                self.seek_drag = Some(t);
-            }
-            if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                self.player.seek(t);
-                self.seek_drag = None;
-            }
-            // The selection, under the slider.
-            if let Some(s) = self.selection.as_ref().filter(|s| Some(&s.path) == status.path.as_ref() && dur > 0.0) {
-                let rail = r.rect.shrink2(egui::vec2(ui.spacing().interact_size.y / 2.0, 0.0));
-                let x = |t: f64| rail.left() + (t / dur).clamp(0.0, 1.0) as f32 * rail.width();
-                let looping = self.library.repeat == library::Repeat::Selection;
-                let color = if looping { Color32::from_rgb(110, 170, 255) } else { Color32::from_gray(120) };
-                let band = egui::Rect::from_x_y_ranges(x(s.start)..=x(s.end).max(x(s.start) + 2.0), rail.bottom() - 3.0..=rail.bottom() - 1.0);
-                ui.painter().rect_filled(band, 1.0, color);
-            }
-
-            if let Some(p) = &status.path {
-                let title = status.title().unwrap_or_default();
-                let text = match &status.tags.artist {
-                    Some(a) => format!("{a} — {title}"),
-                    None => title,
-                };
-                let album = status.tags.album.as_deref().map(|a| format!("{a}\n")).unwrap_or_default();
-                ui.label(text).on_hover_text(format!(
-                    "{album}{}\n{} Hz, {} ch",
-                    p.display(),
-                    status.source_rate,
-                    status.channels
-                ));
+            if !compact {
+                ui.horizontal(|ui| self.seek_bar(ui, &status, pos, dur));
             }
         });
+        if compact {
+            ui.horizontal(|ui| self.seek_bar(ui, &status, pos, dur));
+        }
         if let Some(e) = &status.error {
             ui.colored_label(Color32::LIGHT_RED, e);
+        }
+    }
+
+    fn seek_bar(&mut self, ui: &mut egui::Ui, status: &crate::player::Status, pos: f64, dur: f64) {
+        let mut t = self.seek_drag.unwrap_or(pos).min(dur);
+        let width = ui.available_width();
+        let title_width = if status.path.is_some() { (width * 0.40).min(300.0) + ui.spacing().item_spacing.x } else { 0.0 };
+        ui.spacing_mut().slider_width = (width - title_width).max(1.0);
+        let r = ui.add_enabled(dur > 0.0, egui::Slider::new(&mut t, 0.0..=dur.max(0.001)).show_value(false));
+        r.ctx.accesskit_node_builder(r.id, |node| node.set_label("Playback position"));
+        if r.dragged() {
+            self.seek_drag = Some(t);
+        }
+        if r.drag_stopped() || (r.changed() && !r.dragged()) {
+            self.player.seek(t);
+            self.seek_drag = None;
+        }
+        // The selection, under the slider.
+        if let Some(s) = self.selection.as_ref().filter(|s| Some(&s.path) == status.path.as_ref() && dur > 0.0) {
+            let rail = r.rect.shrink2(egui::vec2(ui.spacing().interact_size.y / 2.0, 0.0));
+            let x = |t: f64| rail.left() + (t / dur).clamp(0.0, 1.0) as f32 * rail.width();
+            let looping = self.library.repeat == library::Repeat::Selection;
+            let color = if looping { Color32::from_rgb(110, 170, 255) } else { Color32::from_gray(120) };
+            let band = Rect::from_x_y_ranges(x(s.start)..=x(s.end).max(x(s.start) + 2.0), rail.bottom() - 3.0..=rail.bottom() - 1.0);
+            ui.painter().rect_filled(band, 1.0, color);
+        }
+        if let Some(p) = &status.path {
+            let title = status.title().unwrap_or_default();
+            let text = match &status.tags.artist {
+                Some(a) => format!("{a} — {title}"),
+                None => title,
+            };
+            let album = status.tags.album.as_deref().map(|a| format!("{a}\n")).unwrap_or_default();
+            ui.add(egui::Label::new(&text).truncate()).on_hover_text(format!(
+                "{text}\n{album}{}\n{} Hz, {} ch", p.display(), status.source_rate, status.channels
+            ));
         }
     }
 
@@ -2091,53 +2179,80 @@ impl App {
         {
             self.library.restore_removed();
         }
-        ui.horizontal(|ui| {
-            let start = self.library.sources.last().map(|s| s.path().to_path_buf());
-            let start = start.map(|p| if p.is_dir() { p } else { p.parent().map(Path::to_path_buf).unwrap_or(p) });
-            if ui.button("📁 Add folder…").on_hover_text("list the audio and video files under a folder, with its subfolders").clicked() {
-                let mut dlg = rfd::FileDialog::new();
-                if let Some(d) = &start {
-                    dlg = dlg.set_directory(d);
-                }
-                for dir in dlg.pick_folders().unwrap_or_default() {
-                    self.library.add(library::Source::Folder(dir));
-                }
-            }
-            if ui.button("🎵 Add files…").on_hover_text("add single tracks").clicked() {
-                let media: Vec<&str> = AUDIO_EXTS.iter().chain(crate::av::VIDEO_EXTS).chain(MIDI_EXTS).copied().collect();
-                let mut dlg = rfd::FileDialog::new().add_filter("Audio, video and MIDI", &media);
-                if let Some(d) = &start {
-                    dlg = dlg.set_directory(d);
-                }
-                for f in dlg.pick_files().unwrap_or_default() {
-                    self.library.add(library::Source::File(f));
-                }
-            }
+        let compact = ui.available_width() < 220.0;
+        let picked = ui.horizontal_wrapped(|ui| {
+            let choose = |ui: &mut egui::Ui| {
+                let folders = ui.button("📁 Add folder…")
+                    .on_hover_text("Include files in this folder and its subfolders").clicked();
+                let files = ui.button("🎵 Add files…").clicked();
+                if folders { Some(true) } else if files { Some(false) } else { None }
+            };
+            let picked = if compact {
+                ui.menu_button("Add…", |ui| {
+                    let picked = choose(ui);
+                    if picked.is_some() {
+                        ui.close();
+                    }
+                    picked
+                }).inner.flatten()
+            } else {
+                choose(ui)
+            };
             let can_rescan = !self.library.sources.is_empty() && !self.library.scanning();
-            if ui.add_enabled(can_rescan, egui::Button::new("⟳")).on_hover_text("scan again").clicked() {
+            if transport_button(ui, can_rescan, "⟳", "Rescan the library").clicked() {
                 self.library.rescan();
+            }
+            if compact && !self.library.sources.is_empty() {
+                self.library_sources(ui, compact);
             }
             if self.library.scanning() {
                 ui.spinner();
             } else if self.library.reading_tags() {
                 ui.spinner().on_hover_text("reading tags");
             }
-        });
+            picked
+        }).inner;
+        if let Some(folders) = picked {
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(path) = self.library.sources.last().map(library::Source::path) {
+                if let Some(dir) = if path.is_dir() { Some(path) } else { path.parent() } {
+                    dialog = dialog.set_directory(dir);
+                }
+            }
+            if folders {
+                for dir in dialog.pick_folders().unwrap_or_default() {
+                    self.library.add(library::Source::Folder(dir));
+                }
+            } else {
+                let media: Vec<&str> = AUDIO_EXTS.iter().chain(crate::av::VIDEO_EXTS).chain(MIDI_EXTS).copied().collect();
+                for file in dialog.add_filter("Audio, video and MIDI", &media).pick_files().unwrap_or_default() {
+                    self.library.add(library::Source::File(file));
+                }
+            }
+        }
         if self.library.sources.is_empty() {
             ui.weak("Add a folder or files, or drop them onto the window.");
             return;
         }
+        if !compact {
+            self.library_sources(ui, compact);
+        }
+        filter_field(ui, &mut self.library.filter, "Filter tracks");
+        self.track_table(ui);
+    }
+
+    fn library_sources(&mut self, ui: &mut egui::Ui, compact: bool) {
         let (folders, files) = self.library.sources.iter().fold((0, 0), |(d, f), s| match s {
             library::Source::Folder(_) => (d + 1, f),
             library::Source::File(_) => (d, f + 1),
         });
         let summary = match (folders, files) {
-            (d, 0) => format!("{d} folder(s)"),
-            (0, f) => format!("{f} file(s)"),
-            (d, f) => format!("{d} folder(s), {f} file(s)"),
+            (d, 0) => counted(d, "folder"),
+            (0, f) => counted(f, "file"),
+            (d, f) => format!("{}, {}", counted(d, "folder"), counted(f, "file")),
         };
         let mut remove = None;
-        egui::CollapsingHeader::new(egui::RichText::new(summary).small()).id_salt("library sources").show(ui, |ui| {
+        let sources = |ui: &mut egui::Ui| {
             egui::ScrollArea::vertical().id_salt("sources").max_height(120.0).show(ui, |ui| {
                 for (i, src) in self.library.sources.iter().enumerate() {
                     ui.horizontal(|ui| {
@@ -2151,15 +2266,15 @@ impl App {
                     });
                 }
             });
-        });
+        };
+        if compact {
+            ui.menu_button("Sources", sources).response.on_hover_text(summary);
+        } else {
+            egui::CollapsingHeader::new(egui::RichText::new(summary).small()).id_salt("library sources").show(ui, sources);
+        }
         if let Some(i) = remove {
             self.library.remove(i);
         }
-        right_to_left_row(ui, |ui| {
-            ui.small(format!("{} tracks", self.library.tracks.len()));
-            ui.add(egui::TextEdit::singleline(&mut self.library.filter).hint_text("filter").desired_width(f32::INFINITY));
-        });
-        self.track_table(ui);
     }
 
     /// The tracks as a table: number, title, artist, album, length, release date, when the
@@ -2188,11 +2303,13 @@ impl App {
                 .any(|s| s.to_lowercase().contains(&filter))
         };
         let mut rows = Vec::new();
+        let mut matching_tracks = 0;
         let mut last_dir: Option<&str> = None;
         for (i, t) in lib.tracks.iter().enumerate() {
             if !matches(t) {
                 continue;
             }
+            matching_tracks += 1;
             if grouped && last_dir != Some(t.dir.as_str()) {
                 last_dir = Some(&t.dir);
                 if !t.dir.is_empty() {
@@ -2201,6 +2318,8 @@ impl App {
             }
             rows.push(Row::Track(i));
         }
+        let total = counted(lib.tracks.len(), "track");
+        ui.weak(if filter.is_empty() { total } else { format!("{matching_tracks} of {total}") });
 
         let cols: Vec<(usize, Column)> = Column::ALL.into_iter().enumerate().filter(|(k, _)| lib.columns.shown[*k]).collect();
         let pad = 4.0;
@@ -2215,6 +2334,9 @@ impl App {
         }
 
         let current = lib.current;
+        let player_path = self.player.status().path;
+        let playing = self.player.is_playing();
+        let paused = self.player.is_paused();
         let mut play = None;
         let mut remove_track = None;
         let mut new_sort = None;
@@ -2225,6 +2347,7 @@ impl App {
             ui.set_min_width(table_w);
             // Headings.
             let (head, mut head_resp) = ui.allocate_exact_size(egui::vec2(table_w, row_h), egui::Sense::click());
+            head_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Library columns"));
             let painter = ui.painter_at(head);
             painter.rect_filled(head, 0.0, ui.visuals().faint_bg_color);
             let mut x = head.left();
@@ -2232,6 +2355,7 @@ impl App {
                 let w = widths[*k];
                 let cell = egui::Rect::from_min_size(pos2(x, head.top()), egui::vec2(w, row_h));
                 let r = ui.interact(cell.shrink2(egui::vec2(3.0, 0.0)), ui.id().with(("col", *k)), egui::Sense::click());
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, r.enabled(), format!("Sort by {}", col.label())));
                 let arrow = match lib.sort {
                     Some((c, false)) if c == *col => " ⏶",
                     Some((c, true)) if c == *col => " ⏷",
@@ -2305,7 +2429,17 @@ impl App {
                         Row::Track(i) => {
                             let t = &lib.tracks[i];
                             let is_cur = Some(i) == current;
+                            let title = t.title();
+                            let playback = if is_cur && player_path.as_ref() == Some(&t.path) {
+                                if playing { "Playing" } else if paused { "Paused" } else { "" }
+                            } else { "" };
                             let (rect, resp) = ui.allocate_exact_size(egui::vec2(table_w, row_h), egui::Sense::click());
+                            resp.widget_info(|| {
+                                let artist = t.meta.as_ref().and_then(|meta| meta.artist.as_deref()).unwrap_or("");
+                                let label = [title.as_str(), artist, playback].into_iter()
+                                    .filter(|part| !part.is_empty()).collect::<Vec<_>>().join(", ");
+                                egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, resp.enabled(), is_cur, label)
+                            });
                             let visuals = ui.style().interact_selectable(&resp, is_cur);
                             if is_cur || resp.hovered() {
                                 ui.painter().rect_filled(rect, 2.0, visuals.weak_bg_fill);
@@ -2318,9 +2452,10 @@ impl App {
                                 let cell = egui::Rect::from_min_size(pos2(x, rect.top()), egui::vec2(widths[*k], row_h));
                                 x += widths[*k];
                                 let text = match col {
+                                    Column::Track if playback == "Playing" => "▶".into(),
+                                    Column::Track if playback == "Paused" => "⏸".into(),
                                     Column::Track => m.and_then(|m| m.track).map(|n| n.to_string()).unwrap_or_default(),
-                                    Column::Title if is_cur => format!("▶ {}", t.title()),
-                                    Column::Title => t.title(),
+                                    Column::Title => title.clone(),
                                     Column::Artist => m.and_then(|m| m.artist.clone()).unwrap_or_default(),
                                     Column::Album => m.and_then(|m| m.album.clone()).unwrap_or_default(),
                                     Column::Length => m.and_then(|m| m.duration).map(fmt_time).unwrap_or_default(),
@@ -2416,6 +2551,15 @@ impl App {
         }
         // Each level keeps its own pan, zoom and selection.
         let salt = egui::Id::new("graph").with(self.group_path());
+        let mut view = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+        let footer_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+        view.max.y = (view.max.y - footer_height).max(view.min.y);
+        let measure = salt.with("measured bounds");
+        let previous: Option<GraphMeasurement> = ui.ctx().data(|data| data.get_temp(measure));
+        let fit = std::mem::take(&mut self.fit_zoom);
+        let fit_bounds = previous
+            .filter(|old| fit && old.nodes == self.snarl.nodes().count())
+            .map(|old| old.bounds);
         // The graph pans on the wheel before node bodies see it, so take it out first.
         let capture_scroll = self.capture_scroll || self.snarl.nodes().any(|node| {
             matches!(&node.kind, NodeKind::Plugin(plugin)
@@ -2443,10 +2587,11 @@ impl App {
             scroll,
             wants_scroll: false,
             selected: self.selected.len(),
-            view: ui.max_rect(),
+            view,
+            transform: TSTransform::IDENTITY,
             zoom: 1.0,
             reset_zoom: std::mem::take(&mut self.reset_zoom),
-            fit_zoom: std::mem::take(&mut self.fit_zoom),
+            fit_bounds,
             diagnostic_zoom: self.diagnostic.as_ref().and_then(|d| d.editor_zoom),
             diagnostic_target: self.diagnostic.as_ref().and_then(|d| d.node),
             node_presets: &self.node_presets,
@@ -2458,7 +2603,7 @@ impl App {
         ui.style_mut().interaction.selectable_labels = false;
         // The first frame fits the graph into view; don't let that zoom in past 1:1.
         let mut style = self.style;
-        if !std::mem::replace(&mut self.graph_shown, true) {
+        if previous.is_none() {
             style.max_scale = Some(1.0);
         }
         if capture_scroll {
@@ -2467,31 +2612,88 @@ impl App {
             style.min_scale = Some(self.zoom);
             style.max_scale = Some(self.zoom);
         }
-        let response = SnarlWidget::new().id_salt(salt).style(style).show(&mut self.snarl, &mut viewer, ui);
-        self.fit_zoom = response.double_clicked();
+        let response = SnarlWidget::new()
+            .id_salt(salt)
+            .style(style)
+            .max_size(view.size())
+            .show(&mut self.snarl, &mut viewer, ui);
+        let bounds = viewer.node_rects.iter().fold(Rect::NOTHING, |bounds, (_, rect)| bounds.union(*rect));
+        let scene_bounds = viewer.transform.inverse() * bounds;
+        let pointer_in_graph = ui.input(|input| {
+            input.pointer.any_down() && input.pointer.latest_pos().is_some_and(|pos| view.contains(pos))
+        });
+        // A worker can report more buses or deliver its first editor image after the
+        // first fit. Keep following layout growth until the user takes over the view.
+        let follow_layout = (fit || previous.is_none_or(|old| old.follow_layout))
+            && !(viewer.reset_zoom || response.changed() || pointer_in_graph);
+        ui.ctx().data_mut(|data| data.insert_temp(measure, GraphMeasurement {
+            view,
+            bounds: scene_bounds,
+            nodes: viewer.node_rects.len(),
+            follow_layout,
+        }));
+        self.graph_view = Some((view, viewer.transform));
+        let resized = previous.is_some_and(|old| old.view != view);
+        let resized_out_of_view = resized && !viewer.node_rects.iter().any(|(_, rect)| view.intersects(*rect));
+        let grew = previous.is_some_and(|old| {
+            old.bounds.is_finite() && (scene_bounds.size() - old.bounds.size()).max_elem() > 2.0
+        });
+        let layout_clipped = follow_layout && (resized || grew) && !view.shrink(12.0).contains_rect(bounds);
+        self.fit_zoom = bounds.is_finite()
+            && (previous.is_none() || (fit && fit_bounds.is_none()) || resized_out_of_view
+                || layout_clipped || response.double_clicked());
         self.selected = SnarlWidget::new().id_salt(salt).get_selected_nodes(ui);
-        // Zoom readout; clicking it goes back to 100% (where text is sharp).
         let zoom = viewer.zoom;
         self.zoom = zoom;
-        let corner = ui.max_rect().right_bottom() - egui::vec2(8.0, 8.0);
-        egui::Area::new(egui::Id::new("graph zoom"))
-            .order(egui::Order::Foreground)
-            .pivot(egui::Align2::RIGHT_BOTTOM)
-            .fixed_pos(corner)
-            .show(ui.ctx(), |ui| {
-                let text = format!("{:.0}%", zoom * 100.0);
-                let b = ui.add_enabled(zoom != 1.0, egui::Button::new(egui::RichText::new(text).small()).wrap_mode(egui::TextWrapMode::Extend));
-                if b.on_hover_text("zoom (Ctrl+wheel); click for 100%, where text is sharpest").clicked() {
-                    self.reset_zoom = true;
-                    ui.ctx().request_repaint();
-                }
-            });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let text = format!("{:.0}%", zoom * 100.0);
+            if ui.add_enabled(zoom != 1.0, egui::Button::new(text).small())
+                .on_hover_text("Reset to 100% (Ctrl+wheel to zoom)").clicked()
+            {
+                self.reset_zoom = true;
+                ui.ctx().request_repaint();
+            }
+            if ui.add_enabled(bounds.is_finite(), egui::Button::new("Fit").small())
+                .on_hover_text("Fit all nodes in view (double-click the canvas)").clicked()
+            {
+                self.fit_zoom = true;
+            }
+        });
+        if self.fit_zoom {
+            ui.ctx().request_repaint();
+        }
         self.placements = std::mem::take(&mut viewer.placements);
         self.node_rects = std::mem::take(&mut viewer.node_rects);
         self.capture_scroll = viewer.wants_scroll;
         let errors = std::mem::take(&mut viewer.errors);
         for e in errors {
             self.log(e);
+        }
+    }
+
+    fn add_plugin_from_list(&mut self, info: &PluginInfo) {
+        let (pos, fit) = match self.graph_view {
+            Some((view, transform)) => {
+                let to_scene = transform.inverse();
+                let occupied: Vec<_> = self.node_rects.iter().map(|(_, rect)| to_scene * *rect).collect();
+                let canvas = to_scene * view.shrink(20.0);
+                // Leave room for controls and for buses reported after worker startup.
+                match free_graph_position(canvas, &occupied, vec2(390.0, 230.0)) {
+                    Some(pos) => (pos, false),
+                    None => {
+                        let bounds = occupied.into_iter().fold(Rect::NOTHING, Rect::union);
+                        (if bounds.is_finite() { bounds.left_bottom() + vec2(0.0, 22.0) } else { canvas.min }, true)
+                    }
+                }
+            }
+            None => {
+                let y = self.snarl.nodes_info().map(|node| node.pos.y).fold(0.0, f32::max);
+                (pos2(0.0, y + 250.0), true)
+            }
+        };
+        if self.add_plugin(info, pos).is_some() && fit {
+            self.show_tab(Tab::Graph);
+            self.fit_zoom = true;
         }
     }
 
@@ -2533,7 +2735,7 @@ impl App {
         let mut done = None;
         let modal = egui::Modal::new(egui::Id::new("node preset name")).show(ctx, |ui| {
             ui.set_width(300.0);
-            ui.strong(format!("Save {} node(s) as a node preset", nodes.len()));
+            ui.strong(format!("Save {} as a node preset", counted(nodes.len(), "node")));
             let name = self.node_preset_name.trim().to_string();
             let edit = ui.add(egui::TextEdit::singleline(&mut self.node_preset_name).hint_text("name").desired_width(f32::INFINITY));
             if !edit.has_focus() && name.is_empty() {
@@ -2693,7 +2895,7 @@ impl App {
     }
 
     fn plugin_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let scanning = self.scan_rx.is_some();
             if ui.add_enabled(!scanning, egui::Button::new("Scan plugins")).on_hover_text("VST3, CLAP, JSFX and native plugins").clicked() {
                 self.start_scan();
@@ -2741,9 +2943,10 @@ impl App {
                 }
             });
         }
-        ui.add(egui::TextEdit::singleline(&mut self.plugin_filter).hint_text("filter"));
+        filter_field(ui, &mut self.plugin_filter, "Filter plugins");
         let filter = self.plugin_filter.to_lowercase();
-        egui::ScrollArea::vertical().id_salt("plugins").max_height(ui.available_height() * 0.55).show(ui, |ui| {
+        let list_height = if cfg!(target_os = "linux") { ui.available_height() * 0.55 } else { ui.available_height() };
+        egui::ScrollArea::vertical().id_salt("plugins").max_height(list_height).show(ui, |ui| {
             for info in &self.plugins {
                 if !filter.is_empty()
                     && !info.name.to_lowercase().contains(&filter)
@@ -2752,16 +2955,23 @@ impl App {
                     continue;
                 }
                 ui.horizontal(|ui| {
-                    if ui.small_button("+").on_hover_text("add to graph").clicked() {
-                        let k = self.added as f32;
-                        actions.push(Action::AddPlugin(info.clone(), pos2(200.0 + 25.0 * k, 260.0 + 25.0 * k)));
-                        self.added = (self.added + 1) % 10;
+                    let disabled = self.host.is_disabled(info.format, &info.path);
+                    let add = ui.add_enabled(!disabled, egui::Button::new("+").small());
+                    let label = format!("Add {} to the graph", plugin_title(info));
+                    add.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !disabled, &label));
+                    if add.on_hover_text(label)
+                        .on_disabled_hover_text("Enable the plugin before adding it").clicked()
+                    {
+                        actions.push(Action::AddPluginFromList(info.clone()));
                     }
-                    let mut text = egui::RichText::new(&info.name);
-                    if info.is_instrument() {
-                        text = text.weak();
+                    ui.small(info.format.label());
+                    if info.is_bridged() {
+                        ui.small("win");
                     }
-                    ui.label(text).on_hover_text(format!(
+                    if disabled {
+                        ui.colored_label(Color32::from_rgb(240, 170, 80), "⚠").on_hover_text("disabled after a crash");
+                    }
+                    ui.add(egui::Label::new(&info.name).truncate()).on_hover_text(format!(
                         "{} · {}\n{}\n{}{}",
                         info.format.label(),
                         info.vendor,
@@ -2769,19 +2979,16 @@ impl App {
                         info.path.display(),
                         if info.is_bridged() { "\n(Windows plugin via yabridge)" } else { "" }
                     ));
-                    if info.format != Format::Vst3 {
-                        ui.small(info.format.label());
-                    }
-                    if info.is_bridged() {
-                        ui.small("win");
-                    }
-                    if self.host.is_disabled(info.format, &info.path) {
-                        ui.colored_label(Color32::from_rgb(240, 170, 80), "⚠").on_hover_text("disabled after a crash");
-                    }
                 });
             }
         });
 
+        #[cfg(target_os = "linux")]
+        self.yabridge_panel(ui);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn yabridge_panel(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.heading("Windows plugins (yabridge)");
         if !self.yabridge.available() {
@@ -2846,7 +3053,7 @@ impl App {
         }
     }
 
-    fn param_windows(&mut self, ctx: &egui::Context) {
+    fn param_windows(&mut self, ctx: &egui::Context, workspace: Rect) {
         for node in every_node(&mut self.snarl, &mut self.outer) {
             let eid = node.eid;
             let NodeKind::Plugin(p) = &mut node.kind else { continue };
@@ -2855,12 +3062,14 @@ impl App {
             }
             let PluginNode { instance, show_params, param_filter, tag, .. } = &mut **p;
             let _g = guard::enter(tag);
-            egui::Window::new(format!("{} — parameters", instance.info().name))
+            let size = vec2(420.0, 480.0).min(workspace.size() * 0.9);
+            egui::Window::new(format!("{} — Parameters", plugin_title(instance.info())))
                 .id(egui::Id::new(("params", eid)))
                 .open(show_params)
-                .default_size([420.0, 480.0])
+                .constrain_to(workspace)
+                .default_rect(Rect::from_center_size(workspace.center(), size))
                 .show(ctx, |ui| {
-                    ui.add(egui::TextEdit::singleline(param_filter).hint_text("filter"));
+                    filter_field(ui, param_filter, "Filter parameters");
                     let f = param_filter.to_lowercase();
                     let params = instance.params().to_vec();
                     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2904,6 +3113,11 @@ impl Drop for App {
 }
 
 impl eframe::App for App {
+    fn persist_egui_memory(&self) -> bool {
+        // The session owns the application layout. eframe only saves the main window.
+        false
+    }
+
     fn on_exit(&mut self) {
         self.shutdown();
     }
@@ -3024,52 +3238,66 @@ impl eframe::App for App {
             });
         }
         egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                match &self.engine {
-                    Some(e) => ui.small(format!("{} · {} Hz · {} ch", e.device_name, e.sample_rate, e.channels)),
-                    None => ui.colored_label(Color32::LIGHT_RED, "no audio device"),
-                };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("About").clicked() {
+                    self.about.open = !self.about.open;
+                }
+                if self.updater.has_update() && ui.small_button("Update available").clicked() {
+                    self.about.open = true;
+                }
                 if self.ffmpeg.1.elapsed() > Duration::from_secs(2) {
                     self.ffmpeg = (crate::av::available(), Instant::now());
                 }
-                if !self.ffmpeg.0 && !self.setup.busy() {
-                    ui.separator();
-                    let b = ui.small_button("FFmpeg isn't installed: get it…");
-                    if b.on_hover_text("needed for video, some audio formats and library tags").clicked() {
-                        self.setup.ask_ffmpeg();
-                    }
+                if !self.ffmpeg.0 && !self.setup.busy()
+                    && ui.small_button("Get FFmpeg…")
+                        .on_hover_text("Required for video, some audio formats, and library tags").clicked()
+                {
+                    self.setup.ask_ffmpeg();
                 }
-                if let Some(m) = self.messages.last() {
-                    ui.separator();
-                    ui.small(m).on_hover_text(self.messages.join("\n"));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("About").clicked() {
-                        self.about.open = !self.about.open;
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    match &self.engine {
+                        Some(e) => {
+                            let device = format!("{} · {} Hz · {} ch", e.device_name, e.sample_rate, e.channels);
+                            let width = if self.messages.is_empty() { ui.available_width() } else { ui.available_width() * 0.5 };
+                            ui.scope(|ui| {
+                                ui.set_max_width(width);
+                                ui.add(egui::Label::new(egui::RichText::new(&device).small()).truncate())
+                                    .on_hover_text(device);
+                            });
+                        }
+                        None => { ui.colored_label(Color32::LIGHT_RED, "No audio device"); }
                     }
-                    if self.updater.has_update() && ui.small_button("Update available").clicked() {
-                        self.about.open = true;
+                    if let Some(message) = self.messages.last() {
+                        ui.separator();
+                        let response = ui.add(egui::Label::new(egui::RichText::new(message).small()).truncate());
+                        if response.hovered() {
+                            response.on_hover_text(self.messages.join("\n"));
+                        }
                     }
                 });
             });
         });
-        self.param_windows(&ctx);
-        self.about.show(&ctx, &mut self.updater);
-        self.loop_editor.show(&ctx, &self.player, &mut self.selection, &mut self.library.repeat, &mut self.loops);
-
+        let workspace = ui.available_rect_before_wrap();
         let mut dock = std::mem::replace(&mut self.dock, egui_dock::DockState::new(Vec::new()));
         let closed: Vec<Tab> = Tab::ALL
             .into_iter()
             .filter(|t| dock.find_tab(t).is_none())
             .filter(|t| *t != Tab::Extensions || !self.extensions.panels().is_empty())
             .collect();
+        let open = dock.iter_leaves().map(|(path, leaf)| {
+            (path, (leaf.tabs.clone(), leaf.tabs.get(leaf.active.0).copied()))
+        }).collect();
         self.placements.clear();
         self.node_rects.clear();
-        let mut tabs = Tabs { app: self, actions: &mut actions, closed, reopen: None };
+        self.graph_view = None;
+        let mut tabs = Tabs { app: self, actions: &mut actions, closed, open, chosen: None, buttons: HashMap::new() };
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            let mut style = egui_dock::Style::from_egui(ui.style());
+            style.tab_bar.show_scroll_bar_on_overflow = true;
             egui_dock::DockArea::new(&mut dock)
                 .id(egui::Id::new("dock"))
-                .style(egui_dock::Style::from_egui(ui.style()))
+                .style(style)
+                .show_tab_name_on_hover(true)
                 // Right-click a tab to close it; buttons on every tab would leave no room.
                 .show_close_buttons(false)
                 .show_add_buttons(true)
@@ -3078,11 +3306,21 @@ impl eframe::App for App {
                 .show_leaf_collapse_buttons(false)
                 .show_inside(ui, &mut tabs);
         });
-        if let Some((path, tab)) = tabs.reopen.take() {
-            dock.set_focused_node_and_surface(path);
-            dock.push_to_focused_leaf(tab);
+        update_dock_tabs(&mut dock, &tabs.buttons);
+        if let Some((path, tab)) = tabs.chosen.take() {
+            if let Some(tab_path) = dock.find_tab(&tab) {
+                if dock.set_active_tab(tab_path).is_ok() {
+                    dock.set_focused_node_and_surface(tab_path.node_path());
+                }
+            } else {
+                dock.set_focused_node_and_surface(path);
+                dock.push_to_focused_leaf(tab);
+            }
         }
         self.dock = dock;
+        self.param_windows(&ctx, workspace);
+        self.about.show(&ctx, workspace, &mut self.updater);
+        self.loop_editor.show(&ctx, workspace, &self.player, &mut self.selection, &mut self.library.repeat, &mut self.loops);
         // Move embedded editors over the space their nodes reserved this frame (none when the
         // graph tab is behind another), less what egui draws over them: native views sit
         // above everything the app draws, so they are cut out where they should be covered.
@@ -3119,16 +3357,16 @@ impl eframe::App for App {
                 }
                 Action::OpenGroup(id) => {
                     self.enter_group(id);
-                    self.graph_shown = false;
                 }
                 Action::Leave(depth) => {
                     while self.outer.len() > depth && self.leave_group() {}
-                    self.graph_shown = false;
                 }
                 Action::LoadIntoGroup(id, name) => self.load_into_group(id, &name),
                 Action::AddPlugin(info, pos) => {
                     self.add_plugin(&info, pos);
                 }
+                Action::AddPluginFromList(info) => self.add_plugin_from_list(&info),
+                Action::FitGraph => self.fit_zoom = true,
                 Action::AddWired(choice, pos, wires) => {
                     if wires.requirements(&self.snarl).is_some() {
                         if let Some(node) = choice.create(self, pos) {
@@ -3343,10 +3581,11 @@ struct Viewer<'a> {
     /// How many nodes are selected.
     selected: usize,
     /// The graph's screen area, zoom shown this frame, and explicit view reset requests.
-    view: egui::Rect,
+    view: Rect,
+    transform: TSTransform,
     zoom: f32,
     reset_zoom: bool,
-    fit_zoom: bool,
+    fit_bounds: Option<Rect>,
     diagnostic_zoom: Option<f32>,
     diagnostic_target: Option<NodeId>,
     node_presets: &'a [String],
@@ -3367,24 +3606,107 @@ impl Viewer<'_> {
 
 const PIN_COLOR: Color32 = Color32::from_rgb(110, 180, 255);
 const MIDI_COLOR: Color32 = Color32::from_rgb(255, 170, 60);
+const MIN_GRAPH_SCALE: f32 = 0.2;
+
+fn graph_style() -> SnarlStyle {
+    SnarlStyle {
+        pin_placement: Some(PinPlacement::Edge),
+        centering: Some(false),
+        min_scale: Some(MIN_GRAPH_SCALE),
+        ..SnarlStyle::new()
+    }
+}
+
+/// Find a free row from the viewport top and the bottom edges of the visible nodes.
+fn free_graph_position(canvas: Rect, occupied: &[Rect], size: egui::Vec2) -> Option<Pos2> {
+    let mut occupied: Vec<_> = occupied.iter().map(|rect| rect.expand(18.0))
+        .filter(|rect| canvas.intersects(*rect)).collect();
+    occupied.sort_by(|a, b| a.left().total_cmp(&b.left()));
+    let mut rows: Vec<_> = occupied.iter().map(|rect| rect.bottom().max(canvas.top())).collect();
+    rows.push(canvas.top());
+    rows.sort_by(f32::total_cmp);
+    rows.dedup();
+    for y in rows.into_iter().take_while(|y| y + size.y <= canvas.bottom()) {
+        let mut x = canvas.left();
+        for rect in occupied.iter().filter(|rect| rect.top() < y + size.y && rect.bottom() > y) {
+            if x + size.x <= rect.left() {
+                break;
+            }
+            x = x.max(rect.right());
+        }
+        if x + size.x <= canvas.right() {
+            return Some(pos2(x, y));
+        }
+    }
+    None
+}
+
+fn fit_graph(view: Rect, bounds: Rect) -> Option<TSTransform> {
+    let view = view.shrink2(vec2(24.0, 32.0));
+    if !view.is_positive() || !bounds.is_finite() || !bounds.is_positive() {
+        return None;
+    }
+    let scaling = (view.size() / bounds.size()).min_elem().clamp(MIN_GRAPH_SCALE, 1.0);
+    Some(TSTransform {
+        translation: view.center().to_vec2() - scaling * bounds.center().to_vec2(),
+        scaling,
+    })
+}
 
 fn midi_pin() -> PinInfo {
     PinInfo::square().with_fill(MIDI_COLOR)
 }
 
-/// A pin's name, kept whole: the pin columns are narrow, and a wrapped or cut label read "ou".
+/// Keep the name on one line with room between the label and the edge pin.
 fn pin_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add_space(5.0);
     ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend))
+}
+
+fn bus_pin(ui: &mut egui::Ui, port: &plugins::AudioPort, direction: &str) -> PinInfo {
+    let role = if port.main { "Main" } else { "Auxiliary" };
+    let layout = port.layout.as_deref().map(|layout| format!(" · {layout}")).unwrap_or_default();
+    let tip = format!("{role} {direction}{layout}");
+    let label = pin_label(ui, &format!("{} ({} ch)", port.name, port.channels)).on_hover_text(&tip);
+    label.ctx.accesskit_node_builder(label.id, |node| node.set_description(tip));
+    if port.main {
+        PinInfo::circle().with_fill(PIN_COLOR)
+    } else {
+        PinInfo::circle()
+            .with_fill(ui.visuals().window_fill())
+            .with_stroke(egui::Stroke::new(1.5, PIN_COLOR))
+            .with_wire_color(PIN_COLOR)
+    }
 }
 
 impl SnarlViewer<GraphNode> for Viewer<'_> {
     fn final_node_rect(&mut self, node: NodeId, rect: egui::Rect, ui: &mut egui::Ui, snarl: &mut Snarl<GraphNode>) {
         let xf = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or_default();
+        if self.node_rects.is_empty() {
+            // The Accessible UI tree uses scene-local widget bounds. The graph's
+            // parent supplies the same transform as the painted layer.
+            ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+                let scale = f64::from(xf.scaling);
+                let clip = xf.inverse() * self.view;
+                node.set_role(egui::accesskit::Role::Group);
+                node.set_label("Node graph");
+                node.set_transform(egui::accesskit::Affine::new([
+                    scale, 0.0, 0.0, scale, xf.translation.x.into(), xf.translation.y.into(),
+                ]));
+                node.set_bounds(egui::accesskit::Rect::new(
+                    clip.left().into(), clip.top().into(), clip.right().into(), clip.bottom().into(),
+                ));
+                node.set_clips_children();
+            });
+        }
         self.node_rects.push((snarl[node].eid, xf * rect));
     }
 
     fn title(&mut self, node: &GraphNode) -> String {
-        node.kind.title()
+        match &node.kind {
+            NodeKind::Plugin(plugin) => plugin_title(plugin.info()),
+            _ => node.kind.title(),
+        }
     }
 
     /// Preserve the scene's continuous, pointer-anchored gesture transform. Pixel alignment
@@ -3395,21 +3717,25 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
             if let Some(node) = self.diagnostic_target.and_then(|id| snarl.get_node_info(id)) {
                 to_global.translation = self.view.min.to_vec2() + egui::vec2(25.0, 25.0) - node.pos.to_vec2() * zoom;
             }
+            self.transform = *to_global;
             self.zoom = zoom;
             return;
         }
-        // Fitting the graph into view (double-click) doesn't zoom in past 100%.
-        if self.reset_zoom || (self.fit_zoom && to_global.scaling > 1.0) {
+        if let Some(fit) = self.fit_bounds.and_then(|bounds| fit_graph(self.view, bounds)) {
+            *to_global = fit;
+        }
+        if self.reset_zoom {
             // Keep the point at the middle of the view where it is.
             let c = self.view.center().to_vec2();
             let local = (c - to_global.translation) / to_global.scaling;
             to_global.scaling = 1.0;
             to_global.translation = c - local;
         }
-        if (self.reset_zoom || self.fit_zoom) && to_global.scaling == 1.0 {
+        if (self.reset_zoom || self.fit_bounds.is_some()) && to_global.scaling == 1.0 {
             let ppp = self.ppp;
             to_global.translation = (to_global.translation * ppp).round() / ppp;
         }
+        self.transform = *to_global;
         self.zoom = to_global.scaling;
     }
 
@@ -3430,7 +3756,7 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         match kind {
             NodeKind::Plugin(plugin) => {
                 if let Some(port) = plugin.audio_ports.inputs.get(pin.id.input) {
-                    pin_label(ui, &format!("{} ({} ch)", port.name, port.channels));
+                    return bus_pin(ui, port, "input");
                 }
             }
             NodeKind::Mixer { .. } => { pin_label(ui, &format!("in {}", pin.id.input + 1)); }
@@ -3446,7 +3772,7 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         }
         if let NodeKind::Plugin(plugin) = &snarl[pin.id.node].kind {
             if let Some(port) = plugin.audio_ports.outputs.get(pin.id.output) {
-                pin_label(ui, &format!("{} ({} ch)", port.name, port.channels));
+                return bus_pin(ui, port, "output");
             }
         } else {
             pin_label(ui, "out");
@@ -3499,6 +3825,9 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<GraphNode>,
     ) {
+        if !snarl.get_node_info(node).is_some_and(|node| node.open) {
+            return;
+        }
         let eid = snarl[node].eid;
         let mut sends: Vec<(usize, f32)> = Vec::new();
         ui.vertical(|ui| match &mut snarl[node].kind {
@@ -3576,7 +3905,11 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                     let db = 20.0 * l.max(1e-6).log10();
                     let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
                     let color = if *l >= 1.0 { Color32::RED } else { Color32::from_rgb(80, 200, 120) };
-                    ui.add(egui::ProgressBar::new(frac).desired_width(160.0).desired_height(6.0).fill(color));
+                    let (rect, _) = ui.allocate_exact_size(vec2(160.0, 6.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+                    if frac > 0.0 {
+                        ui.painter().rect_filled(rect.with_max_x(rect.left() + rect.width() * frac), 3.0, color);
+                    }
                 }
             }
             NodeKind::Gain { db } => {
@@ -3660,28 +3993,37 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                 let _g = guard::enter(&p.tag);
                 let info = p.info();
                 let bridged = if info.is_bridged() { " · yabridge" } else { "" };
-                ui.small(format!("{} · {}{bridged}", info.format.label(), info.vendor));
+                if !info.vendor.is_empty() || !bridged.is_empty() {
+                    ui.small(format!("{}{bridged}", info.vendor));
+                }
                 ui.horizontal(|ui| {
                     let has_editor = p.editor.is_some();
-                    if p.instance.has_editor() && ui.selectable_label(has_editor, "Editor").clicked() {
-                        if has_editor {
-                            p.editor = None;
+                    if p.instance.has_editor() {
+                        if ui.selectable_label(has_editor, "Editor").clicked() {
+                            if has_editor {
+                                p.editor = None;
+                            } else {
+                                let placement = self.embed_parent.map_or(Placement::Window, Placement::Embedded);
+                                if let Err(e) = p.open_editor(placement) {
+                                    self.errors.push(format!("{e:#}"));
+                                }
+                            }
+                        }
+                        let popped_out = p.editor.as_ref().is_some_and(|ed| ed.placement() == Placement::Window);
+                        let target = if popped_out {
+                            self.embed_parent.map(|parent| ("Embed", "Return the editor to the node", Placement::Embedded(parent)))
                         } else {
-                            let placement = self.embed_parent.map_or(Placement::Window, Placement::Embedded);
-                            if let Err(e) = p.open_editor(placement) {
+                            Some(("Pop out", "Open the editor in its own window", Placement::Window))
+                        };
+                        if let Some((label, hint, placement)) = target
+                            && ui.button(label).on_hover_text(hint).clicked()
+                            && let Err(e) = p.open_editor(placement)
+                        {
+                            self.errors.push(format!("{e:#}"));
+                            if popped_out && let Err(e) = p.open_editor(Placement::Window) {
                                 self.errors.push(format!("{e:#}"));
                             }
                         }
-                    }
-                    if p.instance.has_editor()
-                        && p.editor.as_ref().is_none_or(|editor| editor.placement() != Placement::Window)
-                        && ui
-                            .button("Pop out")
-                            .on_hover_text("open in its own window")
-                            .clicked()
-                        && let Err(e) = p.open_editor(Placement::Window)
-                    {
-                        self.errors.push(format!("{e:#}"));
                     }
                     ui.toggle_value(&mut p.show_params, "Params");
                     if ui.checkbox(&mut p.bypass, "Bypass").changed() {
@@ -3701,12 +4043,10 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
                 {
                     ui.colored_label(Color32::LIGHT_RED, error);
                 }
-                if p.instance.latency() > 0 {
-                    let bridge = p.instance.bridge_latency();
-                    ui.small(format!(
-                        "latency {} smp (bridge {bridge})",
-                        p.instance.latency()
-                    ));
+                if p.instance.remote_status().is_none_or(|status| status == "running")
+                    && p.instance.latency() > 0
+                {
+                    ui.small(plugin_latency(p.instance.as_ref()));
                 }
                 if p.instance.has_body() {
                     let mut io = plugins::BodyIo { scroll: self.scroll, wants_scroll: false };
@@ -3759,9 +4099,14 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
         node_menu::show(self, pos, ui, node_menu::WireDrag::from_pins(pins), snarl);
     }
 
-    fn show_graph_menu(&mut self, pos: Pos2, ui: &mut egui::Ui, _snarl: &mut Snarl<GraphNode>) {
+    fn show_graph_menu(&mut self, pos: Pos2, ui: &mut egui::Ui, snarl: &mut Snarl<GraphNode>) {
+        if snarl.nodes().next().is_some() && ui.button("Fit graph in view").clicked() {
+            self.actions.push(Action::FitGraph);
+            ui.close();
+        }
         if self.selected > 0 {
-            if ui.button(format!("Save the {} selected node(s) as a node preset…", self.selected)).clicked() {
+            let nodes = if self.selected == 1 { "node" } else { "nodes" };
+            if ui.button(format!("Save {} selected {nodes} as a node preset…", self.selected)).clicked() {
                 self.actions.push(Action::NameNodePreset);
                 ui.close();
             }
@@ -3844,7 +4189,7 @@ impl SnarlViewer<GraphNode> for Viewer<'_> {
             ui.menu_button("Plugins", |ui| {
                 egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
                     for info in self.plugins {
-                        if ui.button(&info.name).clicked() {
+                        if ui.button(plugin_title(info)).clicked() {
                             self.actions.push(Action::AddPlugin(info.clone(), pos));
                             ui.close();
                         }
@@ -3981,6 +4326,9 @@ fn table_cell(ui: &egui::Ui, painter: &egui::Painter, cell: egui::Rect, text: &s
 
 fn list_row(ui: &mut egui::Ui, height: f32, selected: bool, text: egui::RichText, sense: egui::Sense) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), sense);
+    if sense.senses_click() {
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, resp.enabled(), selected, text.text()));
+    }
     let visuals = ui.style().interact_selectable(&resp, selected);
     if selected || (resp.hovered() && sense.senses_click()) {
         ui.painter().rect_filled(rect, 2.0, visuals.weak_bg_fill);
@@ -4023,6 +4371,58 @@ fn fmt_time(secs: f64) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
+fn counted(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+fn plugin_title(info: &PluginInfo) -> String {
+    format!("{} ({})", info.name, info.format.label())
+}
+
+fn plugin_status(action: &str, plugin: &dyn plugins::Instance) -> String {
+    format!("{action} {} · {} · {}", plugin_title(plugin.info()),
+        counted(plugin.params().len(), "parameter"), plugin_latency(plugin))
+}
+
+fn plugin_latency(plugin: &dyn plugins::Instance) -> String {
+    let total = plugin.latency();
+    let bridge = plugin.bridge_latency();
+    let samples = counted(total as usize, "sample");
+    if bridge == 0 {
+        format!("Latency {samples}")
+    } else if total == bridge {
+        format!("Latency {samples} (isolation)")
+    } else {
+        let processing = total.saturating_sub(bridge);
+        format!("Latency {samples} ({processing} plugin + {bridge} isolation)")
+    }
+}
+
+fn transport_button(ui: &mut egui::Ui, enabled: bool, glyph: &str, label: &str) -> egui::Response {
+    let response = ui.add_enabled(enabled, egui::Button::new(glyph)).on_hover_text(label);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    response
+}
+
+pub(crate) fn filter_field(ui: &mut egui::Ui, filter: &mut String, hint: &str) {
+    ui.horizontal(|ui| {
+        let clear_size = ui.spacing().interact_size.y;
+        let reserved = if filter.is_empty() { 0.0 } else { clear_size + ui.spacing().item_spacing.x };
+        let margin = egui::Margin::symmetric(4, 2);
+        let width = ui.available_width() - reserved - margin.sum().x;
+        let edit = ui.add(egui::TextEdit::singleline(filter)
+            .hint_text(hint).margin(margin).desired_width(width.max(1.0)));
+        if reserved > 0.0 {
+            let clear = ui.add_sized([clear_size; 2], egui::Button::new("×")).on_hover_text("Clear filter");
+            clear.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Clear filter"));
+            if clear.clicked() || (edit.has_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))) {
+                filter.clear();
+                edit.request_focus();
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod graph_zoom_tests {
     use super::*;
@@ -4030,6 +4430,28 @@ mod graph_zoom_tests {
     use crate::plugins::surface::EditorFrame;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn fit_centers_the_full_node_bounds_in_a_compact_view() {
+        let view = Rect::from_min_size(pos2(182.0, 84.0), vec2(302.0, 300.0));
+        let bounds = Rect::from_min_size(pos2(-24.0, 32.0), vec2(690.0, 385.0));
+        let transform = fit_graph(view, bounds).unwrap();
+        let fitted = transform * bounds;
+        assert!(view.shrink(23.0).contains_rect(fitted));
+        assert!(fitted.center().distance(view.center()) < 0.01);
+        assert!(transform.scaling < 1.0);
+    }
+
+    #[test]
+    fn adding_a_plugin_uses_visible_space_below_existing_nodes() {
+        let canvas = Rect::from_min_size(pos2(-100.0, -100.0), vec2(680.0, 460.0));
+        let node = Rect::from_min_size(canvas.min, vec2(650.0, 120.0));
+        let size = vec2(390.0, 230.0);
+        let added = Rect::from_min_size(free_graph_position(canvas, &[node], size).unwrap(), size);
+        assert!(canvas.contains_rect(added));
+        assert!(!node.intersects(added));
+        assert!(free_graph_position(canvas, &[node, added], size).is_none());
+    }
 
     const POINTER: Pos2 = egui::pos2(173.25, 149.75);
 
@@ -4155,9 +4577,10 @@ mod graph_zoom_tests {
                     wants_scroll: false,
                     selected: 0,
                     view: ui.max_rect(),
+                    transform: TSTransform::IDENTITY,
                     zoom,
                     reset_zoom: false,
-                    fit_zoom: false,
+                    fit_bounds: None,
                     diagnostic_zoom: None,
                     diagnostic_target: None,
                     node_presets: &[],

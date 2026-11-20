@@ -22,6 +22,7 @@ and a message is logged; no incompatible wire is created.
   into one input are summed. A wire that would make a loop is refused.
 - **Pins**: round blue pins carry audio buses, square orange pins carry MIDI. A VST3 or CLAP
   node shows each bus's name and channel count, including sidechains and additional outputs.
+  Main audio pins are filled and auxiliary pins are outlined. Hover a bus label for its role.
   Built-in audio nodes use stereo. MIDI only connects to MIDI.
 - **Disconnect**: right-click a wire to cut it, or right-click a pin to drop all its wires.
 - **Remove**: right-click a node and pick "Remove".
@@ -29,7 +30,7 @@ and a message is logged; no incompatible wire is created.
 - **Select several**: Shift+drag a box, or Shift+click nodes.
 - **Zoom**: Ctrl+wheel or pinch on a supported touchpad. Zoom and two-finger panning preserve
   small movements without snapping. The zoom is shown in the corner; click it to go back to
-  100%, where text is sharpest. Double-click empty space to fit the graph.
+  100%, where text is sharpest. Click **Fit** or double-click empty space to fit the graph.
   Embedded plugin editor images scale on every gesture frame with their nodes.
 
 Nodes that aren't connected to anything still run, so a visualizer can hang off any output

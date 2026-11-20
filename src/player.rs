@@ -303,6 +303,10 @@ impl Player {
         self.shared.playing.load(Ordering::Acquire)
     }
 
+    pub fn is_paused(&self) -> bool {
+        self.shared.paused.load(Ordering::Acquire) && !self.finished()
+    }
+
     pub fn position(&self) -> f64 {
         if self.is_midi() {
             return self.midi().player.status().position;
