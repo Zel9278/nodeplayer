@@ -1,6 +1,6 @@
 //! Fonts: the desktop's own sans-serif and monospace faces (from fontconfig; the system's
 //! standard ones on Windows and macOS) in place of egui's thin bundled Ubuntu Light, which
-//! looks blurry at UI sizes; egui's emoji and icon fonts after them; and a Japanese face last,
+//! looks blurry at UI sizes; egui's emoji and icon fonts after them; and CJK faces last,
 //! since egui's fonts have no CJK glyphs.
 
 use std::path::{Path, PathBuf};
@@ -32,7 +32,19 @@ fn system_font(pattern: &str) -> Option<(PathBuf, u32)> {
     let ja = pattern.contains("lang=ja");
     let mono = pattern.starts_with("monospace");
     let bold = pattern.contains("weight=bold");
-    let candidates: &[(&str, u32)] = if cfg!(windows) {
+    let candidates: &[(&str, u32)] = if pattern.contains("lang=zh-cn") {
+        if cfg!(windows) {
+            &[("msyh.ttc", 0), ("simsun.ttc", 0), ("simhei.ttf", 0)]
+        } else {
+            &[("PingFang.ttc", 0), ("Hiragino Sans GB.ttc", 0), ("STHeiti Light.ttc", 0)]
+        }
+    } else if pattern.contains("lang=ko") {
+        if cfg!(windows) {
+            &[("malgun.ttf", 0), ("gulim.ttc", 0)]
+        } else {
+            &[("AppleSDGothicNeo.ttc", 0)]
+        }
+    } else if cfg!(windows) {
         match (ja, mono, bold) {
             (false, false, _) => &[("segoeui.ttf", 0)],
             (false, true, _) => &[("consola.ttf", 0), ("cour.ttf", 0)],
@@ -103,21 +115,33 @@ pub fn install(ctx: &egui::Context) {
 
     let sans = fc_match("sans-serif:lang=ja");
     let mono = fc_match("monospace:lang=ja");
-    let (sans, mono) = match (sans, mono) {
-        (Some(s), Some(m)) => (s, m),
+    let japanese = match (sans, mono) {
+        (Some(s), Some(m)) => Some((s, m)),
         _ => match KNOWN.iter().find(|(p, ..)| Path::new(p).exists()) {
-            Some(&(p, s, m)) => ((p.into(), s), (p.into(), m)),
+            Some(&(p, s, m)) => Some(((p.into(), s), (p.into(), m))),
             None => {
-                log::warn!("no Japanese font found; CJK text will show as boxes");
-                ctx.set_fonts(defs);
-                return;
+                log::warn!("no Japanese font found");
+                None
             }
         },
     };
-    add(&mut defs, "cjk-sans", sans, FontFamily::Proportional, false);
-    add(&mut defs, "cjk-mono", mono, FontFamily::Monospace, false);
-    align_baseline(&mut defs, &FontFamily::Proportional, "cjk-sans");
-    align_baseline(&mut defs, &FontFamily::Monospace, "cjk-mono");
+    if let Some((sans, mono)) = japanese {
+        add(&mut defs, "cjk-sans", sans, FontFamily::Proportional, false);
+        add(&mut defs, "cjk-mono", mono, FontFamily::Monospace, false);
+        align_baseline(&mut defs, &FontFamily::Proportional, "cjk-sans");
+        align_baseline(&mut defs, &FontFamily::Monospace, "cjk-mono");
+    }
+    for (pattern, sans, mono) in [
+        ("sans-serif:lang=zh-cn", "chinese-sans", "chinese-mono"),
+        ("sans-serif:lang=ko", "korean-sans", "korean-mono"),
+    ] {
+        if let Some(face) = fc_match(pattern) {
+            add(&mut defs, sans, face.clone(), FontFamily::Proportional, false);
+            add(&mut defs, mono, face, FontFamily::Monospace, false);
+            align_baseline(&mut defs, &FontFamily::Proportional, sans);
+            align_baseline(&mut defs, &FontFamily::Monospace, mono);
+        }
+    }
     ctx.set_fonts(defs);
 }
 
